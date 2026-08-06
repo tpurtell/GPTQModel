@@ -30,3 +30,7 @@ def test_deepseek_v4_module_tree_matches_v4_attention_and_fused_experts():
     assert "mlp.experts.99.up_proj" in flat_modules
     assert "mlp.experts.99.down_proj" in flat_modules
     assert "mlp.shared_experts.gate_proj" in flat_modules
+
+
+def test_deepseek_v4_preserves_integrated_mtp_namespace() -> None:
+    assert DeepSeekV4QModel.out_of_model_tensors == {"prefixes": ["mtp"]}

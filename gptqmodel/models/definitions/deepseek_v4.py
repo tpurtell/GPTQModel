@@ -9,6 +9,11 @@ from .deepseek_v3 import DeepSeekV3QModel
 class DeepSeekV4QModel(DeepSeekV3QModel):
     dynamic_expert_index = "n_routed_experts"
     rotary_embedding = "model.rotary_emb"
+    # Transformers intentionally ignores the integrated dSpark/MTP checkpoint
+    # namespace. Preserve it byte-for-byte until a quantizer explicitly
+    # replaces those tensors; silently dropping it produces an incomplete V4
+    # artifact even when normal target-layer quantization succeeds.
+    out_of_model_tensors = {"prefixes": ["mtp"]}
     module_tree = [
         "model",
         "layers",
