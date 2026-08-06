@@ -39,6 +39,9 @@ dependencies = { file = ["requirements.txt"] }
 
 
 [project.optional-dependencies]
+torchao = [
+    "torchao>=0.16.0",
+]
 test = [
     "pytest>=8.3.5",
     "pytest-timeout>=2.3.1",
