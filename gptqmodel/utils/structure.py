@@ -1024,10 +1024,74 @@ class LazyTurtle:
 
         path = _get_qualified_name(target_model, target_submodule)
         with self._lock:
-            return self._load_checkpoint_tensors_for_module_path(
+            tensors = self._load_checkpoint_tensors_for_module_path(
                 module_path=path,
                 recurse=recurse,
             )
+
+            # Floatx checkpoints commonly keep a packed ``weight`` and its
+            # scale as direct leaves of the source projection. When the HF
+            # shell renames that projection (for example DeepSeek-V4
+            # ``gate_proj`` -> ``w1``), resolving only the runtime module
+            # prefix yields no tensors even though per-parameter resolution
+            # succeeds. Resolve the raw source weight explicitly so the auto
+            # decoder sees the packed representation.
+            if "weight" not in tensors:
+                source_name, expert_index, split_index, split_dim = self._resolve_checkpoint_tensor_source(
+                    path,
+                    "weight",
+                )
+                if (
+                    source_name is not None
+                    and expert_index is None
+                    and split_index is None
+                    and split_dim is None
+                ):
+                    raw_names = [source_name]
+                    if source_name.endswith(".weight"):
+                        source_prefix = source_name[:-len(".weight")]
+                        for suffix in (
+                            "scale",
+                            "scale_inv",
+                            "scale_2",
+                            "weight_scale",
+                            "weight_scale_inv",
+                            "weight_scale_2",
+                        ):
+                            candidate = f"{source_prefix}.{suffix}"
+                            if candidate in self._weight_map:
+                                raw_names.append(candidate)
+
+                    grouped_names: Dict[str, list[str]] = {}
+                    for raw_name in raw_names:
+                        shard = self._weight_map.get(raw_name)
+                        if shard is not None:
+                            grouped_names.setdefault(shard, []).append(raw_name)
+
+                    for shard, names in grouped_names.items():
+                        shard_path = os.path.join(self.model_local_path, shard)
+                        with safe_open(shard_path, framework="pt", device="cpu") as handler:
+                            for raw_name in names:
+                                if raw_name == source_name:
+                                    tensors["weight"] = handler.get_tensor(raw_name)
+                                    continue
+                                leaf_name = raw_name.rsplit(".", 1)[-1]
+                                tensors[leaf_name] = handler.get_tensor(raw_name)
+
+            # Normalize the direct ``.scale`` spelling used by native
+            # DeepSeek-V4 checkpoints to the names consumed by GPTQModel's
+            # generic floatx decoder. Preserve the source spelling too for
+            # provenance/debug reports.
+            companion_aliases = {
+                "scale": "weight_scale",
+                "scale_inv": "weight_scale_inv",
+                "scale_2": "weight_scale_2",
+            }
+            for source_leaf, decoder_leaf in companion_aliases.items():
+                if source_leaf in tensors and decoder_leaf not in tensors:
+                    tensors[decoder_leaf] = tensors[source_leaf]
+
+            return tensors
 
     def sync_all_meta(
         self,

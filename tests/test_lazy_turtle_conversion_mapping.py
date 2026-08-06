@@ -1035,6 +1035,34 @@ def test_lazy_turtle_materializes_defused_deepseek_v4_expert_linears_from_w123_a
     assert torch.equal(expert.down_proj.weight, checkpoint_tensors["model.layers.0.mlp.experts.0.w2.weight"])
 
 
+@pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="E8M0 dtype not available")
+def test_lazy_turtle_loads_deepseek_v4_packed_expert_weight_and_scale_by_alias(tmp_path):
+    packed = torch.tensor([[0x10, 0x32], [0x54, 0x76], [0x98, 0xBA]], dtype=torch.uint8).view(torch.int8)
+    scale = torch.tensor([[127], [128], [126]], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    checkpoint_tensors = {
+        "layers.0.ffn.experts.0.w1.weight": packed,
+        "layers.0.ffn.experts.0.w1.scale": scale,
+    }
+    turtle = _build_lazy_turtle(
+        tmp_path,
+        checkpoint_tensors,
+        module_tree=DeepSeekV4QModel.module_tree,
+        target_model=_DeepseekV4DummyModel(),
+    )
+
+    shell = _DeepseekV4DefusedShell()
+    gate_proj = shell.model.layers[0].mlp.experts[0].gate_proj
+    tensors = turtle.checkpoint_tensors_for_submodule(
+        target_model=shell,
+        target_submodule=gate_proj,
+        recurse=False,
+    )
+
+    assert torch.equal(tensors["weight"], packed)
+    assert torch.equal(tensors["scale"].view(torch.uint8), scale.view(torch.uint8))
+    assert tensors["weight_scale"] is tensors["scale"]
+
+
 def test_lazy_turtle_materializes_fused_dense_mlp_from_split_gate_up_checkpoint(tmp_path):
     reversed_map = LazyTurtle.reverse_hf_conversion_map(
         [

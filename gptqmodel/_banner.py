@@ -53,10 +53,14 @@ def build_startup_banner(
 
 
 def _get_git_commit():
+    from pathlib import Path
     import subprocess
+
+    source_root = Path(__file__).resolve().parent.parent
     try:
         hash = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"]
+            ["git", "-C", str(source_root), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
         ).decode().strip()
         return f"+{hash}"
     except Exception:

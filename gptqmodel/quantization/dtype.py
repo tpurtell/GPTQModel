@@ -308,9 +308,6 @@ def _dequantize_f4_reference(
     axis: Optional[int] = 0,
     target_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    if unpack_uint4 is None or f4_unpacked_to_f32 is None:
-        raise RuntimeError("torchao with nvfp4 support is required for FP4 dequantization")
-
     if scale is not None and scale_inv is not None:
         raise ValueError("Provide either scale or scale_inv, not both")
 
@@ -323,10 +320,26 @@ def _dequantize_f4_reference(
     if not orig_shape:
         raise ValueError("Tensor must have at least one dimension")
 
-    unpacked = unpack_uint4(tensor.reshape(-1))
     expanded_shape = orig_shape[:-1] + [orig_shape[-1] * 2]
-    unpacked = unpacked.view(*expanded_shape)
-    result = f4_unpacked_to_f32(unpacked).to(target_dtype)
+    if unpack_uint4 is not None and f4_unpacked_to_f32 is not None:
+        unpacked = unpack_uint4(tensor.reshape(-1)).view(*expanded_shape)
+        result = f4_unpacked_to_f32(unpacked).to(target_dtype)
+    else:
+        # Keep floatx source decoding available in free-threaded environments
+        # where TorchAO does not publish a compatible wheel. E2M1 stores the
+        # first logical value in the low nibble.
+        unpacked = torch.empty(expanded_shape, dtype=torch.uint8, device=tensor.device)
+        unpacked[..., 0::2] = tensor & 0x0F
+        unpacked[..., 1::2] = (tensor >> 4) & 0x0F
+        codebook = torch.tensor(
+            [
+                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            ],
+            dtype=target_dtype,
+            device=tensor.device,
+        )
+        result = codebook[unpacked.to(torch.long)]
 
     if scale is not None:
         scale_tensor = _expand_scale(scale.to(result.dtype), result, axis_hint=axis)
@@ -693,6 +706,13 @@ def dequantize_f4_e2m1(
 
     if scale is not None and scale_inv is not None:
         raise ValueError("Provide either scale or scale_inv, not both")
+
+    # Safetensors may expose byte-packed FP4 checkpoints as signed INT8 even
+    # when the payload is purely bitwise. Normalize storage without changing
+    # any bits before selecting the native or reference decoder.
+    if tensor.dtype is torch.int8:
+        tensor = tensor.view(torch.uint8)
+
     if _can_use_fast_path(
         tensor,
         scale if scale is not None else scale_inv,

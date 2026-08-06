@@ -57,6 +57,9 @@ def clone_exllamav3_config_for_module(
 ) -> Optional[EXL3Config]:
     """Clones and applies per-module EXL3 dynamic overrides, or skips the module."""
 
+    if not qcfg.module_is_included(module_full_name):
+        return None
+
     if qcfg.dynamic_get(layer_name=module_full_name) == False:
         return None
 

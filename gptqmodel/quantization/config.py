@@ -1540,6 +1540,7 @@ _DYNAMIC_EXACT_LOOKUP_CACHE: Dict[int, Dict[str, Tuple[int, Union[Dict[str, Any]
 _DYNAMIC_ALL_EXACT_CACHE: Dict[int, bool] = {}
 # Pre-separated regex patterns for mixed dynamic configs.
 _DYNAMIC_REGEX_PATTERN_CACHE: Dict[int, List[Tuple[int, bool, Any, Dict[str, Any]]]] = {}
+_MODULE_INCLUDE_PATTERN_CACHE: Dict[Tuple[str, ...], Tuple[Any, ...]] = {}
 
 def _extract_literal_regex_pattern(raw: str) -> Optional[str]:
     """If `raw` is a regex that matches a single literal string, return that string."""
@@ -1610,6 +1611,24 @@ def _get_dynamic_patterns(dynamic: Dict[str, Dict[str, Any]]) -> List[Tuple[bool
     _DYNAMIC_ALL_EXACT_CACHE[cache_key] = all_exact
     _DYNAMIC_REGEX_PATTERN_CACHE[cache_key] = regex_patterns
     return patterns
+
+
+def _get_module_include_patterns(patterns: Tuple[str, ...]) -> Tuple[Any, ...]:
+    """Compile and cache ordered positive module-include patterns."""
+
+    cached = _MODULE_INCLUDE_PATTERN_CACHE.get(patterns)
+    if cached is not None:
+        return cached
+
+    compiled = []
+    for pattern in patterns:
+        try:
+            compiled.append(pcre.compile(pattern))
+        except Exception as exc:
+            raise ValueError(f"EXL3Config: invalid module_include pattern `{pattern}`") from exc
+    result = tuple(compiled)
+    _MODULE_INCLUDE_PATTERN_CACHE[patterns] = result
+    return result
 
 def _resolve_dynamic_override(
     dynamic: Dict[str, Dict[str, Any]],
@@ -3777,7 +3796,7 @@ class BitsAndBytesConfig(PreProcessorConfig):
         self.compress_statistics = bool(value)
 
 @dataclass
-class EXL3Config(BaseQuantizeConfig):
+class EXL3Config(PreProcessorConfig):
     bits: float = field(default=3.0)
     method: METHOD = field(default=METHOD.EXL3)
     format: FORMAT = field(default=FORMAT.EXL3)
@@ -3789,6 +3808,10 @@ class EXL3Config(BaseQuantizeConfig):
     codebook: str = field(default="mcg")
     tensor_storage: Optional[Dict[str, Any]] = field(default=None)
     calibration: Optional[Dict[str, int]] = field(default=None)
+    module_include: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Positive regex allowlist of module names eligible for EXL3 quantization."},
+    )
 
     @property
     def runtime_bits(self) -> int:
@@ -3824,6 +3847,7 @@ class EXL3Config(BaseQuantizeConfig):
                 raise ValueError("EXL3Config: `group_size` is not used; keep it at `-1`.")
 
     def __post_init__(self):
+        self._normalize_preprocessor_state()
         self.method = _normalize_quant_method(self.method)
         self.format = _normalize_format(self.format)
         self.pack_dtype = _normalize_pack_dtype(self.pack_dtype)
@@ -3882,6 +3906,17 @@ class EXL3Config(BaseQuantizeConfig):
                 for key, value in self.calibration.items()
             }
 
+        if self.module_include is not None:
+            if not isinstance(self.module_include, (list, tuple)) or not self.module_include:
+                raise ValueError("EXL3Config: `module_include` must be a non-empty list of regex patterns.")
+            normalized_patterns = []
+            for pattern in self.module_include:
+                if not isinstance(pattern, str) or not pattern.strip():
+                    raise ValueError("EXL3Config: every `module_include` entry must be a non-empty string.")
+                normalized_patterns.append(pattern.strip())
+            self.module_include = normalized_patterns
+            _get_module_include_patterns(tuple(self.module_include))
+
         if self.meta is not None:
             if not isinstance(self.meta, dict):
                 raise ValueError("QuantizeConfig: `meta` must be a dictionary")
@@ -3921,6 +3956,17 @@ class EXL3Config(BaseQuantizeConfig):
         out["codebook"] = self.codebook
         out["tensor_storage"] = self.tensor_storage
         out["calibration"] = self.calibration
+        out["module_include"] = self.module_include
+
+    def module_is_included(self, module_name: str) -> bool:
+        """Return whether a module passes the positive EXL3 allowlist."""
+
+        if self.module_include is None:
+            return True
+        return any(
+            pattern.match(module_name)
+            for pattern in _get_module_include_patterns(tuple(self.module_include))
+        )
 
     def calculate_bits_per_weight(self):
         head_bits = self.head_bits if self.head_bits is not None else self.bits

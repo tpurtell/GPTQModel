@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
+import subprocess
 from pathlib import Path
 
 
@@ -68,3 +69,19 @@ def test_get_startup_banner_resolves_optional_versions(monkeypatch):
     )
 
     assert any(line.startswith("Triton") and line.endswith("3.6.0") for line in banner.splitlines())
+
+
+def test_git_commit_is_resolved_from_package_source_not_process_cwd(monkeypatch):
+    captured = {}
+
+    def fake_check_output(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return b"abc1234\n"
+
+    monkeypatch.setattr(subprocess, "check_output", fake_check_output)
+
+    assert banner_module._get_git_commit() == "+abc1234"
+    assert captured["command"][:2] == ["git", "-C"]
+    assert Path(captured["command"][2]).resolve() == MODULE_PATH.parent.parent.resolve()
+    assert captured["command"][3:] == ["rev-parse", "--short", "HEAD"]

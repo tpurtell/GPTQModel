@@ -3,13 +3,14 @@
 
 import json
 
+import pytest
 import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
 from gptqmodel.nn_modules.exllamav3 import ExllamaV3Linear
 from gptqmodel.nn_modules.exllamav3_torch import ExllamaV3TorchLinear
-from gptqmodel.quantization.config import FORMAT, METHOD, EXL3Config, QuantizeConfig
+from gptqmodel.quantization.config import AutoModuleDecoderConfig, FORMAT, METHOD, EXL3Config, QuantizeConfig
 from gptqmodel.utils.exllamav3 import build_exllamav3_tensor_storage, replace_exllamav3_placeholders
 from gptqmodel.utils.model_dequant import detect_format
 
@@ -44,6 +45,47 @@ def test_exllamav3_quantize_config_round_trip():
     assert reloaded.out_scales == "always"
     assert reloaded.codebook == "mul1"
     assert reloaded.runtime_bits == 2
+
+
+def test_exllamav3_config_accepts_and_round_trips_auto_module_decoder():
+    cfg = EXL3Config(
+        bits=2.0,
+        preprocessors=[AutoModuleDecoderConfig(target_dtype=torch.bfloat16)],
+    )
+
+    assert len(cfg.preprocessors) == 1
+    assert isinstance(cfg.preprocessors[0], AutoModuleDecoderConfig)
+    assert cfg.preprocessors[0].target_dtype is torch.bfloat16
+
+    reloaded = QuantizeConfig.from_quant_config(cfg.to_dict())
+    assert isinstance(reloaded, EXL3Config)
+    assert len(reloaded.preprocessors) == 1
+    assert isinstance(reloaded.preprocessors[0], AutoModuleDecoderConfig)
+    assert reloaded.preprocessors[0].target_dtype is torch.bfloat16
+
+
+def test_exllamav3_module_include_is_a_positive_allowlist_and_round_trips():
+    routed_expert_pattern = (
+        r"^model\.layers\.\d+\.mlp\.experts\.\d+\."
+        r"(?:gate_proj|up_proj|down_proj)$"
+    )
+    cfg = EXL3Config(bits=2.0, module_include=[routed_expert_pattern])
+
+    assert cfg.module_is_included("model.layers.7.mlp.experts.31.gate_proj")
+    assert not cfg.module_is_included("model.layers.7.mlp.shared_experts.gate_proj")
+    assert not cfg.module_is_included("model.layers.7.self_attn.q_a_proj")
+    assert not cfg.module_is_included("lm_head")
+
+    reloaded = QuantizeConfig.from_quant_config(cfg.to_dict())
+    assert isinstance(reloaded, EXL3Config)
+    assert reloaded.module_include == [routed_expert_pattern]
+    assert reloaded.module_is_included("model.layers.42.mlp.experts.255.down_proj")
+    assert not reloaded.module_is_included("model.layers.42.mlp.shared_experts.down_proj")
+
+
+def test_exllamav3_module_include_rejects_invalid_regex():
+    with pytest.raises(ValueError, match="invalid module_include pattern"):
+        EXL3Config(bits=2.0, module_include=["("])
 
 
 class _TinyModel(nn.Module):

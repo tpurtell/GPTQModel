@@ -1600,6 +1600,7 @@ class BaseQModel(nn.Module):
             decoder_kind = self._decoder_weight_format(
                 weight=weight,
                 checkpoint_tensors=checkpoint_tensors,
+                result_shape=tuple(getattr(module.weight, "shape", weight.shape)),
             )
             if decoder_kind is None:
                 continue
@@ -1648,6 +1649,7 @@ class BaseQModel(nn.Module):
             decoder_kind = self._decoder_weight_format(
                 weight=weight,
                 checkpoint_tensors=checkpoint_tensors,
+                result_shape=tuple(getattr(module.weight, "shape", weight.shape)),
             )
             if decoder_kind is None:
                 continue
@@ -1713,6 +1715,7 @@ class BaseQModel(nn.Module):
             decoder_kind = self._decoder_weight_format(
                 weight=weight,
                 checkpoint_tensors=checkpoint_tensors,
+                result_shape=tuple(getattr(module.weight, "shape", weight.shape)),
             )
             if decoder_kind is None:
                 continue
@@ -1928,11 +1931,12 @@ class BaseQModel(nn.Module):
             quant_source = quant_source.to(device=CPU)
         weight = None if checkpoint_tensors is None else checkpoint_tensors.get("weight")
         if isinstance(weight, torch.Tensor) and hasattr(quant_source, "weight"):
+            result_shape = tuple(getattr(quant_source.weight, "shape", weight.shape))
             decoder_kind = self._decoder_weight_format(
                 weight=weight,
                 checkpoint_tensors=checkpoint_tensors,
+                result_shape=result_shape,
             )
-            result_shape = tuple(getattr(quant_source.weight, "shape", weight.shape))
             scale = (
                 self._decoder_fp4_effective_scale(
                     checkpoint_tensors=checkpoint_tensors,
@@ -2117,6 +2121,7 @@ class BaseQModel(nn.Module):
         *,
         weight: torch.Tensor,
         checkpoint_tensors: Dict[str, torch.Tensor],
+        result_shape: Optional[tuple[int, ...]] = None,
     ) -> Optional[str]:
         """Infer which floatx decoder matches one checkpoint weight tensor."""
 
@@ -2124,7 +2129,18 @@ class BaseQModel(nn.Module):
             return "fp8"
         if is_fp4_packed_dtype(weight.dtype):
             return "fp4"
-        if weight.dtype is not torch.uint8 or not isinstance(checkpoint_tensors.get("weight_scale"), torch.Tensor):
+        weight_scale = checkpoint_tensors.get("weight_scale")
+        if not isinstance(weight_scale, torch.Tensor):
+            return None
+        if (
+            weight.dtype in (torch.uint8, torch.int8)
+            and result_shape is not None
+            and len(result_shape) == weight.ndim
+            and tuple(result_shape[:-1]) == tuple(weight.shape[:-1])
+            and result_shape[-1] == weight.shape[-1] * 2
+        ):
+            return "fp4"
+        if weight.dtype is not torch.uint8:
             return None
         if isinstance(checkpoint_tensors.get("weight_scale_2"), torch.Tensor):
             return "fp4"
@@ -2364,6 +2380,7 @@ class BaseQModel(nn.Module):
         decoder_kind = self._decoder_weight_format(
             weight=weight,
             checkpoint_tensors=checkpoint_tensors,
+            result_shape=tuple(getattr(target_submodule.weight, "shape", weight.shape)),
         )
         if decoder_kind is None:
             return target_submodule
@@ -2690,6 +2707,7 @@ class BaseQModel(nn.Module):
                     decoder_kind = self._decoder_weight_format(
                         weight=weight,
                         checkpoint_tensors=checkpoint_tensors,
+                        result_shape=tuple(getattr(target_submodule.weight, "shape", weight.shape)),
                     )
                     if decoder_kind is not None:
                         # Packed floatx checkpoints can require decoder-specific
