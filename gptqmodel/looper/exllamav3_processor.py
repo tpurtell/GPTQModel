@@ -573,6 +573,13 @@ class EXL3Processor(LoopProcessor):
             group_size=-1,
             desc_act=False,
             sym=True,
+            # This short-lived config owns only the in-memory Hessian capture
+            # for one projection. Enabling the generic completed-module
+            # offloader creates one unused TemporaryDirectory per projection
+            # (768 per DeepSeek V4 MoE block) and repeats that setup every
+            # layer. The enclosing EXL3 config remains responsible for actual
+            # module offload through its explicitly configured shared path.
+            offload_to_disk=False,
             device=module_qcfg.device,
             pack_dtype=module_qcfg.pack_dtype,
             act_group_aware=False,
