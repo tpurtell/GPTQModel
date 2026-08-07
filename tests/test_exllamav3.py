@@ -5,14 +5,25 @@ import json
 
 import pytest
 import torch
-import torch.nn as nn
-from safetensors.torch import save_file
-
+from gptqmodel.exllamav3.modules.quant.exl3_lib.quantize import (
+    reconstruction_error_metrics,
+)
 from gptqmodel.nn_modules.exllamav3 import ExllamaV3Linear
 from gptqmodel.nn_modules.exllamav3_torch import ExllamaV3TorchLinear
-from gptqmodel.quantization.config import AutoModuleDecoderConfig, FORMAT, METHOD, EXL3Config, QuantizeConfig
-from gptqmodel.utils.exllamav3 import build_exllamav3_tensor_storage, replace_exllamav3_placeholders
+from gptqmodel.quantization.config import (
+    FORMAT,
+    METHOD,
+    AutoModuleDecoderConfig,
+    EXL3Config,
+    QuantizeConfig,
+)
+from gptqmodel.utils.exllamav3 import (
+    build_exllamav3_tensor_storage,
+    replace_exllamav3_placeholders,
+)
 from gptqmodel.utils.model_dequant import detect_format
+from safetensors.torch import save_file
+from torch import nn
 
 
 def test_exllamav3_fractional_bits_fail_closed_instead_of_flooring():
@@ -22,6 +33,25 @@ def test_exllamav3_fractional_bits_fail_closed_instead_of_flooring():
             format=FORMAT.EXL3,
             bits=2.25,
         )
+
+
+def test_exllamav3_reconstruction_metrics_retain_bounded_tile_diagnostics():
+    reference = torch.ones((32, 32), dtype=torch.float32)
+    error = torch.zeros_like(reference)
+    error[:16, :16] = 2.0
+
+    metrics = reconstruction_error_metrics(error, reference, worst_tiles=2)
+
+    assert metrics["domain"] == "regularized_exl3_search_space"
+    assert metrics["element_count"] == 1024
+    assert metrics["error_sum_sq"] == pytest.approx(1024.0)
+    assert metrics["reference_sum_sq"] == pytest.approx(1024.0)
+    assert metrics["mse"] == pytest.approx(1.0)
+    assert metrics["nmse"] == pytest.approx(1.0)
+    assert metrics["relative_frobenius"] == pytest.approx(1.0)
+    assert metrics["tile_count"] == 4
+    assert metrics["tile_sse_max"] == pytest.approx(1024.0)
+    assert metrics["worst_tiles"][0] == {"row": 0, "column": 0, "sse": 1024.0}
 
 
 def test_exllamav3_integer_and_dynamic_bits_round_trip():
@@ -96,7 +126,9 @@ def test_exllamav3_module_include_is_a_positive_allowlist_and_round_trips():
     assert isinstance(reloaded, EXL3Config)
     assert reloaded.module_include == [routed_expert_pattern]
     assert reloaded.module_is_included("model.layers.42.mlp.experts.255.down_proj")
-    assert not reloaded.module_is_included("model.layers.42.mlp.shared_experts.down_proj")
+    assert not reloaded.module_is_included(
+        "model.layers.42.mlp.shared_experts.down_proj"
+    )
 
 
 def test_exllamav3_module_include_rejects_invalid_regex():
@@ -170,9 +202,15 @@ def test_detect_format_identifies_exllamav3(tmp_path):
     shard_path = tmp_path / "model.safetensors"
     save_file(
         {
-            "model.layers.0.self_attn.q_proj.trellis": torch.zeros((1, 1, 32), dtype=torch.int16),
-            "model.layers.0.self_attn.q_proj.suh": torch.zeros((16,), dtype=torch.float16),
-            "model.layers.0.self_attn.q_proj.svh": torch.zeros((16,), dtype=torch.float16),
+            "model.layers.0.self_attn.q_proj.trellis": torch.zeros(
+                (1, 1, 32), dtype=torch.int16
+            ),
+            "model.layers.0.self_attn.q_proj.suh": torch.zeros(
+                (16,), dtype=torch.float16
+            ),
+            "model.layers.0.self_attn.q_proj.svh": torch.zeros(
+                (16,), dtype=torch.float16
+            ),
         },
         str(shard_path),
     )
@@ -190,5 +228,7 @@ def test_detect_format_identifies_exllamav3(tmp_path):
         encoding="utf-8",
     )
 
-    detected = detect_format(tmp_path, json.loads(config_path.read_text(encoding="utf-8")))
+    detected = detect_format(
+        tmp_path, json.loads(config_path.read_text(encoding="utf-8"))
+    )
     assert detected == "exl3"

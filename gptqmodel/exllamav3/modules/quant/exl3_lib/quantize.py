@@ -768,6 +768,98 @@ def block_nmse(x: torch.Tensor, y: torch.Tensor, dim: int = 0, blocksize: int = 
     return diff_sq.item() / (sq.item() + 1e-20)
 
 
+def reconstruction_error_metrics(
+    error: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    tile_rows: int = 16,
+    tile_cols: int = 16,
+    worst_tiles: int = 16,
+):
+    """Return bounded, JSON-compatible reconstruction diagnostics.
+
+    EXL3 optimizes the regularized/Hadamard search-space matrix, so these
+    values deliberately describe that domain.  Keeping the domain explicit is
+    important: downstream source-space and activation-output errors are
+    separate measurements and must not be compared as if they were the same
+    loss.
+    """
+
+    if error.shape != reference.shape:
+        raise ValueError("EXL3 error and reference tensors must have identical shapes")
+    if error.ndim != 2:
+        raise ValueError("EXL3 reconstruction diagnostics require rank-2 tensors")
+
+    rows, columns = error.shape
+    if rows % tile_rows or columns % tile_cols:
+        raise ValueError(
+            "EXL3 reconstruction diagnostics require dimensions divisible by "
+            f"{tile_rows}x{tile_cols}, got {rows}x{columns}"
+        )
+
+    error_sq = error.square()
+    reference_sq = reference.square()
+    element_count = error.numel()
+    error_sum_sq = error_sq.sum().item()
+    reference_sum_sq = reference_sq.sum().item()
+    mse = error_sum_sq / max(element_count, 1)
+    nmse = error_sum_sq / max(reference_sum_sq, 1e-20)
+
+    tile_sse = (
+        error_sq.reshape(rows // tile_rows, tile_rows, columns // tile_cols, tile_cols)
+        .sum(dim=(1, 3))
+        .flatten()
+    )
+    quantile_levels = torch.tensor(
+        [0.5, 0.9, 0.99, 0.999],
+        dtype=torch.float,
+        device=tile_sse.device,
+    )
+    quantiles = torch.quantile(tile_sse.float(), quantile_levels).tolist()
+    worst_count = min(max(int(worst_tiles), 0), tile_sse.numel())
+    if worst_count:
+        worst_values, worst_indices = torch.topk(tile_sse, worst_count)
+        worst_values = worst_values.tolist()
+        worst_indices = worst_indices.tolist()
+    else:
+        worst_values = []
+        worst_indices = []
+    tile_columns = columns // tile_cols
+
+    return {
+        "domain": "regularized_exl3_search_space",
+        "shape": [rows, columns],
+        "element_count": element_count,
+        "error_sum_sq": error_sum_sq,
+        "reference_sum_sq": reference_sum_sq,
+        "mse": mse,
+        "nmse": nmse,
+        "relative_frobenius": math.sqrt(max(nmse, 0.0)),
+        "mean_abs_error": error.abs().mean().item(),
+        "max_abs_error": error.abs().max().item(),
+        "reference_finite": bool(torch.isfinite(reference).all().item()),
+        "error_finite": bool(torch.isfinite(error).all().item()),
+        "tile_shape": [tile_rows, tile_cols],
+        "tile_count": tile_sse.numel(),
+        "tile_sse_sum": tile_sse.sum().item(),
+        "tile_sse_max": tile_sse.max().item(),
+        "tile_sse_percentiles": {
+            "p50": quantiles[0],
+            "p90": quantiles[1],
+            "p99": quantiles[2],
+            "p99_9": quantiles[3],
+        },
+        "worst_tiles": [
+            {
+                "row": index // tile_columns,
+                "column": index % tile_columns,
+                "sse": value,
+            }
+            for index, value in zip(worst_indices, worst_values)
+        ],
+    }
+
+
 def regularize(
     weight: torch.Tensor,
     su: torch.Tensor,
@@ -845,6 +937,7 @@ def regularize(
         g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
     else:
         g_scale = 1.0
+        mse_scale = None
     weight *= g_scale
     su /= g_scale
 
@@ -854,10 +947,18 @@ def regularize(
     if verbose:
         print(f"     - su/sv std: {su.std().item():.6f}   {sv.std().item():.6f}")
         print(f"     - global scale: {g_scale:.6f}")
-        print(f"     - sample mse: {mse_scale.item():.6f}")
+        if mse_scale is not None:
+            print(f"     - sample mse: {mse_scale.item():.6f}")
         print(f"     - apply_out_scales: {str(apply_out_scales)}")
 
-    return apply_out_scales, weight, g_scale, su, sv
+    return (
+        apply_out_scales,
+        weight,
+        g_scale,
+        None if mse_scale is None else mse_scale.item(),
+        su,
+        sv,
+    )
 
 
 def quantize_exl3(
@@ -952,7 +1053,7 @@ def quantize_exl3(
             print(f"     - input tensor rms: {rms:.6f}")
 
         # Regularization
-        apply_out_scales, weight_r, g_scale, su, sv = regularize(
+        apply_out_scales, weight_r, g_scale, scale_search_mse, su, sv = regularize(
             weight_r,
             su,
             sv,
@@ -988,8 +1089,18 @@ def quantize_exl3(
 
         pb.update(tiles_k)
 
-        # Metrics
+        # Metrics. Keep every component needed to compare K values; a lone
+        # proxy number is insufficient because the fallback and Hessian paths
+        # do not have the same meaning.
+        E = weight_r - weight_q  # may run on CPU
+        error_metrics = reconstruction_error_metrics(E, weight_r)
+        hessian_num = None
+        hessian_den = None
+        hessian_ratio = None
+        hessian_status = "not_applicable_fallback" if q_fallback else "ok"
         if not q_fallback:
+            W = weight_r
+            Hd = None
             try:
                 def block_trace(A, B, block_size = 1024):
                     total = 0.0
@@ -1000,26 +1111,49 @@ def quantize_exl3(
                         partial = torch.einsum("ik,ij,jk->", A, B_block, A_j_block)
                         total += partial.item()
                     return total
-                E = None
-                W = None
-                Hd = None
-                E = weight_r - weight_q  # may run on CPU
-                W = weight_r
                 Hd = H.to(device)
-                weight_r = None
-                E = E.to(device)
-                num = block_trace(E, Hd)
-                E = None
-                W = W.to(device)
-                den = block_trace(W, Hd)
-                W = None
-                Hd = None
-                proxy_err = num / max(den, 1e-8)
+                E_device = E.to(device)
+                hessian_num = block_trace(E_device, Hd)
+                W_device = W.to(device)
+                hessian_den = block_trace(W_device, Hd)
+                hessian_ratio = hessian_num / max(hessian_den, 1e-8)
+                proxy_err = hessian_ratio
+                del E_device, W_device
             except torch.OutOfMemoryError:
-                del weight_r, E, W, Hd
+                hessian_status = "out_of_memory"
                 proxy_err = -1.0
+            finally:
+                Hd = None
+                W = None
         else:
-            proxy_err = 0.0
+            proxy_err = error_metrics["mse"]
+
+        quant_args["error_metrics"] = {
+            "schema": "gptqmodel.exl3-trellis-error",
+            "schema_version": 1,
+            "quantizer_path": "fallback" if q_fallback else "hessian_ldlq",
+            "reported_metric_kind": (
+                "unweighted_reconstruction_mse"
+                if q_fallback
+                else "hessian_weighted_relative_error"
+            ),
+            "reported_metric_value": (
+                error_metrics["mse"] if q_fallback else hessian_ratio
+            ),
+            "hessian_domain": "regularized_exl3_search_space",
+            "hessian_sample_count": int(H_data["count"]),
+            "hessian_regularization_sigma": float(quant_args.get("sigma_reg", 0.025)),
+            "hessian_weighted_error_numerator": hessian_num,
+            "hessian_weighted_reference_denominator": hessian_den,
+            "hessian_weighted_relative_error": hessian_ratio,
+            "hessian_metric_status": hessian_status,
+            "selected_global_scale": g_scale,
+            "scale_search_mse": scale_search_mse,
+            "apply_out_scales": bool(apply_out_scales),
+            "reconstruction": error_metrics,
+        }
+        weight_r = None
+        E = None
 
         # free_mem()
 

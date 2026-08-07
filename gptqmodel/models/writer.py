@@ -41,6 +41,7 @@ from ..quantization.config import (
 )
 from ..utils.backend import BACKEND
 from ..utils.exllamav3 import build_exllamav3_tensor_storage
+from ..utils.exl3_error_ledger import write_exl3_error_ledger
 from ..utils.hf import (
     _normalize_legacy_tied_weights_keys,
     prepare_remote_code_compat,
@@ -72,6 +73,7 @@ PROCESS_LOG_NAME = "process"
 PROCESS_LOG_LAYER = "layer"
 PROCESS_LOG_MODULE = "module"
 QUANT_LOG_LOSS = "loss"
+QUANT_LOG_LOSS_KIND = "loss_kind"
 QUANT_LOG_NSAMPLES = "samples"
 QUANT_LOG_DAMP = "damp"
 PROCESS_LOG_TIME = "time"
@@ -568,11 +570,21 @@ def ModelWriter(cls):
         os.makedirs(save_dir, exist_ok=True)
 
         if self.quant_log:
+            write_exl3_error_ledger(
+                save_dir,
+                (
+                    entry["exl3_error_ledger_record"]
+                    for entry in self.quant_log
+                    if isinstance(entry.get("exl3_error_ledger_record"), dict)
+                ),
+            )
             with open(os.path.join(save_dir, "quant_log.csv"), mode='w', newline='') as file:
                 w = csv.writer(file)
-                w.writerow([PROCESS_LOG_LAYER, PROCESS_LOG_MODULE, QUANT_LOG_LOSS, QUANT_LOG_NSAMPLES, QUANT_LOG_DAMP, PROCESS_LOG_TIME])
+                w.writerow([PROCESS_LOG_LAYER, PROCESS_LOG_MODULE, QUANT_LOG_LOSS,
+                            QUANT_LOG_LOSS_KIND, QUANT_LOG_NSAMPLES, QUANT_LOG_DAMP, PROCESS_LOG_TIME])
                 w.writerows([[entry.get(PROCESS_LOG_LAYER), entry.get(PROCESS_LOG_MODULE), entry.get(QUANT_LOG_LOSS),
-                              entry.get(QUANT_LOG_DAMP), entry.get(PROCESS_LOG_TIME)] for entry in self.quant_log])
+                              entry.get(QUANT_LOG_LOSS_KIND), entry.get(QUANT_LOG_NSAMPLES), entry.get(QUANT_LOG_DAMP),
+                              entry.get(PROCESS_LOG_TIME)] for entry in self.quant_log])
 
         pre_quantized_size_mb = get_model_files_size(self.model_local_path)
         pre_quantized_size_gb = pre_quantized_size_mb / 1024

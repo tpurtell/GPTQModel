@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import copy
+import os
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
@@ -28,6 +30,7 @@ from ..models.writer import (
     PROCESS_USED_MEMORY,
     QUANT_LOG_DAMP,
     QUANT_LOG_LOSS,
+    QUANT_LOG_LOSS_KIND,
     QUANT_LOG_NSAMPLES,
 )
 from ..nn_modules.exllamav3 import ExllamaV3Linear
@@ -35,6 +38,11 @@ from ..quantization import QuantizeConfig
 from ..quantization.config import EXL3Config, FORMAT, GPTQConfig, METHOD
 from ..quantization.gptq import GPTQ
 from ..utils.device import get_device
+from ..utils.exl3_error_ledger import (
+    JOURNAL_ENV,
+    append_exl3_error_journal,
+    build_projection_record,
+)
 from ..utils.exllamav3 import create_exllamav3_module
 from ..utils.logger import setup_logger
 from ..utils.module_locks import parent_module_lock
@@ -122,6 +130,9 @@ class EXL3Processor(LoopProcessor):
         self.avg_losses = []
         self.lm_head_name = lm_head_name
         self._stats_lock = threading.Lock()
+        self.error_journal_path = os.getenv(JOURNAL_ENV) or str(
+            Path(self.log_tmp_log_file_name).with_suffix(".exl3-error-ledger.jsonl")
+        )
 
     def set_calibration_dataset(self, calibration_dataset):
         """Rejects dataset replacement because EXL3 capture is fixed at construction."""
@@ -279,6 +290,43 @@ class EXL3Processor(LoopProcessor):
         )
         duration = time.perf_counter() - start_time
 
+        quantizer_metrics = quant_args.get("error_metrics")
+        if not isinstance(quantizer_metrics, dict):
+            raise RuntimeError(
+                f"EXL3 quantizer returned no structured error metrics for `{module.full_name}`."
+            )
+        encoded_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in out_tensors.values()
+            if isinstance(tensor, torch.Tensor)
+        )
+        ledger_provenance = None
+        if isinstance(module_qcfg.meta, dict):
+            ledger_provenance = module_qcfg.meta.get("ds4rt_error_ledger")
+        if ledger_provenance is not None and not isinstance(ledger_provenance, dict):
+            raise ValueError("EXL3 `meta.ds4rt_error_ledger` provenance must be a dictionary")
+        ledger_record = build_projection_record(
+            module_full_name=module.full_name,
+            layer_index=module.layer_index,
+            bits=int(quant_args["K"]),
+            codebook=module_qcfg.codebook,
+            sample_count=capture.nsamples,
+            duration_seconds=duration,
+            encoded_bytes=encoded_bytes,
+            device_names=[str(device) for device in quant_args["devices"]],
+            quantizer_metrics=quantizer_metrics,
+            provenance=ledger_provenance,
+        )
+
+        # This synchronous fsync is the commit barrier for the diagnostic
+        # record. Only after it succeeds may the packed tensor payload enter
+        # the module's asynchronous CPU stream/save lifecycle.
+        with self._stats_lock:
+            ledger_record_sha256 = append_exl3_error_journal(
+                self.error_journal_path,
+                ledger_record,
+            )
+
         stream_payload = dict(out_tensors)
         if module.bias is not None:
             stream_payload["bias"] = module.bias.detach()
@@ -307,6 +355,10 @@ class EXL3Processor(LoopProcessor):
             PROCESS_LOG_TIME: f"{duration:.3f}",
             PROCESS_LOG_FWD_TIME: self.formatted_fwd_time(),
             PROCESS_USED_MEMORY: self.device_memory_report(),
+            QUANT_LOG_LOSS_KIND: quantizer_metrics["reported_metric_kind"],
+            "exl3_error_ledger_record": ledger_record,
+            "exl3_error_journal": self.error_journal_path,
+            "exl3_error_record_sha256": ledger_record_sha256,
         }
 
         if workspace_summary:

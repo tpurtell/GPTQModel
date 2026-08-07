@@ -2,12 +2,27 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import csv
+import json
 from types import SimpleNamespace
 
 import pytest
-
-from gptqmodel.models.writer import ModelWriter
+from gptqmodel.models.writer import (
+    PROCESS_LOG_LAYER,
+    PROCESS_LOG_MODULE,
+    PROCESS_LOG_TIME,
+    QUANT_LOG_DAMP,
+    QUANT_LOG_LOSS,
+    QUANT_LOG_LOSS_KIND,
+    QUANT_LOG_NSAMPLES,
+    ModelWriter,
+)
 from gptqmodel.quantization.config import FORMAT, METHOD
+from gptqmodel.utils.exl3_error_ledger import (
+    LEDGER_FILENAME,
+    LEDGER_MANIFEST_FILENAME,
+    build_projection_record,
+)
 
 
 class _DummyKernel:
@@ -125,3 +140,63 @@ def test_save_quantized_strips_attention_before_serialization(tmp_path, monkeypa
 
     assert writer.model.config.attn_implementation == "flash_attention_2"
     assert writer.model.config._attn_implementation == "flash_attention_2"
+
+
+def test_save_quantized_persists_exl3_ledger_and_unambiguous_csv(tmp_path, monkeypatch):
+    tracker = {}
+    writer = _build_dummy_model_writer()
+    writer.model = _DummyModel(tracker)
+    ledger_record = build_projection_record(
+        module_full_name="model.layers.0.mlp.experts.0.gate_proj",
+        layer_index=0,
+        bits=2,
+        codebook="mcg",
+        sample_count=1024,
+        duration_seconds=1.0,
+        encoded_bytes=128,
+        device_names=["cuda:0"],
+        quantizer_metrics={
+            "reported_metric_kind": "hessian_weighted_relative_error",
+            "reconstruction": {
+                "error_sum_sq": 1.0,
+                "reference_sum_sq": 10.0,
+                "element_count": 256,
+                "max_abs_error": 0.5,
+            },
+        },
+        provenance={"family_join": {"source_revision": "abc"}},
+    )
+    writer.quant_log = [
+        {
+            PROCESS_LOG_LAYER: 0,
+            PROCESS_LOG_MODULE: "gate_proj",
+            QUANT_LOG_LOSS: "0.1000000000",
+            QUANT_LOG_LOSS_KIND: "hessian_weighted_relative_error",
+            QUANT_LOG_NSAMPLES: "1024",
+            QUANT_LOG_DAMP: "0.02500",
+            PROCESS_LOG_TIME: "1.000",
+            "exl3_error_ledger_record": ledger_record,
+        }
+    ]
+    monkeypatch.setattr("gptqmodel.models.writer.get_model_files_size", lambda _: 1)
+
+    with pytest.raises(RuntimeError, match="stop after checks"):
+        writer.save_quantized(save_dir=str(tmp_path))
+
+    manifest = json.loads((tmp_path / LEDGER_MANIFEST_FILENAME).read_text())
+    assert manifest["projection_records"] == 1
+    assert manifest["complete_family_records"] == 0
+    assert (tmp_path / LEDGER_FILENAME).is_file()
+    with (tmp_path / "quant_log.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows == [
+        {
+            PROCESS_LOG_LAYER: "0",
+            PROCESS_LOG_MODULE: "gate_proj",
+            QUANT_LOG_LOSS: "0.1000000000",
+            QUANT_LOG_LOSS_KIND: "hessian_weighted_relative_error",
+            QUANT_LOG_NSAMPLES: "1024",
+            QUANT_LOG_DAMP: "0.02500",
+            PROCESS_LOG_TIME: "1.000",
+        }
+    ]
