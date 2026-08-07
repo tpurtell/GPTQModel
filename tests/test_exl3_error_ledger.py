@@ -5,6 +5,7 @@ import hashlib
 import json
 
 import pytest
+from gptqmodel.utils import exl3_error_ledger as ledger_module
 from gptqmodel.utils.exl3_error_ledger import (
     LEDGER_FILENAME,
     LEDGER_MANIFEST_FILENAME,
@@ -248,6 +249,38 @@ def test_projection_journal_fsyncs_individually_bound_records(tmp_path):
     rows = [json.loads(line) for line in journal.read_bytes().splitlines()]
     assert [row["record_sha256"] for row in rows] == digests
     assert [row["projection"] for row in rows] == ["w1", "w2"]
+
+
+def test_projection_journal_is_idempotent_across_process_index_rebuild(tmp_path):
+    journal = tmp_path / "in-progress.jsonl"
+    record = _record("gate_proj", 1.0)
+
+    first = append_exl3_error_journal(journal, record)
+    second = append_exl3_error_journal(journal, record)
+    ledger_module._JOURNAL_INDEX.clear()
+    third = append_exl3_error_journal(journal, record)
+
+    assert first == second == third
+    rows = [json.loads(line) for line in journal.read_bytes().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["record_sha256"] == first
+
+
+def test_projection_journal_rejects_partial_or_digest_corrupt_history(tmp_path):
+    journal = tmp_path / "in-progress.jsonl"
+    journal.write_bytes(b'{"partial":true}')
+    ledger_module._JOURNAL_INDEX.clear()
+    with pytest.raises(ValueError, match="partial record"):
+        append_exl3_error_journal(journal, _record("gate_proj", 1.0))
+
+    journal.write_text(
+        json.dumps({**_record("gate_proj", 1.0), "record_sha256": "0" * 64})
+        + "\n",
+        encoding="utf-8",
+    )
+    ledger_module._JOURNAL_INDEX.clear()
+    with pytest.raises(ValueError, match="failed its digest"):
+        append_exl3_error_journal(journal, _record("down_proj", 2.0))
 
 
 def test_ledger_rejects_non_finite_metrics():

@@ -11,6 +11,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 from collections.abc import Iterable
 from copy import deepcopy
 from pathlib import Path
@@ -37,6 +38,8 @@ _PROJECTION_NAMES = {
     "down_proj": "w2",
     "up_proj": "w3",
 }
+_JOURNAL_INDEX_LOCK = threading.Lock()
+_JOURNAL_INDEX: dict[Path, tuple[tuple[int, int, int, int], set[str]]] = {}
 
 
 def _finite_json_value(value: Any, path: str = "record") -> Any:
@@ -378,6 +381,46 @@ def _bind_record(record: dict[str, Any]) -> dict[str, Any]:
     return {**clean, "record_sha256": digest}
 
 
+def _journal_file_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _load_journal_index(path: Path) -> set[str]:
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read EXL3 error journal: {path}") from error
+    if payload and not payload.endswith(b"\n"):
+        raise ValueError("EXL3 error journal ends with a partial record")
+    digests: set[str] = set()
+    for line_number, line in enumerate(payload.splitlines(), 1):
+        try:
+            record = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"EXL3 error journal record {line_number} is invalid"
+            ) from error
+        if not isinstance(record, dict) or record.get("record_kind") != "projection":
+            raise ValueError(
+                f"EXL3 error journal record {line_number} is not a projection"
+            )
+        digest = record.get("record_sha256")
+        unbound = {
+            key: value for key, value in record.items() if key != "record_sha256"
+        }
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or hashlib.sha256(_canonical_json_bytes(unbound)).hexdigest() != digest
+        ):
+            raise ValueError(
+                f"EXL3 error journal record {line_number} failed its digest"
+            )
+        digests.add(digest)
+    return digests
+
+
 def append_exl3_error_journal(
     journal_path: str | os.PathLike[str],
     projection_record: dict[str, Any],
@@ -388,25 +431,38 @@ def append_exl3_error_journal(
         raise ValueError("EXL3 error journal accepts projection records only")
     bound = _bind_record(projection_record)
     payload = _canonical_json_bytes(bound) + b"\n"
-    path = Path(journal_path)
+    path = Path(journal_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    existed = path.exists()
-    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
-    try:
-        written = os.write(descriptor, payload)
-        if written != len(payload):
-            raise OSError(
-                f"short EXL3 error-journal write: expected {len(payload)}, wrote {written}"
-            )
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    if not existed:
-        directory = os.open(path.parent, os.O_RDONLY)
+    with _JOURNAL_INDEX_LOCK:
+        existed = path.exists()
+        identity = _journal_file_identity(path) if existed else None
+        cached = _JOURNAL_INDEX.get(path)
+        if cached is None or cached[0] != identity:
+            digests = _load_journal_index(path) if existed else set()
+        else:
+            digests = cached[1]
+        if bound["record_sha256"] in digests:
+            return bound["record_sha256"]
+
+        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
         try:
-            os.fsync(directory)
+            written = os.write(descriptor, payload)
+            if written != len(payload):
+                raise OSError(
+                    "short EXL3 error-journal write: "
+                    f"expected {len(payload)}, wrote {written}"
+                )
+            os.fsync(descriptor)
         finally:
-            os.close(directory)
+            os.close(descriptor)
+        if not existed:
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        digests.add(bound["record_sha256"])
+        _JOURNAL_INDEX[path] = (_journal_file_identity(path), digests)
     return bound["record_sha256"]
 
 
