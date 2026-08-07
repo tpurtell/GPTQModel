@@ -114,11 +114,15 @@ def find_last_quantized_layer_index(
 
 
 @contextmanager
-def device_ctx(dev: Optional[torch.device | "DEVICE"]):
+def device_ctx(dev: Optional[torch.device | "DEVICE" | str]):
     """Temporarily set the thread-local device for CUDA/XPU backends."""
     if dev is None:
         yield
         return
+
+    dev = normalize_device_like(dev)
+    if dev is None:
+        raise ValueError("device_ctx received an invalid device")
 
     if dev.type == "cuda":
         with torch.cuda.device(dev.index):

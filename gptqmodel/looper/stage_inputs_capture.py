@@ -44,7 +44,12 @@ class StageInputsCapture:
         self.logger = logger or setup_logger()
 
     def _materialize_modules_with_direct_meta_tensors(self, device: torch.device) -> None:
-        for module_name in self.gptq_model.get_modules_with_direct_meta_tensors(self.gptq_model.model):
+        get_direct_meta_modules = getattr(
+            self.gptq_model, "get_modules_with_direct_meta_tensors", None
+        )
+        if not callable(get_direct_meta_modules):
+            return
+        for module_name in get_direct_meta_modules(self.gptq_model.model):
             module = get_module(self.gptq_model.model, module_name)
             if isinstance(module, torch.nn.Module):
                 self.gptq_model.shell_direct_meta_materialize(
@@ -120,11 +125,24 @@ class StageInputsCapture:
         # materialize / move.to CPU for initial input capture and for first layer to minimize VRAM usage, inputs will be stored on CPU
         # and to mimic behavior of offload_to_disk=False for offload_to_disk=True
         # Use calibration_data_device to specify device for calibration data (or "balanced" for round-robin across GPUs)
-        layers[0] = self.gptq_model.shell_module_materialize(
-            target_submodule=layers[0],
-            device=CPU,
-            module_path=module_path,
+        prepare_capture_layer = getattr(
+            self.gptq_model, "prepare_input_capture_layer", None
         )
+        if callable(prepare_capture_layer):
+            layers[0] = prepare_capture_layer(
+                layers[0],
+                module_path=module_path,
+                device=CPU,
+            )
+        else:
+            # Preserve compatibility with lightweight integrations and test
+            # doubles that implement the historical shell interface without
+            # inheriting BaseQModel.
+            layers[0] = self.gptq_model.shell_module_materialize(
+                target_submodule=layers[0],
+                module_path=module_path,
+                device=CPU,
+            )
         cur_layer_device = CPU
 
         # Use calibration_data_device if specified, otherwise use cur_layer_device

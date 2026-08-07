@@ -19,6 +19,19 @@ MTP_BLOCK_COUNT = 3
 MTP_CAPTURE_INPUT_IDS = "_gptqmodel_mtp_input_ids"
 MTP_CAPTURE_ATTENTION_MASK = "_gptqmodel_mtp_attention_mask"
 MTP_CAPTURE_DECODE_MASK = "_gptqmodel_mtp_decode_mask"
+MTP_REPLAY_PROJECTED_MAIN = "_gptqmodel_mtp_projected_main"
+MTP_REPLAY_MAIN_POSITION_IDS = "_gptqmodel_mtp_main_position_ids"
+MTP_REPLAY_MAIN_ATTENTION_MASK = "_gptqmodel_mtp_main_attention_mask"
+MTP_REPLAY_PROPOSAL_TOKEN_IDS = "_gptqmodel_mtp_proposal_token_ids"
+MTP_REPLAY_ATTENTION_MASK = "_gptqmodel_mtp_joint_attention_mask"
+MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS = (
+    "_gptqmodel_mtp_proposal_position_embeddings"
+)
+MTP_REPLAY_MAIN_POSITION_EMBEDDINGS = "_gptqmodel_mtp_main_position_embeddings"
+MTP_ROUTED_EXPERT_MODULE_PATTERN = (
+    r"^mtp\.\d+\.mlp\.experts\.\d+\."
+    r"(?:gate_proj|up_proj|down_proj)$"
+)
 
 
 def deepseek_v4_mtp_target_layer_ids(config) -> tuple[int, ...]:
@@ -117,7 +130,14 @@ def validate_deepseek_v4_mtp_checkpoint_keys(config, keys: Iterable[str]) -> dic
 
 
 def deepseek_v4_mtp_module_tree() -> list:
-    """Return the auxiliary layer tree without joining it to target traversal."""
+    """Return the routed-expert-only auxiliary quantization tree.
+
+    Every envelope projection, shared expert, norm, router, and hyper-connection
+    remains in the checkpoint's native representation on the coordinator.  Only
+    the routed expert family crosses the Spark artifact boundary, so exposing a
+    dense auxiliary projection as quantizable here would silently change the
+    model scope even if a downstream exporter later discarded it.
+    """
 
     return [
         "mtp",
@@ -126,13 +146,13 @@ def deepseek_v4_mtp_module_tree() -> list:
             "input_layernorm": ("input_layernorm:!",),
             "self_attn": (
                 "q_a_norm:!",
-                "q_a_proj:0",
+                "q_a_proj:!",
                 "q_b_norm:!",
-                "q_b_proj:0",
+                "q_b_proj:!",
                 "o_a_proj:!",
-                "o_b_proj:1",
+                "o_b_proj:!",
                 "kv_norm:!",
-                "kv_proj:2",
+                "kv_proj:!",
             ),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
             "mlp|ffn:moe": {
@@ -145,9 +165,9 @@ def deepseek_v4_mtp_module_tree() -> list:
                     ),
                 },
                 "shared_experts": (
-                    "gate_proj|w1:0",
-                    "up_proj|w3:0",
-                    "down_proj|w2:1",
+                    "gate_proj|w1:!",
+                    "up_proj|w3:!",
+                    "down_proj|w2:!",
                 ),
             },
         },
@@ -365,6 +385,27 @@ class DeepSeekV4MTPReplayBatch:
     main_position_ids: torch.Tensor
     main_attention_mask: torch.Tensor
     projected_main: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class DeepSeekV4MTPReplayState:
+    """Prepared immutable metadata plus the current joint proposal residual.
+
+    The state is deliberately block-independent.  GPTQModel can therefore
+    cache it at the first auxiliary block and carry the same projected target
+    window, proposal IDs, visibility mask, and rotary embeddings through all
+    three normal layer-loop iterations.  Only ``residual`` changes between
+    blocks.
+    """
+
+    projected_main: torch.Tensor
+    residual: torch.Tensor
+    proposal_token_ids: torch.Tensor
+    proposal_position_ids: torch.Tensor
+    joint_attention_mask: torch.Tensor
+    proposal_position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]]
+    main_position_embeddings: tuple[torch.Tensor, torch.Tensor]
+    main_position_ids: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -761,22 +802,31 @@ class DeepSeekV4MTPReplay:
         )
         return proposal_ids, proposal_positions, attention_mask
 
+    @staticmethod
     def _prime_main_cache(
-        self,
         *,
         block: nn.Module,
         projected_main: torch.Tensor,
         main_position_ids: torch.Tensor,
-        rotary: nn.Module,
+        rotary: nn.Module | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         from transformers.cache_utils import DynamicCache
         from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb
 
         input_shape = projected_main.shape[:-1]
         hidden_shape = (*input_shape, -1, int(block.self_attn.head_dim))
-        cos, sin = rotary(
-            projected_main, position_ids=main_position_ids, layer_type="main"
-        )
+        if position_embeddings is None:
+            if rotary is None:
+                raise ValueError(
+                    "DeepSeek V4 MTP main-cache priming requires rotary or "
+                    "precomputed position embeddings"
+                )
+            cos, sin = rotary(
+                projected_main, position_ids=main_position_ids, layer_type="main"
+            )
+        else:
+            cos, sin = position_embeddings
         kv = block.self_attn.kv_norm(block.self_attn.kv_proj(projected_main))
         kv = kv.view(*hidden_shape).transpose(1, 2)
         kv = apply_rotary_pos_emb(kv, cos, sin)
@@ -787,13 +837,11 @@ class DeepSeekV4MTPReplay:
         cache.update(kv, kv, block.layer_idx)
         return cache
 
-    def replay(
+    def prepare_batch(
         self,
         batch: DeepSeekV4MTPReplayBatch,
-        *,
-        prepare_ffn: Callable[[int, nn.Module, torch.Tensor, torch.Tensor], None] | None = None,
-    ) -> DeepSeekV4MTPReplayResult:
-        """Run all three blocks while preserving the joint five-row batch."""
+    ) -> DeepSeekV4MTPReplayState:
+        """Prepare the one shared target window and five proposal rows once."""
 
         from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
             DeepseekV4RotaryEmbedding,
@@ -826,73 +874,226 @@ class DeepSeekV4MTPReplay:
         rotary = DeepseekV4RotaryEmbedding(self.shell.config).to(
             device=first.device, dtype=first.dtype
         )
-        proposal_position_embeddings = {
-            "main": rotary(
-                proposal_embedding,
-                position_ids=proposal_positions,
+        return DeepSeekV4MTPReplayState(
+            projected_main=projected_main,
+            residual=residual,
+            proposal_token_ids=proposal_ids,
+            proposal_position_ids=proposal_positions,
+            joint_attention_mask=attention_mask,
+            proposal_position_embeddings={
+                "main": rotary(
+                    proposal_embedding,
+                    position_ids=proposal_positions,
+                    layer_type="main",
+                )
+            },
+            main_position_embeddings=rotary(
+                projected_main,
+                position_ids=batch.main_position_ids,
                 layer_type="main",
+            ),
+            main_position_ids=batch.main_position_ids,
+        )
+
+    def replay_block(
+        self,
+        block_index: int,
+        state: DeepSeekV4MTPReplayState,
+        *,
+        residual: torch.Tensor | None = None,
+        prepare_ffn: Callable[[int, nn.Module, torch.Tensor, torch.Tensor], None]
+        | None = None,
+        capture_route: bool = True,
+    ) -> tuple[torch.Tensor, DeepSeekV4MTPReplayRoute | None]:
+        """Execute exactly one auxiliary block for normal layer-loop replay."""
+
+        if not isinstance(state, DeepSeekV4MTPReplayState):
+            raise TypeError("state must be DeepSeekV4MTPReplayState")
+        if block_index < 0 or block_index >= len(self.shell.mtp):
+            raise IndexError(
+                f"DeepSeek V4 MTP block index {block_index} outside "
+                f"[0, {len(self.shell.mtp)})"
             )
-        }
-        routes: list[DeepSeekV4MTPReplayRoute] = []
-        for block_index, block in enumerate(self.shell.mtp):
-            cache = self._prime_main_cache(
-                block=block,
-                projected_main=projected_main,
-                main_position_ids=batch.main_position_ids,
-                rotary=rotary,
+        current = state.residual if residual is None else residual
+        return self._replay_block_body(
+            block_index=block_index,
+            block=self.shell.mtp[block_index],
+            residual=current,
+            projected_main=state.projected_main,
+            main_position_ids=state.main_position_ids,
+            proposal_token_ids=state.proposal_token_ids,
+            proposal_position_ids=state.proposal_position_ids,
+            joint_attention_mask=state.joint_attention_mask,
+            proposal_position_embeddings=state.proposal_position_embeddings,
+            main_position_embeddings=state.main_position_embeddings,
+            prepare_ffn=prepare_ffn,
+            capture_route=capture_route,
+        )
+
+    @staticmethod
+    def _replay_block_body(
+        *,
+        block_index: int,
+        block: nn.Module,
+        residual: torch.Tensor,
+        projected_main: torch.Tensor,
+        main_position_ids: torch.Tensor,
+        proposal_token_ids: torch.Tensor,
+        proposal_position_ids: torch.Tensor,
+        joint_attention_mask: torch.Tensor,
+        proposal_position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        main_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        prepare_ffn: Callable[[int, nn.Module, torch.Tensor, torch.Tensor], None]
+        | None = None,
+        capture_route: bool = True,
+    ) -> tuple[torch.Tensor, DeepSeekV4MTPReplayRoute | None]:
+        """Shared official one-block body used by reference and quantization."""
+
+        cache = DeepSeekV4MTPReplay._prime_main_cache(
+            block=block,
+            projected_main=projected_main,
+            main_position_ids=main_position_ids,
+            position_embeddings=main_position_embeddings,
+        )
+        dtype = residual.dtype
+        post, comb, collapsed = block.attn_hc(residual)
+        attention_output, _ = block.self_attn(
+            block.input_layernorm(collapsed),
+            position_embeddings=proposal_position_embeddings,
+            position_ids=proposal_position_ids,
+            attention_mask=joint_attention_mask,
+            past_key_values=cache,
+        )
+        residual = post.to(dtype).unsqueeze(-1) * attention_output.unsqueeze(
+            -2
+        ) + torch.matmul(comb.to(dtype).transpose(-1, -2), residual)
+
+        post, comb, collapsed = block.ffn_hc(residual)
+        ffn_input = block.post_attention_layernorm(collapsed)
+        if prepare_ffn is not None:
+            prepare_ffn(block_index, block, ffn_input, proposal_token_ids)
+
+        captured: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+        def capture_router(_module, _args, _kwargs, output):
+            captured.append(output)
+
+        handle = None
+        if capture_route:
+            handle = block.mlp.gate.register_forward_hook(
+                capture_router, with_kwargs=True
             )
-            dtype = residual.dtype
-            post, comb, collapsed = block.attn_hc(residual)
-            attention_output, _ = block.self_attn(
-                block.input_layernorm(collapsed),
-                position_embeddings=proposal_position_embeddings,
-                position_ids=proposal_positions,
-                attention_mask=attention_mask,
-                past_key_values=cache,
-            )
-            residual = post.to(dtype).unsqueeze(-1) * attention_output.unsqueeze(
-                -2
-            ) + torch.matmul(comb.to(dtype).transpose(-1, -2), residual)
-
-            post, comb, collapsed = block.ffn_hc(residual)
-            ffn_input = block.post_attention_layernorm(collapsed)
-            if prepare_ffn is not None:
-                prepare_ffn(block_index, block, ffn_input, proposal_ids)
-
-            captured: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-
-            def capture_router(_module, _args, _kwargs, output):
-                captured.append(output)
-
-            handle = block.mlp.gate.register_forward_hook(capture_router, with_kwargs=True)
-            try:
-                mlp_output = block.mlp(ffn_input, input_ids=proposal_ids)
-            finally:
+        try:
+            mlp_output = block.mlp(ffn_input, input_ids=proposal_token_ids)
+        finally:
+            if handle is not None:
                 handle.remove()
+        route = None
+        if capture_route:
             if len(captured) != 1 or len(captured[0]) != 3:
                 raise RuntimeError(
                     f"DeepSeek V4 MTP block {block_index} router was not captured exactly once"
                 )
             logits, weights, indices = captured[0]
-            routes.append(
-                DeepSeekV4MTPReplayRoute(
-                    block_index=block_index,
-                    logits=logits.reshape(*proposal_ids.shape, -1),
-                    weights=weights.reshape(*proposal_ids.shape, -1),
-                    indices=indices.reshape(*proposal_ids.shape, -1),
-                )
+            route = DeepSeekV4MTPReplayRoute(
+                block_index=block_index,
+                logits=logits.reshape(*proposal_token_ids.shape, -1),
+                weights=weights.reshape(*proposal_token_ids.shape, -1),
+                indices=indices.reshape(*proposal_token_ids.shape, -1),
             )
-            residual = post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(
-                -2
-            ) + torch.matmul(comb.to(dtype).transpose(-1, -2), residual)
+        residual = post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(
+            -2
+        ) + torch.matmul(comb.to(dtype).transpose(-1, -2), residual)
+        return residual, route
+
+    def replay(
+        self,
+        batch: DeepSeekV4MTPReplayBatch,
+        *,
+        prepare_ffn: Callable[[int, nn.Module, torch.Tensor, torch.Tensor], None] | None = None,
+    ) -> DeepSeekV4MTPReplayResult:
+        """Run all three blocks while preserving the joint five-row batch."""
+        state = self.prepare_batch(batch)
+        residual = state.residual
+        routes: list[DeepSeekV4MTPReplayRoute] = []
+        for block_index in range(len(self.shell.mtp)):
+            residual, route = self.replay_block(
+                block_index,
+                state,
+                residual=residual,
+                prepare_ffn=prepare_ffn,
+                capture_route=True,
+            )
+            if route is None:
+                raise RuntimeError(
+                    f"DeepSeek V4 MTP block {block_index} did not return a route"
+                )
+            routes.append(route)
 
         return DeepSeekV4MTPReplayResult(
-            projected_main=projected_main,
-            proposal_token_ids=proposal_ids,
-            proposal_position_ids=proposal_positions,
+            projected_main=state.projected_main,
+            proposal_token_ids=state.proposal_token_ids,
+            proposal_position_ids=state.proposal_position_ids,
             terminal_residual=residual,
             routes=tuple(routes),
         )
+
+
+def _deepseek_v4_mtp_quantization_block_forward(
+    self,
+    hidden_states: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+    use_cache: bool = False,
+    **kwargs,
+):
+    """Layer-loop entry point for one exact auxiliary replay block.
+
+    ``attention_mask`` is the ordinary two-dimensional all-proposal mask used
+    by GPTQModel to mask Hessian rows.  The distinct additive joint mask below
+    preserves 128 target-main rows plus all five mutually visible proposal
+    rows for the actual attention operator.
+    """
+
+    del attention_mask
+    if use_cache:
+        raise ValueError("DeepSeek V4 MTP calibration replay does not publish a cache")
+    block_index = getattr(self, "_gptqmodel_mtp_block_index", None)
+    if not isinstance(block_index, int):
+        raise RuntimeError("DeepSeek V4 MTP quantization block has no block index")
+    required = {
+        MTP_REPLAY_PROJECTED_MAIN,
+        MTP_REPLAY_MAIN_POSITION_IDS,
+        MTP_REPLAY_PROPOSAL_TOKEN_IDS,
+        MTP_REPLAY_ATTENTION_MASK,
+        MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS,
+        MTP_REPLAY_MAIN_POSITION_EMBEDDINGS,
+    }
+    missing = sorted(required - set(kwargs))
+    if missing:
+        raise ValueError(
+            "DeepSeek V4 MTP quantization replay lacks " + ", ".join(missing)
+        )
+    proposal_positions = position_ids
+    if not isinstance(proposal_positions, torch.Tensor):
+        raise ValueError("DeepSeek V4 MTP quantization replay lacks proposal positions")
+    residual, _ = DeepSeekV4MTPReplay._replay_block_body(
+        block_index=block_index,
+        block=self,
+        residual=hidden_states,
+        projected_main=kwargs[MTP_REPLAY_PROJECTED_MAIN],
+        main_position_ids=kwargs[MTP_REPLAY_MAIN_POSITION_IDS],
+        proposal_token_ids=kwargs[MTP_REPLAY_PROPOSAL_TOKEN_IDS],
+        proposal_position_ids=proposal_positions,
+        joint_attention_mask=kwargs[MTP_REPLAY_ATTENTION_MASK],
+        proposal_position_embeddings=kwargs[
+            MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS
+        ],
+        main_position_embeddings=kwargs[MTP_REPLAY_MAIN_POSITION_EMBEDDINGS],
+        capture_route=False,
+    )
+    return residual
 
 
 def _fp32_topk_router_forward(self, hidden_states: torch.Tensor):
@@ -1490,6 +1691,37 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
             dtype=source_dtype,
         )
 
+    def build_mtp_quantization_model(
+        self,
+        runtime: DeepSeekV4MTPPrefixRuntime,
+        *,
+        calibration_embedding_device: torch.device | str = "cpu",
+    ) -> "DeepSeekV4MTPQuantizationModel":
+        """Build a disjoint GPTQModel adapter for natural auxiliary replay.
+
+        Target traversal and its already-quantized prefix remain untouched.
+        The returned model exposes exactly ``mtp.0`` through ``mtp.2`` to the
+        normal layer looper and accepts :class:`DeepSeekV4MTPReplayBatch`
+        objects as its calibration dataset.
+        """
+
+        if not isinstance(runtime, DeepSeekV4MTPPrefixRuntime):
+            raise TypeError("runtime must be DeepSeekV4MTPPrefixRuntime")
+        embedding = getattr(runtime.target_embedding, "weight", None)
+        if not isinstance(embedding, torch.Tensor) or embedding.is_meta:
+            raise RuntimeError(
+                "DeepSeek V4 MTP quantization requires a materialized target embedding"
+            )
+        embedding = embedding.detach().to(
+            device=torch.device(calibration_embedding_device),
+            dtype=runtime.dtype,
+        )
+        return DeepSeekV4MTPQuantizationModel.from_target_model(
+            self,
+            auxiliary=runtime.auxiliary,
+            embedding_weight=embedding,
+        )
+
     def materialize_mtp_replay_submodule(
         self,
         auxiliary: DeepSeekV4MTPAuxiliary,
@@ -1497,6 +1729,7 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         *,
         device: torch.device | str,
         target_dtype: torch.dtype = torch.bfloat16,
+        recurse: bool = True,
     ) -> nn.Module:
         """Materialize one replay leaf while decoding native FP8/FP4 weights.
 
@@ -1516,7 +1749,7 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         )
         if not is_floatx:
             return auxiliary.materialize_nonquant_submodule(
-                target_submodule, device=device, recurse=True
+                target_submodule, device=device, recurse=recurse
             )
 
         decoded = self.build_mtp_quant_source_module(
@@ -1538,19 +1771,269 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         return target_submodule
 
 
+class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
+    """Disjoint three-layer GPTQModel view over integrated dSpark/MTP.
+
+    This adapter is intentionally constructed only from an already loaded
+    target model and its prefix runtime.  It cannot be selected by AutoModel,
+    cannot append MTP blocks to target traversal, and exposes only routed
+    expert projections to EXL3 processing.
+    """
+
+    module_tree = deepseek_v4_mtp_module_tree()
+    out_of_model_tensors = None
+
+    def after_model_load(self, model, load_quantized_model=False):
+        del load_quantized_model
+        if not isinstance(model, DeepSeekV4MTPAuxiliaryShell):
+            raise TypeError(
+                "DeepSeek V4 MTP quantization model requires an auxiliary shell"
+            )
+        return model
+
+    @classmethod
+    def from_target_model(
+        cls,
+        target_model: DeepSeekV4QModel,
+        *,
+        auxiliary: DeepSeekV4MTPAuxiliary,
+        embedding_weight: torch.Tensor,
+    ) -> "DeepSeekV4MTPQuantizationModel":
+        if not isinstance(target_model, DeepSeekV4QModel):
+            raise TypeError("target_model must be DeepSeekV4QModel")
+        if not isinstance(auxiliary, DeepSeekV4MTPAuxiliary):
+            raise TypeError("auxiliary must be DeepSeekV4MTPAuxiliary")
+        if target_model.quantize_config is None:
+            raise RuntimeError("MTP quantization requires the target quantize config")
+        mtp_quantize_config = copy.deepcopy(target_model.quantize_config)
+        mtp_quantize_config.module_include = [MTP_ROUTED_EXPERT_MODULE_PATTERN]
+        adapter = cls(
+            model=auxiliary.model,
+            quantized=False,
+            quantize_config=mtp_quantize_config,
+            tokenizer=None,
+            qlinear_kernel=target_model.qlinear_kernel,
+            load_quantized_model=False,
+            trust_remote_code=target_model.trust_remote_code,
+            model_local_path=target_model.model_local_path,
+            turtle_model=auxiliary.turtle_model,
+        )
+        adapter._mtp_auxiliary = auxiliary
+        adapter._mtp_replay = DeepSeekV4MTPReplay(
+            auxiliary,
+            embedding_weight=embedding_weight,
+        )
+        for block_index, block in enumerate(adapter.model.mtp):
+            block._gptqmodel_mtp_block_index = block_index
+            block.forward = MethodType(
+                _deepseek_v4_mtp_quantization_block_forward,
+                block,
+            )
+        return adapter
+
+    def prepare_input_capture_layer(
+        self,
+        layer: nn.Module,
+        *,
+        module_path: str | None,
+        device: torch.device,
+    ) -> nn.Module:
+        """Keep block zero meta: its pre-hook aborts before reading weights."""
+
+        del module_path, device
+        if layer is not self.model.mtp[0]:
+            raise RuntimeError(
+                "DeepSeek V4 MTP input capture was not attached to block zero"
+            )
+        return layer
+
+    def prepare_dataset(
+        self,
+        calibration_dataset,
+        calibration_dataset_concat_size=None,
+        calibration_dataset_sort=None,
+        batch_size: int = 1,
+        calibration_data_min_length: int = 10,
+        calibration_concat_separator=None,
+    ):
+        """Preserve durable replay batches without tokenization or concatenation."""
+
+        del calibration_data_min_length
+        if calibration_dataset_concat_size is not None:
+            raise ValueError("MTP replay batches cannot be concatenated")
+        if calibration_concat_separator is not None:
+            raise ValueError("MTP replay batches do not accept a concat separator")
+        if calibration_dataset_sort not in (None, "none"):
+            raise ValueError(
+                "MTP replay order is immutable; calibration_sort must be None"
+            )
+        if batch_size != 1:
+            raise ValueError(
+                "MTP replay batches are already jointly batched; batch_size must be 1"
+            )
+        prepared = []
+        for index, item in enumerate(calibration_dataset):
+            batch = getattr(item, "replay_batch", item)
+            if not isinstance(batch, DeepSeekV4MTPReplayBatch):
+                raise TypeError(
+                    f"MTP calibration item {index} is not DeepSeekV4MTPReplayBatch"
+                )
+            self._mtp_replay._validate_batch(batch)
+            first = (
+                batch.projected_main
+                if batch.projected_main is not None
+                else batch.target_taps[0]
+            )
+            if first.device != self._mtp_replay.embedding_weight.device:
+                raise ValueError(
+                    "MTP replay batch and calibration embedding must share a device"
+                )
+            proposal_ids, _, _ = self._mtp_replay._proposal_metadata(
+                batch, dtype=first.dtype
+            )
+            prepared.append(
+                {
+                    "input_ids": proposal_ids,
+                    "attention_mask": torch.ones_like(
+                        proposal_ids, dtype=torch.bool
+                    ),
+                    MTP_REPLAY_PROJECTED_MAIN: (
+                        batch.projected_main
+                        if batch.projected_main is not None
+                        else torch.cat(batch.target_taps, dim=-1)
+                    ),
+                    MTP_REPLAY_MAIN_POSITION_IDS: batch.main_position_ids,
+                    MTP_REPLAY_MAIN_ATTENTION_MASK: batch.main_attention_mask,
+                    "_gptqmodel_mtp_has_projected_main": torch.tensor(
+                        batch.projected_main is not None,
+                        dtype=torch.bool,
+                        device=first.device,
+                    ),
+                }
+            )
+        if not prepared:
+            raise ValueError("MTP calibration dataset must not be empty")
+        return prepared
+
+    def run_input_capture(self, example, use_cache: bool, data_device):
+        """Construct the exact first-block input, then let its pre-hook stop."""
+
+        del data_device
+        if use_cache:
+            raise ValueError("MTP calibration input capture does not use a cache")
+        required = {
+            "input_ids",
+            "attention_mask",
+            MTP_REPLAY_PROJECTED_MAIN,
+            MTP_REPLAY_MAIN_POSITION_IDS,
+            MTP_REPLAY_MAIN_ATTENTION_MASK,
+            "_gptqmodel_mtp_has_projected_main",
+        }
+        missing = sorted(required - set(example))
+        if missing:
+            raise ValueError("MTP calibration example lacks " + ", ".join(missing))
+        has_projected = bool(
+            example["_gptqmodel_mtp_has_projected_main"].item()
+        )
+        stored_main = example[MTP_REPLAY_PROJECTED_MAIN]
+        if has_projected:
+            projected_main = stored_main
+            target_taps = None
+        else:
+            hidden = int(self.model.config.hidden_size)
+            if stored_main.shape[-1] != MTP_BLOCK_COUNT * hidden:
+                raise ValueError("MTP unprojected target-tap width is invalid")
+            target_taps = tuple(stored_main.split(hidden, dim=-1))
+            projected_main = None
+        replay_batch = DeepSeekV4MTPReplayBatch(
+            target_taps=target_taps,
+            projected_main=projected_main,
+            anchor_token_ids=example["input_ids"][:, 0],
+            main_position_ids=example[MTP_REPLAY_MAIN_POSITION_IDS],
+            main_attention_mask=example[MTP_REPLAY_MAIN_ATTENTION_MASK],
+        )
+        state = self._mtp_replay.prepare_batch(replay_batch)
+        return self.model.mtp[0](
+            state.residual,
+            attention_mask=example["attention_mask"],
+            position_ids=state.proposal_position_ids,
+            use_cache=False,
+            **{
+                MTP_REPLAY_PROJECTED_MAIN: state.projected_main,
+                MTP_REPLAY_MAIN_POSITION_IDS: state.main_position_ids,
+                MTP_REPLAY_PROPOSAL_TOKEN_IDS: state.proposal_token_ids,
+                MTP_REPLAY_ATTENTION_MASK: state.joint_attention_mask,
+                MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS: (
+                    state.proposal_position_embeddings
+                ),
+                MTP_REPLAY_MAIN_POSITION_EMBEDDINGS: (
+                    state.main_position_embeddings
+                ),
+            },
+        )
+
+    def pre_quantize(self, module: nn.Module) -> nn.Module:
+        """Decode the exact auxiliary block body, excluding unused heads."""
+
+        if module not in self.model.mtp:
+            return super().pre_quantize(module)
+        device = torch.device(self.quantize_config.device)
+        source_dtype = getattr(self.model.config, "dtype", torch.bfloat16)
+        if not isinstance(source_dtype, torch.dtype):
+            source_dtype = torch.bfloat16
+        excluded_roots = {
+            "main_proj",
+            "main_norm",
+            "hc_head",
+            "norm",
+            "markov_head",
+            "confidence_head",
+        }
+        materialized = 0
+        for subname, submodule in module.named_modules():
+            if not subname or subname.split(".", 1)[0] in excluded_roots:
+                continue
+            direct = self._mtp_auxiliary.checkpoint_tensors_for_submodule(
+                submodule, recurse=False
+            )
+            if not direct:
+                continue
+            self.materialize_mtp_replay_submodule(
+                self._mtp_auxiliary,
+                submodule,
+                device=device,
+                target_dtype=source_dtype,
+                recurse=False,
+            )
+            materialized += 1
+        if materialized == 0:
+            raise RuntimeError("MTP quantization block materialized no checkpoint leaves")
+        return module
+
+
 
 __all__ = [
     "MTP_BLOCK_COUNT",
     "MTP_CAPTURE_ATTENTION_MASK",
     "MTP_CAPTURE_DECODE_MASK",
     "MTP_CAPTURE_INPUT_IDS",
+    "MTP_REPLAY_ATTENTION_MASK",
+    "MTP_REPLAY_MAIN_ATTENTION_MASK",
+    "MTP_REPLAY_MAIN_POSITION_EMBEDDINGS",
+    "MTP_REPLAY_MAIN_POSITION_IDS",
+    "MTP_REPLAY_PROJECTED_MAIN",
+    "MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS",
+    "MTP_REPLAY_PROPOSAL_TOKEN_IDS",
+    "MTP_ROUTED_EXPERT_MODULE_PATTERN",
     "DeepSeekV4MTPAuxiliary",
     "DeepSeekV4MTPAuxiliaryShell",
     "DeepSeekV4MTPPrefixRuntime",
+    "DeepSeekV4MTPQuantizationModel",
     "DeepSeekV4MTPReplay",
     "DeepSeekV4MTPReplayBatch",
     "DeepSeekV4MTPReplayResult",
     "DeepSeekV4MTPReplayRoute",
+    "DeepSeekV4MTPReplayState",
     "DeepSeekV4MTPTargetTapEvent",
     "DeepSeekV4TargetAnchorResolver",
     "DeepSeekV4QModel",

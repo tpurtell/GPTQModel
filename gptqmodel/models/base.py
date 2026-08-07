@@ -1829,6 +1829,26 @@ class BaseQModel(nn.Module):
             # offload_to_disk(model=self.model, module=self.get_base_modules(model=self.model), disk_path=self.quantize_config.offload_to_disk_path)
             pass
 
+    def prepare_input_capture_layer(
+        self,
+        layer: nn.Module,
+        *,
+        module_path: Optional[str],
+        device: torch.device,
+    ) -> nn.Module:
+        """Materialize the first traversed layer before its early-stop hook.
+
+        Auxiliary model definitions may override this when constructing the
+        first layer input does not execute the layer body.  The ordinary model
+        path retains the historical eager materialization behavior.
+        """
+
+        return self.shell_module_materialize(
+            target_submodule=layer,
+            device=device,
+            module_path=module_path,
+        )
+
     def capture_first_layer_positional_inputs(
         self,
         args: tuple[Any, ...],

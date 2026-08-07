@@ -15,6 +15,7 @@ from gptqmodel.models.definitions.deepseek_v4 import (
     DeepSeekV4MTPAuxiliary,
     DeepSeekV4MTPAuxiliaryShell,
     DeepSeekV4MTPPrefixRuntime,
+    DeepSeekV4MTPQuantizationModel,
     DeepSeekV4MTPReplay,
     DeepSeekV4MTPReplayBatch,
     DeepSeekV4MTPTargetTapEvent,
@@ -27,6 +28,8 @@ from gptqmodel.models.definitions.deepseek_v4 import (
     patch_deepseek_v4_router_precision,
     validate_deepseek_v4_mtp_checkpoint_keys,
 )
+from gptqmodel.quantization.config import EXL3Config
+from gptqmodel.looper.stage_inputs_capture import StageInputsCapture
 
 
 def _tiny_v4_config() -> DeepseekV4Config:
@@ -242,6 +245,131 @@ def test_deepseek_v4_mtp_replay_keeps_five_rows_joint_and_uses_target_lane_means
     for projected_route, tap_route in zip(projected_result.routes, result.routes):
         assert torch.equal(projected_route.indices, tap_route.indices)
         assert torch.equal(projected_route.weights, tap_route.weights)
+
+
+def test_deepseek_v4_mtp_quantization_adapter_replays_one_exact_block() -> None:
+    torch.manual_seed(0xD55)
+    config = _tiny_v4_config()
+    shell = DeepSeekV4MTPAuxiliaryShell(config, device="cpu")
+    with torch.no_grad():
+        for parameter in shell.parameters():
+            if parameter.is_floating_point():
+                parameter.normal_(mean=0.0, std=0.02)
+        for block in shell.mtp:
+            block.mlp.gate.e_score_correction_bias.zero_()
+    auxiliary = DeepSeekV4MTPAuxiliary(
+        model=shell,
+        turtle_model=SimpleNamespace(),
+        checkpoint_contract={"test": True},
+    )
+    embedding = torch.randn(
+        config.vocab_size, config.hidden_size, dtype=torch.bfloat16
+    )
+    target = object.__new__(DeepSeekV4QModel)
+    nn.Module.__init__(target)
+    target.quantize_config = EXL3Config(bits=2.0, device="cpu")
+    target.qlinear_kernel = None
+    target.trust_remote_code = False
+    target.model_local_path = "/tmp/deepseek-v4-test"
+
+    adapter = DeepSeekV4MTPQuantizationModel.from_target_model(
+        target,
+        auxiliary=auxiliary,
+        embedding_weight=embedding,
+    )
+    assert target.quantize_config.module_include is None
+    assert adapter.quantize_config.module_is_included(
+        "mtp.2.mlp.experts.2.down_proj"
+    )
+    assert not adapter.quantize_config.module_is_included(
+        "mtp.2.mlp.shared_experts.down_proj"
+    )
+    assert adapter.extract_layers_node() == ["mtp"]
+    modules = {
+            name
+            for block in adapter.simple_layer_modules(
+                model_config=config,
+                quantize_config=adapter.quantize_config,
+            )
+        for name in block
+    }
+    assert "mlp.experts.2.gate_proj" in modules
+    assert "mlp.experts.2.up_proj" in modules
+    assert "mlp.experts.2.down_proj" in modules
+    assert not any(name.startswith("self_attn.") for name in modules)
+    assert not any(name.startswith("mlp.shared_experts.") for name in modules)
+
+    batch = DeepSeekV4MTPReplayBatch(
+        target_taps=None,
+        projected_main=torch.randn(2, 4, config.hidden_size, dtype=torch.bfloat16),
+        anchor_token_ids=torch.tensor([3, 7]),
+        main_position_ids=torch.tensor([[0, 1, 2, 3], [0, 0, 5, 6]]),
+        main_attention_mask=torch.tensor(
+            [[True, True, True, True], [False, False, True, True]]
+        ),
+    )
+    prepared = adapter.prepare_dataset(
+        [batch], calibration_dataset_sort=None, batch_size=1
+    )
+    assert prepared[0]["input_ids"].shape == (2, 5)
+    assert prepared[0]["attention_mask"].all()
+
+    reference = DeepSeekV4MTPReplay(shell, embedding_weight=embedding)
+    state = reference.prepare_batch(batch)
+    expected, _ = reference.replay_block(0, state, capture_route=False)
+    actual = adapter.run_input_capture(
+        prepared[0], use_cache=False, data_device=torch.device("cpu")
+    )
+    torch.testing.assert_close(actual, expected)
+
+    looper = SimpleNamespace(
+        gptq_model=adapter,
+        _batch_row_count=lambda value: int(value[0].shape[0]),
+    )
+    cache = StageInputsCapture(looper).cache_inputs(
+        layers=list(adapter.model.mtp),
+        layer_names=[f"mtp.{index}" for index in range(3)],
+        calibration_data=prepared,
+        use_cache=False,
+    )
+    assert len(cache.layer_inputs) == 1
+    torch.testing.assert_close(cache.layer_inputs[0][0], state.residual)
+    assert torch.equal(cache.position_ids[0], state.proposal_position_ids)
+    assert torch.equal(cache.attention_masks[0], prepared[0]["attention_mask"])
+    assert torch.equal(
+        cache.layer_input_kwargs[0]["_gptqmodel_mtp_projected_main"],
+        state.projected_main,
+    )
+    assert torch.equal(
+        cache.layer_input_kwargs[0]["_gptqmodel_mtp_proposal_token_ids"],
+        state.proposal_token_ids,
+    )
+    replay_kwargs = dict(cache.layer_input_kwargs[0])
+    routes = []
+    handles = [
+        block.mlp.gate.register_forward_hook(
+            lambda _module, _args, output: routes.append(output)
+        )
+        for block in adapter.model.mtp
+    ]
+    try:
+        residual = cache.layer_inputs[0][0]
+        for block in adapter.model.mtp:
+            residual = block(
+                residual,
+                attention_mask=cache.attention_masks[0],
+                position_ids=cache.position_ids[0],
+                **replay_kwargs,
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+    full_reference = reference.replay(batch)
+    torch.testing.assert_close(residual, full_reference.terminal_residual)
+    assert len(routes) == 3
+    for output in routes:
+        _, _, indices = output
+        assert indices.shape == (2 * 5, config.num_experts_per_tok)
 
 
 def test_deepseek_v4_target_anchor_resolver_matches_native_fp32_greedy_head() -> None:
