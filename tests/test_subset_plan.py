@@ -84,6 +84,39 @@ def test_build_subset_plan_skips_forward_for_no_forward_processor():
     assert plan.calibration_coverage_policy.validate_input_coverage is False
 
 
+def test_layer_plan_wraps_only_meta_forward_fallback_modules():
+    lazy_passthrough = torch.nn.Linear(4, 4, bias=False, device="meta")
+    eager_passthrough = torch.nn.Linear(4, 4, bias=False)
+    full = {
+        "self_attn.o_a_proj": lazy_passthrough,
+        "input_layernorm": eager_passthrough,
+    }
+    looper = _make_looper()
+    looper.gptq_model.lm_head = "lm_head"
+    looper.create_named_modules.return_value = {}
+    processor = _StubProcessor(ExecutionConfig(require_fwd=True))
+
+    plans = build_layer_subset_plans(
+        looper,
+        processor=processor,
+        module=torch.nn.Module(),
+        layer_modules=[["self_attn.q_a_proj"]],
+        planning_layer_modules=[["self_attn.q_a_proj"]],
+        layer_inputs=[[torch.zeros(1, 4)]],
+        full=full,
+        is_lm_head_module=False,
+        layer_index=3,
+        layers_prefix="model.layers.3",
+        fallback=None,
+    )
+
+    assert plans == []
+    assert isinstance(full["self_attn.o_a_proj"], NamedModule)
+    assert full["self_attn.o_a_proj"].module is lazy_passthrough
+    assert full["self_attn.o_a_proj"].full_name == "model.layers.3.self_attn.o_a_proj"
+    assert full["input_layernorm"] is eager_passthrough
+
+
 def test_subset_plan_for_modules_preserves_parent_ordered_module_names():
     modules = {
         "mlp.experts.0.gate_proj": _make_named_module("mlp.experts.0.gate_proj"),

@@ -1163,6 +1163,7 @@ class LazyTurtle:
                 module_path=path,
                 param_cache={},
                 buffer_cache={},
+                device=device,
             )
             return target_submodule
 
@@ -2820,6 +2821,7 @@ class LazyTurtle:
         module_path: str,
         param_cache: Dict[tuple[str, Optional[int], Optional[int], Optional[int], torch.dtype, bool], nn.Parameter],
         buffer_cache: Dict[tuple[str, Optional[int], Optional[int], Optional[int], torch.dtype], torch.Tensor],
+        device: Optional[torch.device] = None,
     ) -> int:
         synced = 0
 
@@ -2876,8 +2878,7 @@ class LazyTurtle:
                     cache_key = (",".join(full_names), None, None, concat_dim, shell_param.dtype, shell_param.requires_grad)
                     new_param = param_cache.get(cache_key)
                     if new_param is None:
-                        if source_param.dtype != shell_param.dtype:
-                            source_param = source_param.to(dtype=shell_param.dtype)
+                        source_param = source_param.to(device=device, dtype=shell_param.dtype)
                         new_param = nn.Parameter(
                             source_param.clone(),
                             requires_grad=shell_param.requires_grad,
@@ -2950,8 +2951,7 @@ class LazyTurtle:
                 cache_key = (full_name, expert_index, split_index, split_dim, shell_param.dtype, shell_param.requires_grad)
                 new_param = param_cache.get(cache_key)
                 if new_param is None:
-                    if source_param.dtype != shell_param.dtype:
-                        source_param = source_param.to(dtype=shell_param.dtype)
+                    source_param = source_param.to(device=device, dtype=shell_param.dtype)
                     new_param = nn.Parameter(
                         source_param.clone(),
                         requires_grad=shell_param.requires_grad,
@@ -3014,8 +3014,7 @@ class LazyTurtle:
                     cache_key = (",".join(full_names), None, None, concat_dim, shell_buffer.dtype)
                     new_buffer = buffer_cache.get(cache_key)
                     if new_buffer is None:
-                        if source_buffer.dtype != shell_buffer.dtype:
-                            source_buffer = source_buffer.to(dtype=shell_buffer.dtype)
+                        source_buffer = source_buffer.to(device=device, dtype=shell_buffer.dtype)
                         new_buffer = source_buffer.clone()
                         buffer_cache[cache_key] = new_buffer
 
@@ -3086,8 +3085,7 @@ class LazyTurtle:
                 cache_key = (full_name, expert_index, split_index, split_dim, shell_buffer.dtype)
                 new_buffer = buffer_cache.get(cache_key)
                 if new_buffer is None:
-                    if source_buffer.dtype != shell_buffer.dtype:
-                        source_buffer = source_buffer.to(dtype=shell_buffer.dtype)
+                    source_buffer = source_buffer.to(device=device, dtype=shell_buffer.dtype)
                     new_buffer = source_buffer.clone()
                     buffer_cache[cache_key] = new_buffer
 

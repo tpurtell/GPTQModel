@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import hmac
+import io
 import json
+import urllib.error
 
 import pytest
 import torch
@@ -20,6 +24,7 @@ from gptqmodel.utils.exl3_remote import (
     decode_tensor_envelope,
     encode_tensor_envelope,
     execute_remote_projection,
+    exl3_quantization_failure_message,
     remote_client_from_provenance,
     validate_remote_output_tensors,
 )
@@ -48,7 +53,7 @@ def _inputs() -> tuple[torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cpu").manual_seed(787)
     weight = torch.randn((128, 128), generator=generator, dtype=torch.float32) * 0.02
     activations = torch.randn((1024, 128), generator=generator, dtype=torch.float32)
-    hessian = (2.0 / activations.shape[0]) * activations.T @ activations
+    hessian = activations.T @ activations
     return weight, hessian
 
 
@@ -66,6 +71,7 @@ def _request(
         quantizer_contract={
             "bits": 2,
             "codebook": "mcg",
+            "hessian_capture": "raw-xtx-sum-fp32-v1",
             "apply_out_scales": None,
             "sigma_reg": 0.025,
             "seed": 787,
@@ -82,6 +88,37 @@ def _packed_tensors() -> dict[str, torch.Tensor]:
         "suh": torch.ones(128, dtype=torch.float16),
         "svh": torch.ones(128, dtype=torch.float16),
         "mcg": torch.tensor([-877912083], dtype=torch.int32),
+    }
+
+
+def test_quantization_failure_message_identifies_hessian_and_minor() -> None:
+    hessian = torch.tensor([[2.0, 0.5], [0.5, -1.0]], dtype=torch.float32)
+    message = exl3_quantization_failure_message(
+        error=RuntimeError(
+            "linalg.cholesky: the leading minor of order 2 is not positive-definite"
+        ),
+        module_full_name="model.layers.0.mlp.experts.29.down_proj",
+        request_sha256="a" * 64,
+        hessian=hessian,
+        sample_count=1024,
+        sigma_reg=0.025,
+    )
+
+    diagnostics = json.loads(message.removeprefix("EXL3 quantization failed: "))
+    assert diagnostics["module_full_name"].endswith("experts.29.down_proj")
+    assert diagnostics["request_sha256"] == "a" * 64
+    assert diagnostics["cholesky_leading_minor"] == 2
+    assert diagnostics["hessian"] == {
+        "state": "quantizer-owned-current-matrix",
+        "shape": [2, 2],
+        "dtype": "torch.float32",
+        "sample_count": 1024,
+        "sigma_reg": 0.025,
+        "nonfinite_count": 0,
+        "symmetry_max_abs": 0.0,
+        "diagonal_min": -1.0,
+        "diagonal_mean": 0.5,
+        "diagonal_max": 2.0,
     }
 
 
@@ -102,29 +139,50 @@ def test_tensor_envelope_is_content_bound() -> None:
         decode_tensor_envelope(bytes(corrupt))
 
 
-def test_scheduler_is_order_independent_and_binds_worker_identity() -> None:
+def test_scheduler_reuses_next_free_slot_and_durably_resumes(tmp_path) -> None:
     endpoints = [_endpoint("spark-d"), _endpoint("spark-a"), _endpoint("spark-c")]
+    assignment_store = tmp_path / "assignments"
     forward = EXL3RemoteClient(
         endpoints=endpoints,
         token=b"secret",
         coordinator_slots=[_coordinator("cuda:0"), _coordinator("cuda:1")],
         timeout_seconds=1,
+        assignment_store_path=assignment_store,
     )
+    keys = [f"model.layers.17.mlp.experts.{expert}.gate_proj" for expert in range(6)]
+    leases = [forward.acquire_slot(key) for key in keys[:5]]
+    assert [lease.slot for lease in leases] == [
+        _coordinator("cuda:0"),
+        _coordinator("cuda:1"),
+        _endpoint("spark-a"),
+        _endpoint("spark-c"),
+        _endpoint("spark-d"),
+    ]
+    leases[0].release()
+    replacement = forward.acquire_slot(keys[5])
+    assert replacement.slot == _coordinator("cuda:0")
+    assert replacement.new_assignment is True
+    replacement.release()
+    for lease in leases[1:]:
+        lease.release()
+
+    records = [json.loads(path.read_text()) for path in assignment_store.rglob("*.json")]
+    assert len(records) == len(keys)
+    assert {record["assignment_key"] for record in records} == set(keys)
+    assert {record["scheduler"] for record in records} == {REMOTE_SCHEDULER}
+
     reverse = EXL3RemoteClient(
         endpoints=list(reversed(endpoints)),
         token=b"secret",
         coordinator_slots=[_coordinator("cuda:1"), _coordinator("cuda:0")],
         timeout_seconds=1,
+        assignment_store_path=assignment_store,
     )
-    keys = [f"base:17:{expert}" for expert in range(128)]
-    assert [forward.assigned_slot(key) for key in keys] == [
-        reverse.assigned_slot(key) for key in keys
-    ]
-    assert {forward.assigned_slot(key) for key in keys} == {
-        _coordinator("cuda:0"),
-        _coordinator("cuda:1"),
-        *endpoints,
-    }
+    resumed = reverse.acquire_slot(keys[0])
+    assert resumed.slot == _coordinator("cuda:0")
+    assert resumed.new_assignment is False
+    resumed.release()
+
     endpoint = endpoints[0]
     assert forward.execution_contract(endpoint) == {
         "kind": "remote_worker",
@@ -144,7 +202,9 @@ def test_scheduler_is_order_independent_and_binds_worker_identity() -> None:
     }
 
 
-def test_provenance_requires_token_and_preserves_retry_contract(monkeypatch) -> None:
+def test_provenance_requires_token_and_preserves_retry_contract(
+    tmp_path, monkeypatch
+) -> None:
     endpoint = _endpoint("spark-a")
     provenance = {
         "run": {
@@ -152,6 +212,7 @@ def test_provenance_requires_token_and_preserves_retry_contract(monkeypatch) -> 
                 "contract": REMOTE_CONTRACT,
                 "scheduler": REMOTE_SCHEDULER,
                 "token_env": "TEST_EXL3_TOKEN",
+                "assignment_store": str(tmp_path / "assignments.json"),
                 "coordinator_slots": [
                     {
                         "device": "cuda:0",
@@ -162,7 +223,7 @@ def test_provenance_requires_token_and_preserves_retry_contract(monkeypatch) -> 
                 ],
                 "timeout_seconds": 42,
                 "max_attempts": 3,
-                "orchestration_workers": 2,
+                "orchestration_workers": 3,
                 "endpoints": [endpoint.__dict__],
             }
         }
@@ -254,6 +315,46 @@ def test_retry_stays_on_the_assigned_worker_and_retains_history(monkeypatch) -> 
             "message": "simulated lost response",
         }
     ]
+
+
+def test_request_surfaces_authenticated_worker_error(monkeypatch) -> None:
+    endpoint = _endpoint("spark-a")
+    token = b"secret"
+    client = EXL3RemoteClient(
+        endpoints=[endpoint],
+        token=token,
+        coordinator_slots=[],
+        timeout_seconds=1,
+    )
+    payload = json.dumps(
+        {"message": "checkpoint request mismatch", "status": "error"},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    headers = {
+        "Content-Length": str(len(payload)),
+        "X-DS4RT-Signature": hmac.new(token, payload, hashlib.sha256).hexdigest(),
+    }
+
+    def _reject(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            endpoint.url,
+            400,
+            "Bad Request",
+            headers,
+            io.BytesIO(payload),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _reject)
+
+    with pytest.raises(
+        RuntimeError,
+        match="HTTP 400.*checkpoint request mismatch",
+    ):
+        client._request(
+            endpoint,
+            urllib.request.Request(endpoint.url),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="EXL3 requires CUDA")

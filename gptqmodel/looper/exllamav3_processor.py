@@ -64,7 +64,10 @@ from ..utils.exl3_projection_checkpoint import (
 )
 from ..utils.exl3_remote import (
     CoordinatorSlot,
+    EXL3_HESSIAN_CAPTURE_CONTRACT,
+    ExecutionSlotLease,
     RemoteEndpoint,
+    exl3_quantization_failure_message,
     remote_client_from_provenance,
 )
 from ..utils.exllamav3 import create_exllamav3_module
@@ -80,6 +83,30 @@ _OUT_SCALES_TO_ARG = {
     "auto": None,
     None: None,
 }
+
+
+def prepare_exl3_hessian(
+    capture: GPTQ,
+    *,
+    target_device: torch.device,
+    module_full_name: str,
+) -> torch.Tensor:
+    """Restore GPTQ's normalized capture to EXL3's raw X^T X contract."""
+
+    capture.finalize_hessian(target_device=target_device)
+    hessian = capture.H
+    if hessian is None:
+        raise RuntimeError(
+            f"EXL3 failed to capture Hessian for module `{module_full_name}`."
+        )
+    if capture.nsamples <= 0:
+        raise RuntimeError(
+            f"EXL3 captured no calibration activations for module `{module_full_name}`."
+        )
+    # GPTQ capture stores 2/N * X^T X. ExLlamaV3's H_data finalizer divides
+    # by `count`, so restore the raw X^T X sum before handing it over.
+    hessian.mul_(float(capture.nsamples) / 2.0)
+    return hessian
 
 
 class _EXL3NaturalRouteCapture:
@@ -181,8 +208,18 @@ class _EXL3NaturalRouteCapture:
 
         num_experts = int(logits.shape[-1])
         top_k = int(indices.shape[-1])
-        flat_indices = indices.detach().reshape(-1).to(dtype=torch.int64)
-        flat_weights = weights.detach().reshape(-1).to(dtype=torch.float64)
+        # CUDA weighted bincount uses atomic additions whose final low bits can
+        # vary across otherwise identical runs. Route evidence is part of the
+        # projection checkpoint identity, so reduce this small vector on CPU in
+        # float64 and keep resume identities bit-stable.
+        flat_indices = indices.detach().reshape(-1).to(
+            device="cpu",
+            dtype=torch.int64,
+        )
+        flat_weights = weights.detach().reshape(-1).to(
+            device="cpu",
+            dtype=torch.float64,
+        )
         if flat_indices.numel() == 0:
             return
         counts = torch.bincount(flat_indices, minlength=num_experts)
@@ -203,9 +240,9 @@ class _EXL3NaturalRouteCapture:
             raise RuntimeError(
                 "EXL3 natural-route capture observed an invalid expert id"
             )
-        counts = counts.to(device="cpu", dtype=torch.int64)
-        gate_sums = gate_sums.to(device="cpu", dtype=torch.float64)
-        gate_squared_mass = gate_squared_mass.to(device="cpu", dtype=torch.float64)
+        counts = counts.to(dtype=torch.int64)
+        gate_sums = gate_sums.to(dtype=torch.float64)
+        gate_squared_mass = gate_squared_mass.to(dtype=torch.float64)
 
         with self._lock:
             if self._router_top_k is None:
@@ -412,16 +449,10 @@ class EXL3Processor(LoopProcessor):
             return locks.setdefault(device_key, threading.Lock())
 
     @staticmethod
-    def _expert_assignment_key(module: NamedModule) -> str:
-        """Keep all projections in one expert family on one deterministic slot."""
+    def _projection_assignment_key(module: NamedModule) -> str:
+        """Return the durable scheduler identity for one independent projection."""
 
-        identity = routed_expert_identity(module.full_name)
-        if identity is None:
-            return module.full_name
-        return (
-            f"{identity['block_namespace']}:{identity['logical_layer']}:"
-            f"{identity['expert']}"
-        )
+        return module.full_name
 
     def subset_forward_capture_context(
         self,
@@ -558,14 +589,6 @@ class EXL3Processor(LoopProcessor):
                 raise ValueError(
                     "EXL3 distributed dispatch only accepts routed-expert projections"
                 )
-            execution_slot = remote_client.assigned_slot(
-                self._expert_assignment_key(module)
-            )
-            self.tasks[module.name]["execution_slot"] = execution_slot
-            if isinstance(execution_slot, CoordinatorSlot):
-                coordinator_device = torch.device(execution_slot.device)
-                module.state["distributed_quant_device"] = coordinator_device
-                module.state["preferred_quant_device"] = coordinator_device
 
     def is_skipped(self, module: NamedModule) -> bool:
         """Reports whether preprocessing omitted this module from EXL3 work."""
@@ -656,9 +679,47 @@ class EXL3Processor(LoopProcessor):
         subset_index: Optional[int] = None,
         subset_total: Optional[int] = None,
     ):
-        """Runs EXL3 quantization for one module and stages its packed tensors."""
+        """Dynamically lease one slot, then quantize and stage one projection."""
 
         del subset, previous_subset, subset_index, subset_total
+
+        ledger_provenance = self._ledger_provenance()
+        remote_client = self._remote_client_for_run(ledger_provenance)
+        execution_lease = None
+        execution_slot = None
+        if remote_client is not None:
+            if routed_expert_identity(module.full_name) is None:
+                raise ValueError(
+                    "EXL3 distributed dispatch only accepts routed-expert projections"
+                )
+            execution_lease = remote_client.acquire_slot(
+                self._projection_assignment_key(module)
+            )
+            execution_slot = execution_lease.slot
+        try:
+            return self._process_on_slot(
+                module=module,
+                device=device,
+                ledger_provenance=ledger_provenance,
+                remote_client=remote_client,
+                execution_slot=execution_slot,
+                execution_lease=execution_lease,
+            )
+        finally:
+            if execution_lease is not None:
+                execution_lease.release()
+
+    def _process_on_slot(
+        self,
+        *,
+        module: NamedModule,
+        device: torch.device | None,
+        ledger_provenance: dict[str, Any] | None,
+        remote_client,
+        execution_slot,
+        execution_lease: ExecutionSlotLease | None,
+    ):
+        """Run one projection while its physical execution slot is exclusively held."""
 
         base_title = f"Quantizing {module.name} in layer"
         self.draw_progress(base_title)
@@ -667,13 +728,6 @@ class EXL3Processor(LoopProcessor):
         capture: GPTQ = task_entry["capture"]
         module_qcfg: EXL3Config = task_entry["qcfg"]
 
-        ledger_provenance = self._ledger_provenance()
-        remote_client = self._remote_client_for_run(ledger_provenance)
-        execution_slot = task_entry.get("execution_slot")
-        if remote_client is not None and execution_slot is None:
-            execution_slot = remote_client.assigned_slot(
-                self._expert_assignment_key(module)
-            )
         target_device = device or get_device(module.module)
         if isinstance(execution_slot, CoordinatorSlot):
             target_device = execution_slot.device
@@ -681,16 +735,11 @@ class EXL3Processor(LoopProcessor):
         if target_device.type != "cuda":
             raise ValueError("EXL3 quantization requires CUDA/HIP execution.")
 
-        capture.finalize_hessian(target_device=target_device)
-        hessian = capture.H
-        if hessian is None:
-            raise RuntimeError(
-                f"EXL3 failed to capture Hessian for module `{module.full_name}`."
-            )
-        if capture.nsamples <= 0:
-            raise RuntimeError(
-                f"EXL3 captured no calibration activations for module `{module.full_name}`."
-            )
+        hessian = prepare_exl3_hessian(
+            capture,
+            target_device=target_device,
+            module_full_name=module.full_name,
+        )
 
         h_data = {
             "H": hessian,
@@ -741,6 +790,7 @@ class EXL3Processor(LoopProcessor):
                 "apply_out_scales": quant_args["apply_out_scales"],
                 "sigma_reg": float(quant_args["sigma_reg"]),
                 "seed": int(quant_args["seed"]),
+                "hessian_capture": EXL3_HESSIAN_CAPTURE_CONTRACT,
             }
             if execution_contract is not None:
                 quantizer_contract["execution"] = copy.deepcopy(execution_contract)
@@ -791,6 +841,9 @@ class EXL3Processor(LoopProcessor):
                     "worker": copy.deepcopy(worker),
                     "transport": copy.deepcopy(transport),
                     "coordinator_elapsed_seconds": remote_elapsed,
+                    "scheduler_wait_seconds": execution_lease.wait_seconds,
+                    "scheduler_new_assignment": execution_lease.new_assignment,
+                    "scheduler_assignment_key": execution_lease.assignment_key,
                 }
             else:
                 wait_started = time.perf_counter()
@@ -801,19 +854,38 @@ class EXL3Processor(LoopProcessor):
                 )
                 with quant_lock:
                     quant_started = time.perf_counter()
-                    _weight_q, proxy_err, out_tensors = quantize_exl3(
-                        weight=input_weight,
-                        H_data=h_data,
-                        quant_args=quant_args,
-                        return_weight_q=False,
-                    )
+                    try:
+                        _weight_q, proxy_err, out_tensors = quantize_exl3(
+                            weight=input_weight,
+                            H_data=h_data,
+                            quant_args=quant_args,
+                            return_weight_q=False,
+                        )
+                    except Exception as error:
+                        raise RuntimeError(
+                            exl3_quantization_failure_message(
+                                error=error,
+                                module_full_name=module.full_name,
+                                request_sha256=(
+                                    checkpoint_request.get("request_sha256")
+                                    if checkpoint_request is not None
+                                    else None
+                                ),
+                                hessian=hessian,
+                                sample_count=capture.nsamples,
+                                sigma_reg=float(quant_args["sigma_reg"]),
+                            )
+                        ) from error
                     del _weight_q
                     duration = time.perf_counter() - quant_started
                 device_names = [str(device) for device in quant_args["devices"]]
                 quantizer_metrics = quant_args.get("error_metrics")
                 execution_result = {
                     "kind": "coordinator",
-                    "scheduler_wait_seconds": quant_started - wait_started,
+                    "scheduler_wait_seconds": execution_lease.wait_seconds,
+                    "scheduler_new_assignment": execution_lease.new_assignment,
+                    "scheduler_assignment_key": execution_lease.assignment_key,
+                    "coordinator_quant_lock_wait_seconds": quant_started - wait_started,
                 }
             if not isinstance(quantizer_metrics, dict):
                 raise RuntimeError(
@@ -895,6 +967,11 @@ class EXL3Processor(LoopProcessor):
             if ledger_record != expected_ledger_record:
                 raise ValueError("EXL3 projection checkpoint ledger is inconsistent")
             checkpoint_hit = True
+
+        if execution_lease is not None and isinstance(execution_slot, RemoteEndpoint):
+            # The Spark is free as soon as the packed result is durable. Do not
+            # strand it while the coordinator reconstructs/stages that result.
+            execution_lease.release()
 
         # The packed result and its exact ledger are now durable when the run
         # opted into projection checkpoints. The journal remains the ordered

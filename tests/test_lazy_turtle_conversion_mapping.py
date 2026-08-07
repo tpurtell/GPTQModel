@@ -1347,6 +1347,31 @@ def test_deepseek_ocr2_direct_meta_view_separator_uses_checkpoint_misspelling(tm
     assert torch.equal(shell.model.view_separator, source)
 
 
+def test_direct_meta_materialization_forwards_target_device(tmp_path, monkeypatch):
+    shell = _DeepseekOCR2DirectParamShell()
+    turtle = _build_lazy_turtle(
+        tmp_path,
+        {"model.view_seperator": torch.arange(4, dtype=torch.bfloat16)},
+        hf_conversion_map_reversed=DeepSeekOCR2QModel.resolve_hf_conversion_map_reversed(target_model=shell),
+        target_model=shell,
+    )
+    captured = {}
+
+    def _capture_materialization(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(turtle, "_materialize_direct_meta_tensors", _capture_materialization)
+
+    turtle.materialize_direct_meta_tensors(
+        target_model=shell,
+        target_submodule=shell.model,
+        device=torch.device("cpu"),
+    )
+
+    assert captured["device"] == torch.device("cpu")
+
+
 def test_deepseek_ocr2_materializes_vision_tower_from_legacy_checkpoint_paths(tmp_path):
     vision_weight = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     vision_bias = torch.arange(2, dtype=torch.float32)

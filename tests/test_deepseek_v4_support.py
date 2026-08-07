@@ -28,7 +28,7 @@ from gptqmodel.models.definitions.deepseek_v4 import (
     patch_deepseek_v4_router_precision,
     validate_deepseek_v4_mtp_checkpoint_keys,
 )
-from gptqmodel.quantization.config import EXL3Config
+from gptqmodel.quantization.config import AutoModuleDecoderConfig, EXL3Config
 from gptqmodel.looper.stage_inputs_capture import StageInputsCapture
 
 
@@ -116,6 +116,76 @@ def test_deepseek_v4_target_input_capture_keeps_first_layer_lazy() -> None:
         assert "layer zero" in str(exc)
     else:
         raise AssertionError("nonzero target input-capture layer was accepted")
+
+
+def test_deepseek_v4_pre_quantize_keeps_packed_target_layer_lazy(monkeypatch) -> None:
+    first = nn.Linear(2, 2, device="meta")
+    harness = object.__new__(DeepSeekV4QModel)
+    harness.model = SimpleNamespace(
+        model=SimpleNamespace(layers=nn.ModuleList([first]))
+    )
+    monkeypatch.setattr(
+        harness,
+        "shell_module_materialize",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("packed parent layer was eagerly materialized")
+        ),
+    )
+
+    assert harness.pre_quantize(first) is first
+    assert first.weight.device.type == "meta"
+
+
+def test_auto_decoder_materializes_unquantized_linear_subclass_with_its_forward(monkeypatch) -> None:
+    class GroupedLinear(nn.Linear):
+        pass
+
+    target = GroupedLinear(2, 4, bias=False, device="meta")
+    named = SimpleNamespace(
+        full_name="model.layers.0.self_attn.o_a_proj",
+        state={},
+    )
+    harness = object.__new__(DeepSeekV4QModel)
+    nn.Module.__init__(harness)
+    harness.model = nn.Module()
+    harness.model.proj = target
+    harness.quantize_config = SimpleNamespace(
+        preprocessors=[AutoModuleDecoderConfig(target_dtype=torch.bfloat16)]
+    )
+    harness.auto_module_decoder_events = []
+    harness.turtle_model = SimpleNamespace(
+        checkpoint_tensors_for_submodule=lambda **_kwargs: {
+            "weight": torch.zeros((4, 2), dtype=torch.float8_e4m3fn),
+            "weight_scale": torch.ones((), dtype=torch.float32),
+        }
+    )
+    decoded = GroupedLinear(2, 4, bias=False, dtype=torch.bfloat16)
+    monkeypatch.setattr(harness, "_decoder_weight_format", lambda **_kwargs: "fp8")
+    monkeypatch.setattr(
+        harness,
+        "_build_decoder_quant_source_module",
+        lambda *_args, **_kwargs: decoded,
+    )
+    monkeypatch.setattr(
+        harness,
+        "_build_decoder_forward_module",
+        lambda *, quant_source, device: quant_source.to(device),
+    )
+    monkeypatch.setattr(
+        harness,
+        "_replace_live_submodule",
+        lambda _current, replacement: replacement,
+    )
+
+    replacement = harness._prepare_auto_decoder_forward_module(
+        target_submodule=target,
+        device=torch.device("cpu"),
+        named_module=named,
+    )
+
+    assert isinstance(replacement, GroupedLinear)
+    assert named.state["auto_module_decoder"]["target_dtype"] == torch.bfloat16
+    assert named.state["auto_module_decoder_forward_mode"] == "decode"
 
 
 def test_deepseek_v4_mtp_checkpoint_contract_is_exact_and_does_not_trust_nextn_count() -> None:

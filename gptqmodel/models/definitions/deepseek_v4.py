@@ -1295,6 +1295,20 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
             )
         return layer
 
+    def pre_quantize(self, module: nn.Module) -> nn.Module:
+        """Keep each packed target layer lazy for per-leaf materialization.
+
+        Subset planning materializes checkpoint-backed leaves through their
+        forward or quant-source role. Eagerly materializing the containing
+        layer first bypasses that decoder-aware boundary and tries to reshape
+        packed FP4 expert weights into dense shell parameters.
+        """
+
+        layers = getattr(getattr(self.model, "model", None), "layers", ())
+        if any(module is layer for layer in layers):
+            return module
+        return super().pre_quantize(module)
+
     def attach_mtp_quantization_model(
         self,
         adapter: "DeepSeekV4MTPQuantizationModel",

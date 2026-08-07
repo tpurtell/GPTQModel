@@ -936,8 +936,12 @@ class ModuleLooper():
             named_module = subset.get(name)
             module_ref = None
             if named_module is None and fallback_modules is not None:
-                module_ref = fallback_modules.get(name)
-                named_module = module_ref
+                named_module = fallback_modules.get(name)
+                module_ref = (
+                    named_module.module
+                    if isinstance(named_module, NamedModule)
+                    else named_module
+                )
             elif named_module is not None:
                 module_ref = named_module.module if isinstance(named_module, NamedModule) else named_module
             if module_ref is None:
@@ -947,10 +951,23 @@ class ModuleLooper():
             except Exception:
                 current = None
 
+            # Lazy checkpoint-backed layers cannot be moved while their leaf
+            # tensors are still meta. Materialize each planned leaf through the
+            # model's decoder-aware forward boundary directly on its assigned
+            # device, then apply an ordinary move only if one is still needed.
+            # Do not record META as a restore destination: it is not a usable
+            # runtime placement and move_to() intentionally rejects it.
+            if current == META and isinstance(named_module, NamedModule):
+                module_ref = self._prepare_named_module_for_forward(
+                    named_module=named_module,
+                    fallback_device=target,
+                )
+                current = get_device(module_ref)
+
             if target is None or (current is not None and current == target):
                 continue
 
-            if current is not None:
+            if current is not None and current != META:
                 previous[name] = current
 
             emit_device_telemetry(
@@ -959,7 +976,19 @@ class ModuleLooper():
                 current_device=current,
                 target_device=target,
             )
-            move_to(module_ref, device=target)
+            try:
+                move_to(module_ref, device=target)
+            except NotImplementedError as exc:
+                module_label = (
+                    named_module.full_name
+                    if isinstance(named_module, NamedModule)
+                    else name
+                )
+                raise NotImplementedError(
+                    "Forward device override could not move "
+                    f"`{module_label}` from {current} to {target} after "
+                    "decoder-aware leaf materialization."
+                ) from exc
             rehome_module_to_device(module_ref, target, move_parameters=True, move_buffers=True)
             if isinstance(named_module, NamedModule):
                 setattr(named_module, "target_device", target)
@@ -1017,6 +1046,14 @@ class ModuleLooper():
             return
 
         quant_source = named_module.state.get("quant_source_module")
+        if isinstance(task, dict):
+            capture = task.get("capture")
+            if capture is not None and hasattr(capture, "module"):
+                capture.module = (
+                    quant_source
+                    if isinstance(quant_source, torch.nn.Module)
+                    else named_module.module
+                )
         if isinstance(quant_source, torch.nn.Module) and hasattr(task, "module"):
             task.module = quant_source
 
@@ -1062,7 +1099,10 @@ class ModuleLooper():
 
         target_device = get_device(named_module.module)
         if target_device == META:
-            target_device = fallback_device
+            target_device = (
+                normalize_device_like(named_module.state.get("preferred_quant_device"))
+                or fallback_device
+            )
 
         prepared = self.gptq_model.shell_module_materialize(
             target_submodule=named_module.module,
@@ -1076,6 +1116,58 @@ class ModuleLooper():
         setattr(named_module, "target_device", target_device)
         setattr(named_module.module, "target_device", target_device)
         return prepared
+
+    def _prepare_layer_direct_state_for_forward(
+        self,
+        module: torch.nn.Module,
+        fallback_device: torch.device,
+        *,
+        projection_modules: Optional[Dict[str, object]] = None,
+    ) -> int:
+        """Materialize non-projection direct state needed by a lazy layer forward.
+
+        Projection leaves are excluded because packed floatx weights must pass
+        through decoder-aware NamedModule materialization. Norms, routers,
+        hyper-connections, attention sinks, and other direct parameters/buffers
+        can be restored safely through LazyTurtle's direct-meta boundary.
+        """
+
+        excluded_ids = set()
+        for candidate in (projection_modules or {}).values():
+            candidate_module = (
+                candidate.module if isinstance(candidate, NamedModule) else candidate
+            )
+            if isinstance(candidate_module, torch.nn.Module):
+                excluded_ids.add(id(candidate_module))
+
+        module_names = {id(child): name for name, child in module.named_modules()}
+        materialized = 0
+        for child in module.modules():
+            if id(child) in excluded_ids:
+                continue
+            direct_tensors = list(child.parameters(recurse=False)) + list(
+                child.buffers(recurse=False)
+            )
+            if not any(getattr(tensor, "is_meta", False) for tensor in direct_tensors):
+                continue
+            self.gptq_model.shell_direct_meta_materialize(
+                target_submodule=child,
+                device=fallback_device,
+            )
+            remaining = [
+                tensor
+                for tensor in list(child.parameters(recurse=False))
+                + list(child.buffers(recurse=False))
+                if getattr(tensor, "is_meta", False)
+            ]
+            if remaining:
+                child_name = module_names.get(id(child), "<layer>")
+                raise RuntimeError(
+                    "Lazy forward direct-state materialization left META tensors "
+                    f"under `{child_name}`."
+                )
+            materialized += 1
+        return materialized
 
     def _prepare_named_module_for_quantization(
         self,

@@ -528,6 +528,158 @@ def test_stage_subset_flush_goes_global_when_work_fans_out_across_devices():
     ) is None
 
 
+def test_subset_pass_without_forward_skips_forward_device_overrides(monkeypatch):
+    class DummyProcessor:
+        execution_config = ExecutionConfig(require_fwd=False)
+        tasks = {}
+
+        def set_fwd_time(self, *_):
+            return None
+
+    class DummyLooper:
+        gptq_model = types.SimpleNamespace(
+            quantize_config=QuantizeConfig(bits=4, group_size=128),
+        )
+
+        def _apply_forward_device_overrides(self, *_, **__):
+            raise AssertionError("a no-forward pass must not install forward device overrides")
+
+    monkeypatch.setattr(stage_subset_module, "torch_sync", lambda: None)
+
+    plan = SubsetPlan(
+        modules={},
+        subset_index=0,
+        subset_total=1,
+        execute_forward=False,
+        replay_after_process=False,
+        forward_mode="parallel",
+        batch_count=0,
+        forward_row_counts=[],
+        forward_total_rows=1,
+        moe_groups={},
+        forward_device_map={"mlp.experts.0.gate_proj": torch.device("cuda:0")},
+        calibration_coverage_policy=CalibrationCoveragePolicy(
+            validate_input_coverage=False,
+            fallback_enabled=True,
+            prune_uncovered_modules=False,
+            record_dynamic_exclusions=False,
+        ),
+        module_chunks=[{}],
+    )
+
+    processed, outputs, used_data_parallel = stage_subset_module._run_single_subset_pass(
+        looper=DummyLooper(),
+        processor=DummyProcessor(),
+        module=torch.nn.Identity(),
+        plan=plan,
+        layer_inputs=[],
+        layer_input_kwargs=[],
+        position_ids=[],
+        attention_masks=[],
+        cur_layer_device=torch.device("cpu"),
+        is_lm_head_module=False,
+        layer_descriptor="model.layers.0",
+        layer_title="Layer 0",
+        layer_index=0,
+        full={},
+        fallback=None,
+        shared_kv_cache_dict={},
+        pb=None,
+        logger=types.SimpleNamespace(),
+        is_awq_processor=False,
+        execute_forward=False,
+    )
+
+    assert processed == {}
+    assert outputs is None
+    assert used_data_parallel is False
+
+
+def test_forward_device_override_materializes_meta_fallback_named_module():
+    original = NamedModule(
+        torch.nn.Linear(4, 4, bias=False, device="meta"),
+        name="mlp.experts.0.gate_proj",
+        full_name="model.layers.0.mlp.experts.0.gate_proj",
+        layer_index=0,
+    )
+    calls = []
+
+    class DummyQModel:
+        def shell_module_materialize(self, **kwargs):
+            calls.append(kwargs)
+            return torch.nn.Linear(4, 4, bias=False, device=kwargs["device"])
+
+    looper = object.__new__(ModuleLooper)
+    looper.gptq_model = DummyQModel()
+
+    previous = looper._apply_forward_device_overrides(
+        subset={},
+        device_map={original.name: torch.device("cpu")},
+        fallback_modules={original.name: original},
+    )
+
+    assert previous == {}
+    assert len(calls) == 1
+    assert calls[0]["role"] == "forward"
+    assert calls[0]["named_module"] is original
+    assert calls[0]["device"] == torch.device("cpu")
+    assert original.module.weight.device.type == "cpu"
+
+
+def test_lazy_forward_materializes_direct_state_but_not_projection_weights():
+    class LazyLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.empty(2, device="meta"))
+            self.proj = torch.nn.Linear(2, 2, bias=False, device="meta")
+
+    layer = LazyLayer()
+    projection = NamedModule(
+        layer.proj,
+        name="proj",
+        full_name="model.layers.0.proj",
+        layer_index=0,
+    )
+    calls = []
+
+    class DummyQModel:
+        def shell_direct_meta_materialize(self, *, target_submodule, device):
+            calls.append((target_submodule, device))
+            target_submodule.scale = torch.nn.Parameter(torch.ones(2, device=device))
+
+    looper = object.__new__(ModuleLooper)
+    looper.gptq_model = DummyQModel()
+
+    count = looper._prepare_layer_direct_state_for_forward(
+        layer,
+        torch.device("cpu"),
+        projection_modules={"proj": projection},
+    )
+
+    assert count == 1
+    assert calls == [(layer, torch.device("cpu"))]
+    assert layer.scale.device.type == "cpu"
+    assert layer.proj.weight.device.type == "meta"
+
+
+def test_rehome_processor_task_rebinds_dict_capture_to_quant_source():
+    named = NamedModule(
+        torch.nn.Linear(4, 4, bias=False, device="meta"),
+        name="mlp.experts.0.gate_proj",
+        full_name="model.layers.0.mlp.experts.0.gate_proj",
+        layer_index=0,
+    )
+    quant_source = torch.nn.Linear(4, 4, bias=False)
+    named.state["quant_source_module"] = quant_source
+    capture = types.SimpleNamespace(module=named.module)
+    processor = types.SimpleNamespace(tasks={named.name: {"capture": capture}})
+
+    looper = object.__new__(ModuleLooper)
+    looper._rehome_processor_task(processor, named, torch.device("cpu"))
+
+    assert capture.module is quant_source
+
+
 def test_stage_inputs_capture_collects_real_inputs():
     gptq_model = _TinyGptqModel()
     looper = _TinyLooper(gptq_model)
@@ -760,6 +912,9 @@ def test_run_layer_stage_invokes_subset_stage(monkeypatch):
         def pre_quantize(self, module):
             return module
 
+        def should_quantize_layer(self, *_args):
+            return True
+
         def post_quantize(self, module):
             return module
 
@@ -828,7 +983,7 @@ def test_run_layer_stage_invokes_subset_stage(monkeypatch):
         layers=layers,
         layer_modules=layer_modules,
         planning_layer_modules=layer_modules,
-        layers_prefix="model.layers",
+        layer_names=["model.layers.0"],
         fallback=True,
         shared_kv_cache_dict={},
         pb=pb,
@@ -1209,6 +1364,9 @@ def test_run_layer_stage_reuses_subset_plan_for_replay(monkeypatch):
         def pre_quantize(self, module):
             return module
 
+        def should_quantize_layer(self, *_args):
+            return True
+
         def post_quantize(self, module):
             return module
 
@@ -1270,7 +1428,7 @@ def test_run_layer_stage_reuses_subset_plan_for_replay(monkeypatch):
         layers=[torch.nn.Linear(1, 1, bias=False) for _ in range(2)],
         layer_modules=[["self_attn.q_proj"]],
         planning_layer_modules=[["self_attn.q_proj"]],
-        layers_prefix="model.layers",
+        layer_names=["model.layers.0", "model.layers.1"],
         fallback=True,
         shared_kv_cache_dict={},
         pb=pb,
@@ -1905,6 +2063,9 @@ def test_run_layer_stage_replays_untouched_layer_outputs_when_all_modules_skippe
         def pre_quantize(self, module):
             return module
 
+        def should_quantize_layer(self, *_args):
+            return True
+
         def post_quantize(self, module):
             return module
 
@@ -2020,7 +2181,7 @@ def test_run_layer_stage_replays_untouched_layer_outputs_when_all_modules_skippe
             ["mlp.gate_proj", "mlp.up_proj"],
             ["mlp.down_proj"],
         ],
-        layers_prefix="model.layers",
+        layer_names=["model.layers.0", "model.layers.1"],
         fallback=True,
         shared_kv_cache_dict={},
         pb=pb,

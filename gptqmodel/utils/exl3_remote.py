@@ -12,13 +12,15 @@ import math
 import os
 import re
 import struct
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -35,13 +37,17 @@ from .exl3_projection_checkpoint import (
 )
 
 REMOTE_CONTRACT = "ds4rt.exl3-remote-worker-v1"
-REMOTE_SCHEDULER = "sha256-family-modulo-explicit-slots-v2"
+REMOTE_SCHEDULER = "dynamic-free-slot-projection-v1"
+REMOTE_ASSIGNMENT_SCHEMA = "ds4rt.exl3-dynamic-projection-assignments"
+REMOTE_ASSIGNMENT_SCHEMA_VERSION = 1
+EXL3_HESSIAN_CAPTURE_CONTRACT = "raw-xtx-sum-fp32-v1"
 REMOTE_REQUEST_SCHEMA = "ds4rt.exl3-remote-request"
 REMOTE_RESULT_SCHEMA = "ds4rt.exl3-remote-result"
 ENVELOPE_MAGIC = b"DS4EXL3\x00"
 MAX_HEADER_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024 * 1024
 REMOTE_CHECKPOINT_RETENTION = 2
+_CHOLESKY_MINOR_PATTERN = re.compile(r"leading minor of order (\d+)")
 
 
 def _sha256(payload: bytes) -> str:
@@ -50,6 +56,78 @@ def _sha256(payload: bytes) -> str:
 
 def _hmac(token: bytes, payload: bytes) -> str:
     return hmac.new(token, payload, hashlib.sha256).hexdigest()
+
+
+def _finite_scalar(value: torch.Tensor) -> float | None:
+    scalar = float(value.item())
+    return scalar if math.isfinite(scalar) else None
+
+
+@torch.no_grad()
+def exl3_quantization_failure_message(
+    *,
+    error: Exception,
+    module_full_name: str,
+    request_sha256: str | None,
+    hessian: torch.Tensor,
+    sample_count: int,
+    sigma_reg: float,
+) -> str:
+    """Create bounded diagnostics from EXL3's current Hessian on failure."""
+
+    rows = int(hessian.shape[0]) if hessian.ndim == 2 else 0
+    columns = int(hessian.shape[1]) if hessian.ndim == 2 else 0
+    nonfinite_count = 0
+    symmetry_max_abs = 0.0
+    if rows and rows == columns:
+        chunk_rows = min(rows, 1024)
+        for start in range(0, rows, chunk_rows):
+            stop = min(start + chunk_rows, rows)
+            block = hessian[start:stop]
+            nonfinite_count += int((~torch.isfinite(block)).sum().item())
+            difference = block - hessian[:, start:stop].transpose(0, 1)
+            block_max = _finite_scalar(difference.abs().max())
+            if block_max is not None:
+                symmetry_max_abs = max(symmetry_max_abs, block_max)
+    diagonal = torch.diagonal(hessian) if rows and rows == columns else None
+    error_text = str(error)
+    minor_match = _CHOLESKY_MINOR_PATTERN.search(error_text)
+    diagnostics = {
+        "schema": "gptqmodel.exl3-quantization-failure",
+        "schema_version": 1,
+        "module_full_name": module_full_name,
+        "request_sha256": request_sha256,
+        "error_type": type(error).__name__,
+        "error": error_text,
+        "cholesky_leading_minor": (
+            int(minor_match.group(1)) if minor_match is not None else None
+        ),
+        "hessian": {
+            # quantize_exl3 mutates the raw X^T X input during finalization. At
+            # Cholesky time this is the regularized, Hadamard-transformed matrix.
+            "state": "quantizer-owned-current-matrix",
+            "shape": [rows, columns],
+            "dtype": str(hessian.dtype),
+            "sample_count": int(sample_count),
+            "sigma_reg": float(sigma_reg),
+            "nonfinite_count": nonfinite_count,
+            "symmetry_max_abs": symmetry_max_abs,
+            "diagonal_min": (
+                _finite_scalar(diagonal.min()) if diagonal is not None else None
+            ),
+            "diagonal_mean": (
+                _finite_scalar(diagonal.mean()) if diagonal is not None else None
+            ),
+            "diagonal_max": (
+                _finite_scalar(diagonal.max()) if diagonal is not None else None
+            ),
+        },
+    }
+    return "EXL3 quantization failed: " + json.dumps(
+        diagnostics,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def encode_tensor_envelope(
@@ -157,6 +235,7 @@ def validate_remote_inputs(
         or contract["bits"] < 1
         or contract["bits"] > 8
         or contract.get("codebook") not in {"mcg", "mul1"}
+        or contract.get("hessian_capture") != EXL3_HESSIAN_CAPTURE_CONTRACT
         or contract.get("apply_out_scales") not in {None, True, False}
         or isinstance(contract.get("sigma_reg"), bool)
         or not isinstance(contract.get("sigma_reg"), (int, float))
@@ -254,16 +333,29 @@ def execute_remote_projection(
         contract["codebook"]: True,
     }
     started = time.perf_counter()
-    _weight_q, proxy_error, out_tensors = quantize_exl3(
-        weight.to(device=target),
-        {
-            "H": hessian.to(device=target),
-            "count": request["sample_count"],
-            "finalized": False,
-        },
-        quant_args,
-        return_weight_q=False,
-    )
+    device_hessian = hessian.to(device=target)
+    try:
+        _weight_q, proxy_error, out_tensors = quantize_exl3(
+            weight.to(device=target),
+            {
+                "H": device_hessian,
+                "count": request["sample_count"],
+                "finalized": False,
+            },
+            quant_args,
+            return_weight_q=False,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            exl3_quantization_failure_message(
+                error=error,
+                module_full_name=request["module_full_name"],
+                request_sha256=request["request_sha256"],
+                hessian=device_hessian,
+                sample_count=request["sample_count"],
+                sigma_reg=float(contract["sigma_reg"]),
+            )
+        ) from error
     del _weight_q
     duration = time.perf_counter() - started
     metrics = quant_args.get("error_metrics")
@@ -326,8 +418,35 @@ class CoordinatorSlot:
 ExecutionSlot = CoordinatorSlot | RemoteEndpoint
 
 
+@dataclass
+class ExecutionSlotLease:
+    """One exclusive physical-slot claim for a projection execution."""
+
+    slot: ExecutionSlot
+    assignment_key: str
+    wait_seconds: float
+    new_assignment: bool
+    _client: "EXL3RemoteClient" = field(repr=False)
+    _slot_id: str = field(repr=False)
+    _released: bool = field(default=False, init=False, repr=False)
+    _release_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+
+    def release(self) -> None:
+        """Release this lease exactly once; safe from error-cleanup paths."""
+
+        with self._release_lock:
+            if self._released:
+                return
+            self._client._release_slot(self._slot_id)
+            self._released = True
+
+
 class EXL3RemoteClient:
-    """Deterministically assign whole expert families to qualified workers."""
+    """Dynamically dispatch durable projection assignments to free GPU slots."""
 
     def __init__(
         self,
@@ -338,6 +457,7 @@ class EXL3RemoteClient:
         timeout_seconds: float,
         max_attempts: int = 2,
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+        assignment_store_path: str | os.PathLike[str] | None = None,
     ) -> None:
         if not endpoints or not token:
             raise ValueError("EXL3 remote client requires endpoints and an auth token")
@@ -377,18 +497,217 @@ class EXL3RemoteClient:
         self.timeout_seconds = float(timeout_seconds)
         self.max_attempts = max_attempts
         self.max_body_bytes = int(max_body_bytes)
+        self._slots: tuple[ExecutionSlot, ...] = (
+            *self.coordinator_slots,
+            *self.endpoints,
+        )
+        self._slot_by_id = {
+            self._slot_id(slot): slot
+            for slot in self._slots
+        }
+        if len(self._slot_by_id) != len(self._slots):
+            raise ValueError("EXL3 remote client has duplicate execution slots")
+        self._slot_contracts = {
+            slot_id: self.execution_contract(slot)
+            for slot_id, slot in self._slot_by_id.items()
+        }
+        self._topology_sha256 = _sha256(canonical_json_bytes(self._slot_contracts))
+        self.assignment_store_path = None
+        if assignment_store_path is not None:
+            raw_assignment_path = Path(assignment_store_path).expanduser()
+            if raw_assignment_path.is_symlink():
+                raise ValueError("EXL3 assignment store cannot be a symbolic link")
+            self.assignment_store_path = raw_assignment_path.resolve()
+        self._slot_condition = threading.Condition()
+        self._busy_slots: set[str] = set()
+        self._assignments = self._load_assignments()
         self._identity_lock = threading.Lock()
         self._qualified: set[str] = set()
         self._endpoint_locks = {
             endpoint.name: threading.Lock() for endpoint in self.endpoints
         }
 
-    def assigned_slot(self, assignment_key: str) -> ExecutionSlot:
-        slots: list[ExecutionSlot] = [*self.coordinator_slots, *self.endpoints]
-        if not slots:
-            raise ValueError("EXL3 remote client has no execution slots")
-        index = int(hashlib.sha256(assignment_key.encode()).hexdigest()[:16], 16) % len(slots)
-        return slots[index]
+    @staticmethod
+    def _slot_id(slot: ExecutionSlot) -> str:
+        if isinstance(slot, CoordinatorSlot):
+            return f"coordinator:{slot.device}"
+        return f"remote_worker:{slot.name}"
+
+    def _assignment_record(self, assignment_key: str, slot_id: str) -> dict[str, Any]:
+        body = {
+            "schema": REMOTE_ASSIGNMENT_SCHEMA,
+            "schema_version": REMOTE_ASSIGNMENT_SCHEMA_VERSION,
+            "scheduler": REMOTE_SCHEDULER,
+            "topology_sha256": self._topology_sha256,
+            "assignment_key": assignment_key,
+            "assignment_key_sha256": _sha256(assignment_key.encode()),
+            "slot_id": slot_id,
+            "execution": self._slot_contracts[slot_id],
+        }
+        return {
+            **body,
+            "record_sha256": _sha256(canonical_json_bytes(body)),
+        }
+
+    def _load_assignments(self) -> dict[str, str]:
+        root = self.assignment_store_path
+        if root is None or not root.exists():
+            return {}
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("EXL3 assignment store is not a regular directory")
+        assignments: dict[str, str] = {}
+        for path in sorted(root.rglob("*")):
+            if path.is_dir():
+                if path.is_symlink():
+                    raise ValueError("EXL3 assignment store contains a symbolic link")
+                continue
+            if path.name.startswith("."):
+                # A killed atomic writer may leave only an unpublished temp file.
+                continue
+            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                raise ValueError("EXL3 assignment store contains an invalid entry")
+            try:
+                record = json.loads(path.read_bytes())
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ValueError("EXL3 assignment record is not valid JSON") from error
+            if not isinstance(record, dict):
+                raise ValueError("EXL3 assignment record is malformed")
+            body = {
+                key: value
+                for key, value in record.items()
+                if key != "record_sha256"
+            }
+            assignment_key = record.get("assignment_key")
+            slot_id = record.get("slot_id")
+            key_sha256 = (
+                _sha256(assignment_key.encode())
+                if isinstance(assignment_key, str)
+                else None
+            )
+            expected_relative = (
+                Path(key_sha256[:2]) / key_sha256[2:4] / f"{key_sha256}.json"
+                if key_sha256 is not None
+                else None
+            )
+            if (
+                record.get("schema") != REMOTE_ASSIGNMENT_SCHEMA
+                or record.get("schema_version") != REMOTE_ASSIGNMENT_SCHEMA_VERSION
+                or record.get("scheduler") != REMOTE_SCHEDULER
+                or record.get("topology_sha256") != self._topology_sha256
+                or not isinstance(assignment_key, str)
+                or not assignment_key
+                or len(assignment_key) > 4096
+                or record.get("assignment_key_sha256") != key_sha256
+                or path.relative_to(root) != expected_relative
+                or not isinstance(slot_id, str)
+                or slot_id not in self._slot_by_id
+                or record.get("execution") != self._slot_contracts[slot_id]
+                or record.get("record_sha256") != _sha256(canonical_json_bytes(body))
+                or assignment_key in assignments
+            ):
+                raise ValueError("EXL3 assignment store failed identity validation")
+            assignments[assignment_key] = slot_id
+        return assignments
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _ensure_assignment_directory(self, path: Path) -> None:
+        missing = []
+        current = path
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        if current.is_symlink() or not current.is_dir():
+            raise ValueError("EXL3 assignment-store parent is invalid")
+        for directory in reversed(missing):
+            directory.mkdir()
+            self._fsync_directory(directory.parent)
+
+    def _persist_assignment(self, assignment_key: str, slot_id: str) -> None:
+        root = self.assignment_store_path
+        if root is None:
+            raise ValueError("EXL3 dynamic scheduling requires an assignment store")
+        key_sha256 = _sha256(assignment_key.encode())
+        path = root / key_sha256[:2] / key_sha256[2:4] / f"{key_sha256}.json"
+        self._ensure_assignment_directory(path.parent)
+        if path.is_symlink():
+            raise ValueError("EXL3 assignment record cannot be a symbolic link")
+        if path.exists():
+            raise ValueError("EXL3 assignment record appeared concurrently")
+        payload = canonical_json_bytes(
+            self._assignment_record(assignment_key, slot_id)
+        ) + b"\n"
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=path.parent,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as target:
+                target.write(payload)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary_name, path)
+            self._fsync_directory(path.parent)
+        except BaseException:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def acquire_slot(self, assignment_key: str) -> ExecutionSlotLease:
+        """Wait for the assigned/free slot and durably claim it for one projection."""
+
+        if (
+            not isinstance(assignment_key, str)
+            or not assignment_key
+            or len(assignment_key) > 4096
+        ):
+            raise ValueError("EXL3 projection assignment key is invalid")
+        wait_started = time.perf_counter()
+        new_assignment = False
+        with self._slot_condition:
+            while True:
+                slot_id = self._assignments.get(assignment_key)
+                if slot_id is None:
+                    slot_id = next(
+                        (
+                            candidate
+                            for candidate in self._slot_by_id
+                            if candidate not in self._busy_slots
+                        ),
+                        None,
+                    )
+                    if slot_id is not None:
+                        # This commit is the ownership barrier. A killed run will
+                        # either see the old complete file or the new complete file.
+                        self._persist_assignment(assignment_key, slot_id)
+                        self._assignments[assignment_key] = slot_id
+                        new_assignment = True
+                if slot_id is not None and slot_id not in self._busy_slots:
+                    self._busy_slots.add(slot_id)
+                    return ExecutionSlotLease(
+                        slot=self._slot_by_id[slot_id],
+                        assignment_key=assignment_key,
+                        wait_seconds=time.perf_counter() - wait_started,
+                        new_assignment=new_assignment,
+                        _client=self,
+                        _slot_id=slot_id,
+                    )
+                self._slot_condition.wait()
+
+    def _release_slot(self, slot_id: str) -> None:
+        with self._slot_condition:
+            if slot_id not in self._busy_slots:
+                raise RuntimeError(f"EXL3 execution slot `{slot_id}` is not leased")
+            self._busy_slots.remove(slot_id)
+            self._slot_condition.notify_all()
 
     @staticmethod
     def execution_contract(slot: ExecutionSlot) -> dict[str, Any]:
@@ -412,14 +731,10 @@ class EXL3RemoteClient:
             "image_digest": endpoint.image_digest,
         }
 
-    def _request(self, endpoint: RemoteEndpoint, request: urllib.request.Request) -> bytes:
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                payload = response.read(self.max_body_bytes + 1)
-                signature = response.headers.get("X-DS4RT-Signature")
-                content_length = response.headers.get("Content-Length")
-        except (OSError, urllib.error.URLError, urllib.error.HTTPError) as error:
-            raise RuntimeError(f"EXL3 worker `{endpoint.name}` request failed") from error
+    def _read_response(self, endpoint: RemoteEndpoint, response) -> bytes:
+        payload = response.read(self.max_body_bytes + 1)
+        signature = response.headers.get("X-DS4RT-Signature")
+        content_length = response.headers.get("Content-Length")
         if len(payload) > self.max_body_bytes:
             raise RuntimeError(f"EXL3 worker `{endpoint.name}` response is too large")
         if content_length is not None:
@@ -438,6 +753,42 @@ class EXL3RemoteClient:
         ):
             raise RuntimeError(f"EXL3 worker `{endpoint.name}` response signature is invalid")
         return payload
+
+    def _request(self, endpoint: RemoteEndpoint, request: urllib.request.Request) -> bytes:
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                return self._read_response(endpoint, response)
+        except urllib.error.HTTPError as error:
+            try:
+                payload = self._read_response(endpoint, error)
+            except RuntimeError as response_error:
+                raise RuntimeError(
+                    f"EXL3 worker `{endpoint.name}` returned an invalid error response"
+                ) from response_error
+            finally:
+                error.close()
+            try:
+                error_record = json.loads(payload)
+            except (UnicodeError, json.JSONDecodeError) as decode_error:
+                raise RuntimeError(
+                    f"EXL3 worker `{endpoint.name}` returned an invalid error record"
+                ) from decode_error
+            message = error_record.get("message") if isinstance(error_record, dict) else None
+            if (
+                not isinstance(error_record, dict)
+                or error_record.get("status") != "error"
+                or not isinstance(message, str)
+                or not message
+            ):
+                raise RuntimeError(
+                    f"EXL3 worker `{endpoint.name}` returned an inconsistent error record"
+                )
+            raise RuntimeError(
+                f"EXL3 worker `{endpoint.name}` rejected request "
+                f"(HTTP {error.code}): {message}"
+            ) from error
+        except (OSError, urllib.error.URLError) as error:
+            raise RuntimeError(f"EXL3 worker `{endpoint.name}` request failed") from error
 
     def qualify(self, endpoint: RemoteEndpoint) -> None:
         with self._identity_lock:
@@ -559,6 +910,8 @@ def remote_client_from_provenance(
         or not isinstance(remote.get("endpoints"), list)
         or not remote["endpoints"]
         or not isinstance(remote.get("coordinator_slots"), list)
+        or not isinstance(remote.get("assignment_store"), str)
+        or not remote["assignment_store"]
         or not isinstance(remote.get("token_env"), str)
         or not remote["token_env"]
         or isinstance(remote.get("timeout_seconds", 7200), bool)
@@ -627,7 +980,9 @@ def remote_client_from_provenance(
                 image_digest=value["image_digest"],
             )
         )
-    expected_orchestration_workers = len(endpoints) + len(coordinator_slots)
+    expected_orchestration_workers = (
+        len(coordinator_slots) + 2 * len(endpoints)
+    )
     if remote.get("orchestration_workers") != expected_orchestration_workers:
         raise ValueError("invalid EXL3 remote-worker orchestration width")
     return EXL3RemoteClient(
@@ -636,21 +991,25 @@ def remote_client_from_provenance(
         coordinator_slots=coordinator_slots,
         timeout_seconds=float(remote.get("timeout_seconds", 7200)),
         max_attempts=int(remote.get("max_attempts", 2)),
+        assignment_store_path=remote["assignment_store"],
     )
 
 
 __all__ = [
     "DEFAULT_MAX_BODY_BYTES",
+    "EXL3_HESSIAN_CAPTURE_CONTRACT",
     "REMOTE_CONTRACT",
     "REMOTE_REQUEST_SCHEMA",
     "REMOTE_RESULT_SCHEMA",
     "REMOTE_SCHEDULER",
     "EXL3RemoteClient",
     "CoordinatorSlot",
+    "ExecutionSlotLease",
     "ExecutionSlot",
     "RemoteEndpoint",
     "decode_tensor_envelope",
     "encode_tensor_envelope",
+    "exl3_quantization_failure_message",
     "execute_remote_projection",
     "remote_client_from_provenance",
     "validate_projection_request",

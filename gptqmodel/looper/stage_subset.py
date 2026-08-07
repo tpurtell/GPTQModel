@@ -653,6 +653,32 @@ def build_layer_subset_plans(
         if subset:
             subsets.append(subset)
 
+    # Lazy packed checkpoints can leave forward-only (`:!`) linear leaves on
+    # META because no quantization subset preprocesses them. Wrap only those
+    # lazy passthrough leaves so the forward device boundary can attach the
+    # active decoder plan and materialize them without changing ordinary eager
+    # model behavior.
+    for name, candidate in list(full.items()):
+        if isinstance(candidate, NamedModule):
+            continue
+        try:
+            candidate_device = get_device(candidate)
+        except Exception:
+            continue
+        if candidate_device != META:
+            continue
+        full_name = (
+            looper.gptq_model.lm_head
+            if is_lm_head_module
+            else f"{layers_prefix}.{name}"
+        )
+        full[name] = NamedModule(
+            candidate,
+            name=name,
+            full_name=full_name,
+            layer_index=layer_index,
+        )
+
     subset_total = len(subsets)
     return [
         build_subset_plan(
@@ -786,6 +812,11 @@ def _run_single_subset_pass(
     subset_size = len(subset_names)
 
     if execute_forward:
+        looper._prepare_layer_direct_state_for_forward(
+            module,
+            cur_layer_device,
+            projection_modules=full,
+        )
         for named_module in subset.values():
             if isinstance(named_module, NamedModule):
                 looper._prepare_named_module_for_forward(
@@ -921,7 +952,7 @@ def _run_single_subset_pass(
 
     previous_forward_devices: Dict[str, torch.device] = {}
     preserve_devices = plan.preserve_module_devices
-    if forward_device_map:
+    if execute_forward and forward_device_map:
         previous_forward_devices = looper._apply_forward_device_overrides(
             subset,
             forward_device_map,

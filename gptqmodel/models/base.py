@@ -2435,6 +2435,18 @@ class BaseQModel(nn.Module):
         """Swap one decoded shell module to an FP8 forward view when supported."""
 
         decoder_plan = named_module.state.get("auto_module_decoder")
+        if not isinstance(decoder_plan, dict):
+            # Passthrough modules participate in the layer forward but are not
+            # visited by ModulePreProcessor. They still need the run's active
+            # checkpoint decoder when a lazy packed source backs their shell.
+            decoder_config = self._active_auto_module_decoder_config()
+            if decoder_config is not None:
+                decoder_plan = {
+                    "code": decoder_config.code,
+                    "source_dtype": decoder_config.source_dtype,
+                    "target_dtype": decoder_config.target_dtype,
+                }
+                named_module.state["auto_module_decoder"] = decoder_plan
         turtle_model = self.turtle_model
         if not isinstance(decoder_plan, dict) or turtle_model is None:
             return target_submodule
@@ -2458,6 +2470,7 @@ class BaseQModel(nn.Module):
 
         target_dtype = decoder_plan.get("target_dtype", target_submodule.weight.dtype)
         forward_policy = str(decoder_plan.get("passthrough_forward_policy", "native")).strip().lower()
+        preserve_subclass_forward = type(target_submodule) is not nn.Linear
         if not isinstance(named_module.state.get("quant_source_module"), nn.Module):
             named_module.state["quant_source_module"] = self._build_decoder_quant_source_module(
                 target_submodule,
@@ -2467,7 +2480,12 @@ class BaseQModel(nn.Module):
 
         forward_mode = "decode"
         replacement = target_submodule
-        if forward_policy != "decode" and decoder_kind == "fp8" and device_supports_dtype(device, weight.dtype, require_validation=False):
+        if (
+            forward_policy != "decode"
+            and not preserve_subclass_forward
+            and decoder_kind == "fp8"
+            and device_supports_dtype(device, weight.dtype, require_validation=False)
+        ):
             fp8_module = self._build_fp8_forward_module(
                 target_submodule=target_submodule,
                 checkpoint_tensors=checkpoint_tensors,
@@ -2477,7 +2495,12 @@ class BaseQModel(nn.Module):
             if fp8_module is not None:
                 replacement = self._replace_live_submodule(target_submodule, fp8_module)
                 forward_mode = "native"
-        elif forward_policy != "decode" and decoder_kind == "fp4" and device_supports_native_fp4(device, require_validation=False):
+        elif (
+            forward_policy != "decode"
+            and not preserve_subclass_forward
+            and decoder_kind == "fp4"
+            and device_supports_native_fp4(device, require_validation=False)
+        ):
             fp4_module = self._build_fp4_forward_module(
                 target_submodule=target_submodule,
                 checkpoint_tensors=checkpoint_tensors,
