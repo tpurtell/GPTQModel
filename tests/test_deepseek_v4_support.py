@@ -91,6 +91,33 @@ def test_deepseek_v4_preserves_integrated_mtp_namespace() -> None:
     assert DeepSeekV4QModel.out_of_model_tensors == {"prefixes": ["mtp"]}
 
 
+def test_deepseek_v4_target_input_capture_keeps_first_layer_lazy() -> None:
+    first = nn.Linear(2, 2, device="meta")
+    second = nn.Linear(2, 2, device="meta")
+    harness = object.__new__(DeepSeekV4QModel)
+    harness.model = SimpleNamespace(
+        model=SimpleNamespace(layers=nn.ModuleList([first, second]))
+    )
+
+    assert harness.prepare_input_capture_layer(
+        first,
+        module_path="model.layers.0",
+        device=torch.device("cpu"),
+    ) is first
+    assert first.weight.device.type == "meta"
+
+    try:
+        harness.prepare_input_capture_layer(
+            second,
+            module_path="model.layers.1",
+            device=torch.device("cpu"),
+        )
+    except RuntimeError as exc:
+        assert "layer zero" in str(exc)
+    else:
+        raise AssertionError("nonzero target input-capture layer was accepted")
+
+
 def test_deepseek_v4_mtp_checkpoint_contract_is_exact_and_does_not_trust_nextn_count() -> None:
     config = _tiny_v4_config()
     assert config.num_nextn_predict_layers == 1

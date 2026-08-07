@@ -1272,6 +1272,29 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         },
     ]
 
+    def prepare_input_capture_layer(
+        self,
+        layer: nn.Module,
+        *,
+        module_path: str | None,
+        device: torch.device,
+    ) -> nn.Module:
+        """Keep target layer zero lazy until its pre-hook captures the input.
+
+        The input-capture hook aborts before the first decoder layer reads any
+        parameters. Materializing the complete layer here is therefore both
+        unnecessary and invalid for packed FP4 checkpoints: the generic lazy
+        loader sees the packed half-width expert tensors before the per-leaf
+        auto decoder can reconstruct them.
+        """
+
+        del module_path, device
+        if layer is not self.model.model.layers[0]:
+            raise RuntimeError(
+                "DeepSeek V4 target input capture was not attached to layer zero"
+            )
+        return layer
+
     def attach_mtp_quantization_model(
         self,
         adapter: "DeepSeekV4MTPQuantizationModel",
