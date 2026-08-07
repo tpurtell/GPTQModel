@@ -558,6 +558,21 @@ def fallback_quant(
 
 finalize_capture_H_mutex = threading.Lock()
 
+
+@torch.no_grad()
+def restore_hessian_symmetry_(H: torch.Tensor, quant_args: dict) -> None:
+    """Restore symmetry lost to independent FP32 Hadamard GEMMs."""
+
+    if H.ndim != 2 or H.shape[0] != H.shape[1]:
+        raise ValueError("EXL3 Hessian symmetry restoration requires a square matrix")
+    symmetric = (H + H.transpose(0, 1)) * 0.5
+    correction_max_abs = float((H - symmetric).abs().max().item())
+    H.copy_(symmetric)
+    del symmetric
+    quant_args["hessian_symmetry_restoration"] = "mean-with-transpose-fp32"
+    quant_args["hessian_symmetry_correction_max_abs"] = correction_max_abs
+
+
 def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
     with finalize_capture_H_mutex:
 
@@ -602,6 +617,13 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         blockwise_preapply_had_r_(H, had_k)
         H *= su
         blockwise_preapply_had_l_(H, had_k)
+
+        # The operations above are a symmetric congruence mathematically, but
+        # the independent FP32 left/right GEMMs can differ enough for
+        # torch.linalg.cholesky to reject an otherwise positive-definite
+        # regularized Hessian. Restore the represented symmetric matrix without
+        # changing sigma or adding diagonal damping.
+        restore_hessian_symmetry_(H, quant_args)
 
         # Get block LDL decomposition of H, zero diagonal
         if q_fallback:
@@ -1191,6 +1213,12 @@ def quantize_exl3(
             "hessian_domain": "regularized_exl3_search_space",
             "hessian_sample_count": int(H_data["count"]),
             "hessian_regularization_sigma": float(quant_args.get("sigma_reg", 0.025)),
+            "hessian_symmetry_restoration": quant_args.get(
+                "hessian_symmetry_restoration"
+            ),
+            "hessian_symmetry_correction_max_abs": quant_args.get(
+                "hessian_symmetry_correction_max_abs"
+            ),
             "hessian_weighted_error_numerator": hessian_num,
             "hessian_weighted_reference_denominator": hessian_den,
             "hessian_weighted_relative_error": hessian_ratio,
