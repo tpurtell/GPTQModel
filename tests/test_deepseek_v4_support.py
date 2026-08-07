@@ -3,12 +3,41 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 import torch.nn.functional as F
+from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
 from gptqmodel.models import auto
 from gptqmodel.models.definitions.deepseek_v4 import (
+    DeepSeekV4MTPAuxiliaryShell,
     DeepSeekV4QModel,
+    expected_deepseek_v4_mtp_checkpoint_keys,
     patch_deepseek_v4_router_precision,
+    validate_deepseek_v4_mtp_checkpoint_keys,
 )
+
+
+def _tiny_v4_config() -> DeepseekV4Config:
+    return DeepseekV4Config(
+        vocab_size=32,
+        hidden_size=16,
+        moe_intermediate_size=8,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        q_lora_rank=8,
+        n_routed_experts=3,
+        num_experts_per_tok=2,
+        hc_mult=2,
+        o_groups=2,
+        o_lora_rank=8,
+        sliding_window=8,
+        layer_types=["sliding_attention"] * 3,
+        mlp_layer_types=["moe"] * 3,
+        dspark_target_layer_ids=[0, 1, 2],
+        dspark_markov_rank=4,
+        partial_rotary_factor=0.5,
+        dtype="bfloat16",
+    )
 
 
 def test_deepseek_v4_model_type_selects_definition(monkeypatch):
@@ -41,6 +70,76 @@ def test_deepseek_v4_module_tree_matches_v4_attention_and_fused_experts():
 
 def test_deepseek_v4_preserves_integrated_mtp_namespace() -> None:
     assert DeepSeekV4QModel.out_of_model_tensors == {"prefixes": ["mtp"]}
+
+
+def test_deepseek_v4_mtp_checkpoint_contract_is_exact_and_does_not_trust_nextn_count() -> None:
+    config = _tiny_v4_config()
+    assert config.num_nextn_predict_layers == 1
+    keys = expected_deepseek_v4_mtp_checkpoint_keys(config)
+    report = validate_deepseek_v4_mtp_checkpoint_keys(config, keys)
+
+    assert report == {
+        "block_count": 3,
+        "target_layer_ids": [0, 1, 2],
+        "routed_experts_per_block": 3,
+        "tensor_count": len(keys),
+    }
+    assert "mtp.0.ffn.experts.0.w1.weight" in keys
+    assert "mtp.2.ffn.experts.2.w3.scale" in keys
+    assert "mtp.0.main_proj.weight" in keys
+    assert "mtp.2.confidence_head.proj.weight" in keys
+
+    missing = set(keys)
+    missing.remove("mtp.1.ffn.experts.2.w2.scale")
+    try:
+        validate_deepseek_v4_mtp_checkpoint_keys(config, missing)
+    except RuntimeError as exc:
+        assert "missing=1" in str(exc)
+    else:
+        raise AssertionError("an incomplete MTP namespace was accepted")
+
+    unexpected = set(keys)
+    unexpected.add("mtp.3.ffn.gate.weight")
+    try:
+        validate_deepseek_v4_mtp_checkpoint_keys(config, unexpected)
+    except RuntimeError as exc:
+        assert "unexpected=1" in str(exc)
+    else:
+        raise AssertionError("an unknown MTP block was accepted")
+
+
+def test_deepseek_v4_mtp_shell_is_defused_patched_and_fail_closed() -> None:
+    shell = DeepSeekV4MTPAuxiliaryShell(_tiny_v4_config())
+
+    assert shell.target_layer_ids == (0, 1, 2)
+    assert shell.base_num_hidden_layers == 3
+    assert shell.config.num_hidden_layers == 6
+    assert shell.config.layer_types[-3:] == ["sliding_attention"] * 3
+    assert shell.config.mlp_layer_types[-3:] == ["moe"] * 3
+    assert len(shell.mtp) == 3
+    assert shell.mtp[0].main_proj.in_features == 48
+    assert shell.mtp[0].main_proj.out_features == 16
+    assert shell.mtp[2].confidence_head.proj.in_features == 20
+    assert shell.mtp[2].markov_head.markov_w1.weight.shape == (32, 4)
+
+    for block in shell.mtp:
+        assert block.self_attn.layer_type == "sliding_attention"
+        assert len(block.mlp.experts) == 3
+        assert hasattr(block.mlp.experts[0], "gate_proj")
+        assert hasattr(block.mlp.experts[0], "up_proj")
+        assert hasattr(block.mlp.experts[0], "down_proj")
+        assert block.mlp.gate._gptqmodel_v4_fp32_router
+        assert block.mlp.gate.weight.dtype is torch.bfloat16
+        assert block.mlp.gate.e_score_correction_bias.dtype is torch.float32
+        assert block.self_attn.sinks.dtype is torch.float32
+        assert block.attn_hc.fn.dtype is torch.float32
+
+    try:
+        shell()
+    except RuntimeError as exc:
+        assert "must not be appended to target layers" in str(exc)
+    else:
+        raise AssertionError("generic MTP shell forward did not fail closed")
 
 
 class _LearnedRouter(nn.Module):

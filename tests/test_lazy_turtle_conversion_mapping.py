@@ -11,7 +11,11 @@ from safetensors.torch import save_file
 from torch import nn
 
 from gptqmodel.models.definitions.deepseek_ocr2 import DeepSeekOCR2QModel
-from gptqmodel.models.definitions.deepseek_v4 import DeepSeekV4QModel
+from gptqmodel.models.definitions.deepseek_v4 import (
+    DeepSeekV4QModel,
+    deepseek_v4_mtp_checkpoint_mapping_reversed,
+    deepseek_v4_mtp_module_tree,
+)
 from gptqmodel.models.definitions.gemma3 import Gemma3ForConditionalGenerationGPTQ
 from gptqmodel.models.definitions.mixtral import MixtralQModel
 from gptqmodel.models.definitions.ovis import OvisQModel
@@ -227,6 +231,32 @@ class _DeepseekV4DefusedShell(nn.Module):
         self.config = SimpleNamespace(model_type="deepseek_v4")
         self.model = nn.Module()
         self.model.layers = nn.ModuleList([_DefusedLayerShell()])
+
+
+class _DeepseekV4MTPDefusedShell(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="deepseek_v4")
+        block = nn.Module()
+        block.input_layernorm = nn.LayerNorm(4, elementwise_affine=True, bias=False, device="meta")
+        block.self_attn = nn.Module()
+        block.self_attn.q_a_proj = nn.Linear(4, 3, bias=False, device="meta")
+        block.self_attn.sinks = nn.Parameter(torch.empty(2, device="meta"))
+        block.attn_hc = nn.Module()
+        block.attn_hc.fn = nn.Parameter(torch.empty(2, 4, device="meta"))
+        block.mlp = nn.Module()
+        block.mlp.gate = nn.Module()
+        block.mlp.gate.register_buffer(
+            "e_score_correction_bias", torch.empty(2, device="meta"), persistent=True
+        )
+        block.mlp.experts = nn.ModuleList([_DefusedExpertLeaf(hidden_dim=4, intermediate_dim=3)])
+        block.mlp.shared_experts = _DefusedExpertLeaf(hidden_dim=4, intermediate_dim=3)
+        self.mtp = nn.ModuleList([block])
+        self.mtp.append(nn.Module())
+        terminal = nn.Module()
+        terminal.hc_head = nn.Module()
+        terminal.hc_head.hc_fn = nn.Parameter(torch.empty(2, 4, device="meta"))
+        self.mtp.append(terminal)
 
 
 class _WeightRenamingStub:
@@ -892,6 +922,50 @@ def test_lazy_turtle_handles_deepseek_v4_composed_renaming_order_for_attn_sinks(
         )
         == "model.layers.0.attn.attn_sink"
     )
+
+
+def test_lazy_turtle_resolves_explicit_deepseek_v4_mtp_shell_aliases(tmp_path):
+    checkpoint_tensors = {
+        "mtp.0.attn_norm.weight": torch.arange(4, dtype=torch.float32),
+        "mtp.0.attn.attn_sink": torch.arange(2, dtype=torch.float32),
+        "mtp.0.attn.wq_a.weight": torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        "mtp.0.hc_attn_fn": torch.arange(8, dtype=torch.float32).reshape(2, 4),
+        "mtp.0.ffn.gate.bias": torch.arange(2, dtype=torch.float32),
+        "mtp.0.ffn.experts.0.w1.weight": torch.arange(6, dtype=torch.int8).reshape(3, 2),
+        "mtp.0.ffn.experts.0.w1.scale": torch.ones(3, 1, dtype=torch.float32),
+        "mtp.0.ffn.shared_experts.w2.weight": torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        "mtp.2.hc_head_fn": torch.arange(8, dtype=torch.float32).reshape(2, 4),
+    }
+    shell = _DeepseekV4MTPDefusedShell()
+    turtle = _build_lazy_turtle(
+        tmp_path,
+        checkpoint_tensors,
+        module_tree=deepseek_v4_mtp_module_tree(),
+        hf_conversion_map_reversed=deepseek_v4_mtp_checkpoint_mapping_reversed(),
+        target_model=shell,
+    )
+
+    expected = {
+        ("mtp.0.input_layernorm", "weight"): "mtp.0.attn_norm.weight",
+        ("mtp.0.self_attn", "sinks"): "mtp.0.attn.attn_sink",
+        ("mtp.0.self_attn.q_a_proj", "weight"): "mtp.0.attn.wq_a.weight",
+        ("mtp.0.attn_hc", "fn"): "mtp.0.hc_attn_fn",
+        ("mtp.0.mlp.gate", "e_score_correction_bias"): "mtp.0.ffn.gate.bias",
+        ("mtp.0.mlp.experts.0.gate_proj", "weight"): "mtp.0.ffn.experts.0.w1.weight",
+        ("mtp.0.mlp.shared_experts.down_proj", "weight"): "mtp.0.ffn.shared_experts.w2.weight",
+        ("mtp.2.hc_head", "hc_fn"): "mtp.2.hc_head_fn",
+    }
+    for (module_path, leaf), checkpoint_name in expected.items():
+        assert turtle._resolve_checkpoint_tensor_name(module_path, leaf) == checkpoint_name
+
+    tensors = turtle.checkpoint_tensors_for_submodule(
+        target_model=shell,
+        target_submodule=shell.mtp[0].mlp.experts[0].gate_proj,
+        recurse=False,
+    )
+    assert torch.equal(tensors["weight"], checkpoint_tensors["mtp.0.ffn.experts.0.w1.weight"])
+    assert torch.equal(tensors["scale"], checkpoint_tensors["mtp.0.ffn.experts.0.w1.scale"])
+    assert tensors["weight_scale"] is tensors["scale"]
 
 
 def test_lazy_turtle_resolves_deepseek_v4_compressor_indexer_projection_aliases(tmp_path):
