@@ -25,8 +25,8 @@ from ..exllamav3.modules.quant.exl3_lib.quantize import (
 )
 from ..looper.loop_processor import (
     DTYPE_SIZE_COLUMN,
-    ExecutionConfig,
     MODULE_FEATURE_COLUMN,
+    ExecutionConfig,
     LoopProcessor,
 )
 from ..looper.named_module import NamedModule
@@ -45,7 +45,7 @@ from ..models.writer import (
 )
 from ..nn_modules.exllamav3 import ExllamaV3Linear
 from ..quantization import QuantizeConfig
-from ..quantization.config import EXL3Config, FORMAT, GPTQConfig, METHOD
+from ..quantization.config import FORMAT, METHOD, EXL3Config, GPTQConfig
 from ..quantization.gptq import GPTQ
 from ..utils.device import get_device
 from ..utils.exl3_error_ledger import (
@@ -57,15 +57,15 @@ from ..utils.exl3_error_ledger import (
     route_evidence_required,
     routed_expert_identity,
 )
-from ..utils.exllamav3 import create_exllamav3_module
 from ..utils.exl3_projection_checkpoint import (
     EXL3ProjectionCheckpointStore,
     build_projection_request,
     checkpoint_root_from_provenance,
 )
+from ..utils.exl3_remote import remote_client_from_provenance
+from ..utils.exllamav3 import create_exllamav3_module
 from ..utils.logger import setup_logger
 from ..utils.module_locks import parent_module_lock
-
 
 setup_logger()
 
@@ -359,6 +359,9 @@ class EXL3Processor(LoopProcessor):
         self._natural_route_evidence_cache: dict[
             tuple[str, int], dict[int, dict[str, Any]]
         ] = {}
+        self._remote_client_initialized = False
+        self._remote_client = None
+        self._distributed_local_quant_lock = threading.Lock()
         self.error_journal_path = os.getenv(JOURNAL_ENV) or str(
             Path(self.log_tmp_log_file_name).with_suffix(".exl3-error-ledger.jsonl")
         )
@@ -381,6 +384,29 @@ class EXL3Processor(LoopProcessor):
                 "EXL3 `meta.ds4rt_error_ledger` provenance must be a dictionary"
             )
         return provenance
+
+    def _remote_client_for_run(self, provenance: dict[str, Any] | None):
+        """Construct the immutable remote-worker client at most once per run."""
+
+        lock = getattr(self, "_stats_lock", None)
+        context = lock if lock is not None else nullcontext()
+        with context:
+            if not getattr(self, "_remote_client_initialized", False):
+                self._remote_client = remote_client_from_provenance(provenance)
+                self._remote_client_initialized = True
+            return getattr(self, "_remote_client", None)
+
+    @staticmethod
+    def _expert_assignment_key(module: NamedModule) -> str:
+        """Keep all projections in one expert family on one deterministic slot."""
+
+        identity = routed_expert_identity(module.full_name)
+        if identity is None:
+            return module.full_name
+        return (
+            f"{identity['block_namespace']}:{identity['logical_layer']}:"
+            f"{identity['expert']}"
+        )
 
     def subset_forward_capture_context(
         self,
@@ -617,7 +643,6 @@ class EXL3Processor(LoopProcessor):
         if target_device.type != "cuda":
             raise ValueError("EXL3 quantization requires CUDA/HIP execution.")
 
-        start_time = time.perf_counter()
         capture.finalize_hessian(target_device=target_device)
         hessian = capture.H
         if hessian is None:
@@ -636,6 +661,21 @@ class EXL3Processor(LoopProcessor):
         }
 
         ledger_provenance = self._ledger_provenance()
+        remote_client = self._remote_client_for_run(ledger_provenance)
+        remote_endpoint = None
+        execution_contract = None
+        projection_provenance = ledger_provenance
+        if remote_client is not None:
+            if routed_expert_identity(module.full_name) is None:
+                raise ValueError(
+                    "EXL3 remote dispatch only accepts routed-expert projections"
+                )
+            remote_endpoint = remote_client.assigned_endpoint(
+                self._expert_assignment_key(module)
+            )
+            execution_contract = remote_client.execution_contract(remote_endpoint)
+            projection_provenance = copy.deepcopy(ledger_provenance)
+            projection_provenance["execution"] = copy.deepcopy(execution_contract)
         quant_args = self._build_quant_args(module, module_qcfg, target_device)
         input_weight = self._quant_input_weight(capture, target_device)
         checkpoint_root = checkpoint_root_from_provenance(ledger_provenance)
@@ -644,6 +684,10 @@ class EXL3Processor(LoopProcessor):
             if checkpoint_root is not None
             else None
         )
+        if remote_client is not None and checkpoint_store is None:
+            raise ValueError(
+                "EXL3 remote dispatch requires a coordinator projection checkpoint"
+            )
         checkpoint_request = None
         checkpoint_result = None
         checkpoint_hit = False
@@ -653,19 +697,22 @@ class EXL3Processor(LoopProcessor):
                 if isinstance(ledger_provenance, dict)
                 else None
             )
+            quantizer_contract = {
+                "bits": int(quant_args["K"]),
+                "codebook": module_qcfg.codebook,
+                "apply_out_scales": quant_args["apply_out_scales"],
+                "sigma_reg": float(quant_args["sigma_reg"]),
+                "seed": int(quant_args["seed"]),
+            }
+            if execution_contract is not None:
+                quantizer_contract["execution"] = copy.deepcopy(execution_contract)
             checkpoint_request = build_projection_request(
                 module_full_name=module.full_name,
                 layer_index=module.layer_index,
                 input_weight=input_weight,
                 hessian=hessian,
                 sample_count=capture.nsamples,
-                quantizer_contract={
-                    "bits": int(quant_args["K"]),
-                    "codebook": module_qcfg.codebook,
-                    "apply_out_scales": quant_args["apply_out_scales"],
-                    "sigma_reg": float(quant_args["sigma_reg"]),
-                    "seed": int(quant_args["seed"]),
-                },
+                quantizer_contract=quantizer_contract,
                 family_join=family_join,
                 route_evidence=task_entry.get("route_evidence"),
             )
@@ -674,22 +721,68 @@ class EXL3Processor(LoopProcessor):
             loaded_checkpoint = None
 
         if loaded_checkpoint is None:
-            _weight_q, proxy_err, out_tensors = quantize_exl3(
-                weight=input_weight,
-                H_data=h_data,
-                quant_args=quant_args,
-                return_weight_q=False,
-            )
-            del _weight_q
-            duration = time.perf_counter() - start_time
-            quantizer_metrics = quant_args.get("error_metrics")
+            if remote_endpoint is not None:
+                remote_started = time.perf_counter()
+                out_tensors, remote_result, transport = remote_client.quantize(
+                    endpoint=remote_endpoint,
+                    request_manifest=checkpoint_request,
+                    input_weight=input_weight,
+                    hessian=hessian,
+                )
+                remote_elapsed = time.perf_counter() - remote_started
+                duration = remote_result.get("duration_seconds")
+                proxy_err = remote_result.get("proxy_error")
+                device_names = remote_result.get("device_names")
+                quantizer_metrics = remote_result.get("quantizer_metrics")
+                worker = remote_result.get("worker")
+                if (
+                    isinstance(duration, bool)
+                    or not isinstance(duration, (int, float))
+                    or isinstance(proxy_err, bool)
+                    or not isinstance(proxy_err, (int, float))
+                    or not isinstance(device_names, list)
+                    or not all(isinstance(value, str) for value in device_names)
+                    or not isinstance(quantizer_metrics, dict)
+                    or not isinstance(worker, dict)
+                ):
+                    raise RuntimeError(
+                        f"EXL3 remote worker returned malformed results for `{module.full_name}`."
+                    )
+                execution_result = {
+                    "kind": "remote_worker",
+                    "worker": copy.deepcopy(worker),
+                    "transport": copy.deepcopy(transport),
+                    "coordinator_elapsed_seconds": remote_elapsed,
+                }
+            else:
+                wait_started = time.perf_counter()
+                quant_lock = (
+                    self._distributed_local_quant_lock
+                    if remote_client is not None
+                    else nullcontext()
+                )
+                with quant_lock:
+                    quant_started = time.perf_counter()
+                    _weight_q, proxy_err, out_tensors = quantize_exl3(
+                        weight=input_weight,
+                        H_data=h_data,
+                        quant_args=quant_args,
+                        return_weight_q=False,
+                    )
+                    del _weight_q
+                    duration = time.perf_counter() - quant_started
+                device_names = [str(device) for device in quant_args["devices"]]
+                quantizer_metrics = quant_args.get("error_metrics")
+                execution_result = {
+                    "kind": "coordinator",
+                    "scheduler_wait_seconds": quant_started - wait_started,
+                }
             if not isinstance(quantizer_metrics, dict):
                 raise RuntimeError(
                     f"EXL3 quantizer returned no structured error metrics for `{module.full_name}`."
                 )
             if isinstance(proxy_err, torch.Tensor):
                 proxy_err = proxy_err.item()
-            device_names = [str(device) for device in quant_args["devices"]]
             encoded_bytes = sum(
                 tensor.numel() * tensor.element_size()
                 for tensor in out_tensors.values()
@@ -705,7 +798,7 @@ class EXL3Processor(LoopProcessor):
                 encoded_bytes=encoded_bytes,
                 device_names=device_names,
                 quantizer_metrics=quantizer_metrics,
-                provenance=ledger_provenance,
+                provenance=projection_provenance,
                 route_evidence=task_entry.get("route_evidence"),
             )
             checkpoint_result = {
@@ -714,6 +807,8 @@ class EXL3Processor(LoopProcessor):
                 "device_names": device_names,
                 "quantizer_metrics": quantizer_metrics,
                 "ledger_record": ledger_record,
+                "execution_contract": execution_contract,
+                "execution_result": execution_result,
             }
             if checkpoint_store is not None:
                 checkpoint_store.commit(
@@ -728,6 +823,8 @@ class EXL3Processor(LoopProcessor):
             device_names = checkpoint_result.get("device_names")
             quantizer_metrics = checkpoint_result.get("quantizer_metrics")
             ledger_record = checkpoint_result.get("ledger_record")
+            stored_execution_contract = checkpoint_result.get("execution_contract")
+            execution_result = checkpoint_result.get("execution_result")
             encoded_bytes = sum(
                 tensor.numel() * tensor.element_size()
                 for tensor in out_tensors.values()
@@ -740,6 +837,8 @@ class EXL3Processor(LoopProcessor):
                 or not all(isinstance(value, str) for value in device_names)
                 or not isinstance(quantizer_metrics, dict)
                 or not isinstance(ledger_record, dict)
+                or stored_execution_contract != execution_contract
+                or (remote_client is not None and not isinstance(execution_result, dict))
             ):
                 raise ValueError("EXL3 projection checkpoint result is malformed")
             expected_ledger_record = build_projection_record(
@@ -752,7 +851,7 @@ class EXL3Processor(LoopProcessor):
                 encoded_bytes=encoded_bytes,
                 device_names=device_names,
                 quantizer_metrics=quantizer_metrics,
-                provenance=ledger_provenance,
+                provenance=projection_provenance,
                 route_evidence=task_entry.get("route_evidence"),
             )
             if ledger_record != expected_ledger_record:
@@ -815,6 +914,8 @@ class EXL3Processor(LoopProcessor):
                 else None
             ),
             "exl3_projection_checkpoint_hit": checkpoint_hit,
+            "exl3_execution_contract": execution_contract,
+            "exl3_execution_result": execution_result,
         }
 
         if workspace_summary:
