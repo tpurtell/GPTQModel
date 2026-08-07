@@ -27,7 +27,11 @@ import torch
 from safetensors.torch import load as load_safetensors
 from safetensors.torch import save as save_safetensors
 
-from ..exllamav3.modules.quant.exl3_lib.quantize import quantize_exl3
+from ..exllamav3.modules.quant.exl3_lib.quantize import (
+    EXL3_HESSIAN_NUMERICAL_CONTRACT,
+    EXL3_HESSIAN_SYMMETRY_CONTRACT,
+    quantize_exl3,
+)
 from .exl3_projection_checkpoint import (
     CHECKPOINT_SCHEMA,
     CHECKPOINT_SCHEMA_VERSION,
@@ -342,6 +346,8 @@ def validate_remote_inputs(
         or contract["bits"] > 8
         or contract.get("codebook") not in {"mcg", "mul1"}
         or contract.get("hessian_capture") != EXL3_HESSIAN_CAPTURE_CONTRACT
+        or contract.get("hessian_numerical") != EXL3_HESSIAN_NUMERICAL_CONTRACT
+        or contract.get("hessian_symmetry") != EXL3_HESSIAN_SYMMETRY_CONTRACT
         or contract.get("apply_out_scales") not in {None, True, False}
         or isinstance(contract.get("sigma_reg"), bool)
         or not isinstance(contract.get("sigma_reg"), (int, float))
@@ -395,6 +401,43 @@ def validate_remote_output_tensors(
         or marker.numel() != 1
     ):
         raise ValueError("EXL3 remote output tensor geometry is inconsistent")
+
+
+def validate_exl3_hessian_metrics(
+    metrics: dict[str, Any],
+    *,
+    sample_count: int,
+    sigma_reg: float,
+) -> None:
+    """Require the complete production Hessian numerical contract."""
+
+    diagonal_addend = metrics.get("hessian_regularization_diagonal_addend")
+    symmetry_correction = metrics.get("hessian_symmetry_correction_max_abs")
+    if (
+        metrics.get("quantizer_path") != "hessian_ldlq"
+        or metrics.get("hessian_metric_status") != "ok"
+        or metrics.get("hessian_sample_count") != sample_count
+        or metrics.get("hessian_regularization_sigma") != sigma_reg
+        or metrics.get("hessian_numerical_contract")
+        != EXL3_HESSIAN_NUMERICAL_CONTRACT
+        or metrics.get("hessian_transform_compute_dtype") != "torch.float64"
+        or metrics.get("hessian_storage_dtype") != "torch.float32"
+        or metrics.get("hessian_regularization_placement")
+        != "before-fp64-congruence"
+        or metrics.get("hessian_symmetry_restoration")
+        != EXL3_HESSIAN_SYMMETRY_CONTRACT
+        or isinstance(diagonal_addend, bool)
+        or not isinstance(diagonal_addend, (int, float))
+        or not math.isfinite(diagonal_addend)
+        or diagonal_addend <= 0.0
+        or isinstance(symmetry_correction, bool)
+        or not isinstance(symmetry_correction, (int, float))
+        or not math.isfinite(symmetry_correction)
+        or symmetry_correction < 0.0
+    ):
+        raise RuntimeError(
+            "EXL3 quantizer returned an invalid Hessian numerical contract"
+        )
 
 
 def execute_remote_projection(
@@ -466,14 +509,13 @@ def execute_remote_projection(
     del _weight_q
     duration = time.perf_counter() - started
     metrics = quant_args.get("error_metrics")
-    if (
-        not isinstance(metrics, dict)
-        or metrics.get("quantizer_path") != "hessian_ldlq"
-        or metrics.get("hessian_metric_status") != "ok"
-        or quant_args.get("q_fallback") is not False
-        or metrics.get("hessian_sample_count") != request["sample_count"]
-    ):
+    if not isinstance(metrics, dict) or quant_args.get("q_fallback") is not False:
         raise RuntimeError("EXL3 remote worker rejected fallback/incomplete metrics")
+    validate_exl3_hessian_metrics(
+        metrics,
+        sample_count=request["sample_count"],
+        sigma_reg=float(contract["sigma_reg"]),
+    )
     if isinstance(proxy_error, torch.Tensor):
         proxy_error = proxy_error.item()
     if (

@@ -13,6 +13,10 @@ import gptqmodel.utils.exl3_remote as exl3_remote
 import pytest
 import torch
 
+from gptqmodel.exllamav3.modules.quant.exl3_lib.quantize import (
+    EXL3_HESSIAN_NUMERICAL_CONTRACT,
+    EXL3_HESSIAN_SYMMETRY_CONTRACT,
+)
 from gptqmodel.utils.exl3_projection_checkpoint import (
     EXL3ProjectionCheckpointStore,
     build_projection_request,
@@ -29,6 +33,7 @@ from gptqmodel.utils.exl3_remote import (
     execute_remote_projection,
     exl3_quantization_failure_message,
     remote_client_from_provenance,
+    validate_exl3_hessian_metrics,
     validate_remote_output_tensors,
 )
 
@@ -75,6 +80,8 @@ def _request(
             "bits": 2,
             "codebook": "mcg",
             "hessian_capture": "raw-xtx-sum-fp32-v1",
+            "hessian_numerical": EXL3_HESSIAN_NUMERICAL_CONTRACT,
+            "hessian_symmetry": EXL3_HESSIAN_SYMMETRY_CONTRACT,
             "apply_out_scales": None,
             "sigma_reg": 0.025,
             "seed": 787,
@@ -305,6 +312,35 @@ def test_output_geometry_is_bound_to_request() -> None:
     tensors["trellis"] = torch.zeros((8, 8, 16), dtype=torch.int16)
     with pytest.raises(ValueError, match="geometry"):
         validate_remote_output_tensors(request, tensors)
+
+
+def test_hessian_metrics_bind_fp64_congruence_contract() -> None:
+    metrics = {
+        "quantizer_path": "hessian_ldlq",
+        "hessian_metric_status": "ok",
+        "hessian_sample_count": 2821,
+        "hessian_regularization_sigma": 0.025,
+        "hessian_numerical_contract": EXL3_HESSIAN_NUMERICAL_CONTRACT,
+        "hessian_transform_compute_dtype": "torch.float64",
+        "hessian_storage_dtype": "torch.float32",
+        "hessian_regularization_placement": "before-fp64-congruence",
+        "hessian_regularization_diagonal_addend": 0.000180678,
+        "hessian_symmetry_restoration": EXL3_HESSIAN_SYMMETRY_CONTRACT,
+        "hessian_symmetry_correction_max_abs": 1e-12,
+    }
+    validate_exl3_hessian_metrics(
+        metrics,
+        sample_count=2821,
+        sigma_reg=0.025,
+    )
+
+    metrics["hessian_numerical_contract"] = "legacy-fp32"
+    with pytest.raises(RuntimeError, match="numerical contract"):
+        validate_exl3_hessian_metrics(
+            metrics,
+            sample_count=2821,
+            sigma_reg=0.025,
+        )
 
 
 def test_retry_stays_on_the_assigned_worker_and_retains_history(monkeypatch) -> None:

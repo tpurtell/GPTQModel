@@ -20,6 +20,8 @@ from torch.nn import Module
 from torch.nn.modules.conv import _ConvNd
 
 from ..exllamav3.modules.quant.exl3_lib.quantize import (
+    EXL3_HESSIAN_NUMERICAL_CONTRACT,
+    EXL3_HESSIAN_SYMMETRY_CONTRACT,
     quantize_exl3,
     reconstruct_exl3_tensors,
 )
@@ -69,6 +71,7 @@ from ..utils.exl3_remote import (
     RemoteEndpoint,
     exl3_quantization_failure_message,
     remote_client_from_provenance,
+    validate_exl3_hessian_metrics,
 )
 from ..utils.exllamav3 import create_exllamav3_module
 from ..utils.logger import setup_logger
@@ -791,6 +794,8 @@ class EXL3Processor(LoopProcessor):
                 "sigma_reg": float(quant_args["sigma_reg"]),
                 "seed": int(quant_args["seed"]),
                 "hessian_capture": EXL3_HESSIAN_CAPTURE_CONTRACT,
+                "hessian_numerical": EXL3_HESSIAN_NUMERICAL_CONTRACT,
+                "hessian_symmetry": EXL3_HESSIAN_SYMMETRY_CONTRACT,
             }
             if execution_contract is not None:
                 quantizer_contract["execution"] = copy.deepcopy(execution_contract)
@@ -904,6 +909,11 @@ class EXL3Processor(LoopProcessor):
                 raise RuntimeError(
                     f"EXL3 quantizer returned no structured error metrics for `{module.full_name}`."
                 )
+            validate_exl3_hessian_metrics(
+                quantizer_metrics,
+                sample_count=capture.nsamples,
+                sigma_reg=float(quant_args["sigma_reg"]),
+            )
             if isinstance(proxy_err, torch.Tensor):
                 proxy_err = proxy_err.item()
             encoded_bytes = sum(

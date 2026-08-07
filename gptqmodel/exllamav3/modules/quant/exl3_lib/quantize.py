@@ -20,6 +20,9 @@ from ....util.tensor import save_tensor_image
 
 # Constant
 had_k, had_n = 128, 128
+
+EXL3_HESSIAN_NUMERICAL_CONTRACT = "signed-block-hadamard-congruence-fp64-v1"
+EXL3_HESSIAN_SYMMETRY_CONTRACT = "mean-with-transpose-fp64"
 codebook_scale = 1.24371088
 
 codebook_mcg_mult = 0xCBAC1FED
@@ -248,7 +251,7 @@ def preapply_had_r(x: torch.Tensor, had_dim):
 def blockwise_preapply_had_l_(x: torch.Tensor, had_dim):
     k, n = x.shape
     assert k % had_dim == 0
-    assert x.dtype == torch.float
+    assert x.dtype in (torch.float32, torch.float64)
     had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
     num_blocks = k // had_dim
     for i in range(num_blocks):
@@ -262,7 +265,7 @@ def blockwise_preapply_had_l_(x: torch.Tensor, had_dim):
 def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
     k, n = x.shape
     assert n % had_dim == 0
-    assert x.dtype == torch.float
+    assert x.dtype in (torch.float32, torch.float64)
     had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
     num_blocks = n // had_dim
     for i in range(num_blocks):
@@ -561,16 +564,85 @@ finalize_capture_H_mutex = threading.Lock()
 
 @torch.no_grad()
 def restore_hessian_symmetry_(H: torch.Tensor, quant_args: dict) -> None:
-    """Restore symmetry lost to independent FP32 Hadamard GEMMs."""
+    """Restore symmetry lost to independent finite-precision Hadamard GEMMs."""
 
     if H.ndim != 2 or H.shape[0] != H.shape[1]:
         raise ValueError("EXL3 Hessian symmetry restoration requires a square matrix")
+    if H.dtype not in (torch.float32, torch.float64):
+        raise ValueError(
+            "EXL3 Hessian symmetry restoration requires FP32 or FP64 input"
+        )
     symmetric = (H + H.transpose(0, 1)) * 0.5
     correction_max_abs = float((H - symmetric).abs().max().item())
     H.copy_(symmetric)
     del symmetric
-    quant_args["hessian_symmetry_restoration"] = "mean-with-transpose-fp32"
+    quant_args["hessian_symmetry_restoration"] = (
+        "mean-with-transpose-fp64"
+        if H.dtype == torch.float64
+        else "mean-with-transpose-fp32"
+    )
     quant_args["hessian_symmetry_correction_max_abs"] = correction_max_abs
+
+
+@torch.no_grad()
+def regularize_and_transform_hessian_(
+    H: torch.Tensor,
+    *,
+    su: torch.Tensor,
+    diag_mean: torch.Tensor,
+    quant_args: dict,
+) -> None:
+    """Apply EXL3's regularized signed-Hadamard congruence in FP64.
+
+    The diagonal regularizer makes the captured covariance positive-definite
+    before the congruence. Applying the independent left/right block-Hadamard
+    GEMMs in FP32 can consume that positive margin for highly correlated expert
+    activations, even after the represented matrix is made exactly symmetric.
+    FP64 preserves the intended mathematical operation without increasing
+    ``sigma_reg`` or introducing data-dependent damping.
+    """
+
+    if (
+        H.ndim != 2
+        or H.shape[0] != H.shape[1]
+        or H.dtype != torch.float32
+        or su.shape != (H.shape[0], 1)
+        or su.device != H.device
+        or diag_mean.numel() != 1
+        or diag_mean.device != H.device
+    ):
+        raise ValueError("EXL3 FP64 Hessian congruence received invalid input")
+
+    sigma_reg = quant_args.get("sigma_reg", 0.025)
+    if (
+        isinstance(sigma_reg, bool)
+        or not isinstance(sigma_reg, (int, float))
+        or not math.isfinite(float(sigma_reg))
+        or float(sigma_reg) < 0.0
+    ):
+        raise ValueError(
+            "EXL3 Hessian regularization sigma must be finite and non-negative"
+        )
+
+    regularization = float(sigma_reg) * float(diag_mean.item())
+    transformed = H.to(dtype=torch.float64)
+    idx = torch.arange(H.shape[0], device=H.device)
+    transformed[idx, idx] += regularization
+    su_fp64 = su.to(dtype=torch.float64)
+    transformed *= su_fp64.transpose(0, 1)
+    blockwise_preapply_had_r_(transformed, had_k)
+    transformed *= su_fp64
+    blockwise_preapply_had_l_(transformed, had_k)
+    restore_hessian_symmetry_(transformed, quant_args)
+    if quant_args["hessian_symmetry_restoration"] != EXL3_HESSIAN_SYMMETRY_CONTRACT:
+        raise RuntimeError("EXL3 FP64 Hessian symmetry contract was not recorded")
+    H.copy_(transformed)
+
+    quant_args["hessian_numerical_contract"] = EXL3_HESSIAN_NUMERICAL_CONTRACT
+    quant_args["hessian_transform_compute_dtype"] = "torch.float64"
+    quant_args["hessian_storage_dtype"] = "torch.float32"
+    quant_args["hessian_regularization_placement"] = "before-fp64-congruence"
+    quant_args["hessian_regularization_diagonal_addend"] = regularization
 
 
 def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
@@ -590,17 +662,18 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         count = H_data["count"]
         if count == 0:
             q_fallback = True
+            diag_mean = torch.diag(H).mean()
         else:
             H /= count
             diag_mean = torch.diag(H).mean()
             q_fallback = diag_mean.item() < 1e-20
 
-        # Regularize diagonal
+        # Preserve the original-channel diagonal used by the weight
+        # regularizer. The same sigma term is applied to the Hessian in FP64
+        # immediately before the signed-Hadamard congruence below.
         idx = torch.arange(H.shape[0])
-        H[idx, idx] += quant_args.get("sigma_reg", 0.025) * diag_mean
-
-        # Some tests
-        diag = H[idx, idx].clone()
+        regularization = quant_args.get("sigma_reg", 0.025) * diag_mean
+        diag = H[idx, idx].clone() + regularization
 
         if verbose:
             print(f"     - H min/max: {H.min().item():.6f}   {H.max().item():.6f}")
@@ -612,18 +685,15 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         su = (torch.randn(k, device = H.device).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
         H_data["su"] = su
 
-        # Input had
-        H *= su.T
-        blockwise_preapply_had_r_(H, had_k)
-        H *= su
-        blockwise_preapply_had_l_(H, had_k)
-
-        # The operations above are a symmetric congruence mathematically, but
-        # the independent FP32 left/right GEMMs can differ enough for
-        # torch.linalg.cholesky to reject an otherwise positive-definite
-        # regularized Hessian. Restore the represented symmetric matrix without
-        # changing sigma or adding diagonal damping.
-        restore_hessian_symmetry_(H, quant_args)
+        # Input signed-Hadamard congruence. FP64 preserves the positive margin
+        # supplied by sigma_reg for cold/highly-correlated experts; exact
+        # symmetry is restored before the result is stored back in FP32.
+        regularize_and_transform_hessian_(
+            H,
+            su=su,
+            diag_mean=diag_mean,
+            quant_args=quant_args,
+        )
 
         # Get block LDL decomposition of H, zero diagonal
         if q_fallback:
@@ -1213,6 +1283,19 @@ def quantize_exl3(
             "hessian_domain": "regularized_exl3_search_space",
             "hessian_sample_count": int(H_data["count"]),
             "hessian_regularization_sigma": float(quant_args.get("sigma_reg", 0.025)),
+            "hessian_numerical_contract": quant_args.get(
+                "hessian_numerical_contract"
+            ),
+            "hessian_transform_compute_dtype": quant_args.get(
+                "hessian_transform_compute_dtype"
+            ),
+            "hessian_storage_dtype": quant_args.get("hessian_storage_dtype"),
+            "hessian_regularization_placement": quant_args.get(
+                "hessian_regularization_placement"
+            ),
+            "hessian_regularization_diagonal_addend": quant_args.get(
+                "hessian_regularization_diagonal_addend"
+            ),
             "hessian_symmetry_restoration": quant_args.get(
                 "hessian_symmetry_restoration"
             ),
