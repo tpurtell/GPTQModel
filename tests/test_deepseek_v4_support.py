@@ -8,6 +8,8 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from gptqmodel.models import auto
 from gptqmodel.models.definitions.deepseek_v4 import (
     DeepSeekV4MTPAuxiliaryShell,
+    DeepSeekV4MTPReplay,
+    DeepSeekV4MTPReplayBatch,
     DeepSeekV4QModel,
     expected_deepseek_v4_mtp_checkpoint_keys,
     patch_deepseek_v4_router_precision,
@@ -35,6 +37,8 @@ def _tiny_v4_config() -> DeepseekV4Config:
         mlp_layer_types=["moe"] * 3,
         dspark_target_layer_ids=[0, 1, 2],
         dspark_markov_rank=4,
+        dspark_block_size=5,
+        dspark_noise_token_id=31,
         partial_rotary_factor=0.5,
         dtype="bfloat16",
     )
@@ -140,6 +144,78 @@ def test_deepseek_v4_mtp_shell_is_defused_patched_and_fail_closed() -> None:
         assert "must not be appended to target layers" in str(exc)
     else:
         raise AssertionError("generic MTP shell forward did not fail closed")
+
+
+def test_deepseek_v4_mtp_replay_keeps_five_rows_joint_and_uses_target_lane_means() -> None:
+    torch.manual_seed(0xD54)
+    config = _tiny_v4_config()
+    shell = DeepSeekV4MTPAuxiliaryShell(config, device="cpu")
+    with torch.no_grad():
+        for parameter in shell.parameters():
+            if parameter.is_floating_point():
+                parameter.normal_(mean=0.0, std=0.02)
+        for block in shell.mtp:
+            block.mlp.gate.e_score_correction_bias.zero_()
+    embedding = torch.randn(
+        config.vocab_size, config.hidden_size, dtype=torch.bfloat16
+    )
+    replay = DeepSeekV4MTPReplay(shell, embedding_weight=embedding)
+
+    target_outputs = tuple(
+        torch.randn(2, 4, config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    collapsed = tuple(
+        DeepSeekV4MTPReplay.collapse_target_layer_output(value)
+        for value in target_outputs
+    )
+    for source, tap in zip(target_outputs, collapsed):
+        torch.testing.assert_close(tap, source.mean(dim=2))
+
+    batch = DeepSeekV4MTPReplayBatch(
+        target_taps=collapsed,
+        anchor_token_ids=torch.tensor([7, 9]),
+        main_position_ids=torch.tensor([[0, 1, 2, 3], [0, 0, 5, 6]]),
+        main_attention_mask=torch.tensor(
+            [[True, True, True, True], [False, False, True, True]]
+        ),
+    )
+    ffn_shapes = []
+    result = replay.replay(
+        batch,
+        prepare_ffn=lambda block_index, _block, hidden, token_ids: ffn_shapes.append(
+            (block_index, tuple(hidden.shape), tuple(token_ids.shape))
+        ),
+    )
+
+    assert result.proposal_token_ids.tolist() == [
+        [7, 31, 31, 31, 31],
+        [9, 31, 31, 31, 31],
+    ]
+    assert result.proposal_position_ids.tolist() == [
+        [4, 5, 6, 7, 8],
+        [7, 8, 9, 10, 11],
+    ]
+    assert result.projected_main.shape == (2, 4, config.hidden_size)
+    assert result.terminal_residual.shape == (
+        2,
+        5,
+        config.hc_mult,
+        config.hidden_size,
+    )
+    assert ffn_shapes == [
+        (0, (2, 5, config.hidden_size), (2, 5)),
+        (1, (2, 5, config.hidden_size), (2, 5)),
+        (2, (2, 5, config.hidden_size), (2, 5)),
+    ]
+    assert len(result.routes) == 3
+    for block_index, route in enumerate(result.routes):
+        assert route.block_index == block_index
+        assert route.logits.shape == (2, 5, config.n_routed_experts)
+        assert route.weights.shape == (2, 5, config.num_experts_per_tok)
+        assert route.indices.shape == (2, 5, config.num_experts_per_tok)
+        assert route.logits.dtype is torch.float32
+        assert route.weights.dtype is torch.float32
 
 
 class _LearnedRouter(nn.Module):
