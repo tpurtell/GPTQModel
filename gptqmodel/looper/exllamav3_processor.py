@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import transformers
@@ -18,7 +20,12 @@ from torch.nn import Module
 from torch.nn.modules.conv import _ConvNd
 
 from ..exllamav3.modules.quant.exl3_lib.quantize import quantize_exl3
-from ..looper.loop_processor import DTYPE_SIZE_COLUMN, ExecutionConfig, MODULE_FEATURE_COLUMN, LoopProcessor
+from ..looper.loop_processor import (
+    DTYPE_SIZE_COLUMN,
+    ExecutionConfig,
+    MODULE_FEATURE_COLUMN,
+    LoopProcessor,
+)
 from ..looper.named_module import NamedModule
 from ..models import BaseQModel
 from ..models.writer import (
@@ -40,8 +47,12 @@ from ..quantization.gptq import GPTQ
 from ..utils.device import get_device
 from ..utils.exl3_error_ledger import (
     JOURNAL_ENV,
+    ROUTE_EVIDENCE_SCHEMA,
+    ROUTE_EVIDENCE_SCHEMA_VERSION,
     append_exl3_error_journal,
     build_projection_record,
+    route_evidence_required,
+    routed_expert_identity,
 )
 from ..utils.exllamav3 import create_exllamav3_module
 from ..utils.logger import setup_logger
@@ -59,6 +70,211 @@ _OUT_SCALES_TO_ARG = {
 }
 
 
+class _EXL3NaturalRouteCapture:
+    """Accumulate per-expert exposure during one native-router subset replay."""
+
+    def __init__(
+        self,
+        processor: "EXL3Processor",
+        *,
+        layer_module: Module,
+        subset: Dict[str, NamedModule],
+    ) -> None:
+        self.processor = processor
+        self.targets: dict[str, dict[str, Any]] = {}
+        for task_name, named_module in subset.items():
+            full_name = getattr(named_module, "full_name", None)
+            identity = (
+                routed_expert_identity(full_name)
+                if isinstance(full_name, str)
+                else None
+            )
+            if identity is not None and task_name in processor.tasks:
+                self.targets[task_name] = identity
+        family_ids = {
+            (identity["block_namespace"], identity["logical_layer"])
+            for identity in self.targets.values()
+        }
+        if not self.targets or len(family_ids) != 1:
+            raise ValueError(
+                "EXL3 natural-route capture requires one routed block per subset"
+            )
+
+        mlp = getattr(layer_module, "mlp", None)
+        if mlp is None:
+            mlp = getattr(layer_module, "ffn", None)
+        self.router = getattr(mlp, "gate", None)
+        if not isinstance(self.router, Module):
+            raise ValueError("EXL3 natural-route capture could not resolve the router")
+
+        self._lock = threading.Lock()
+        self._handle = None
+        self._router_calls = 0
+        self._router_token_count = 0
+        self._router_selected_route_count = 0
+        self._router_top_k: int | None = None
+        self._expert_counts: torch.Tensor | None = None
+        self._gate_sums: torch.Tensor | None = None
+        self._gate_squared_mass: torch.Tensor | None = None
+        self._router_weight_dtypes: set[str] = set()
+        self._mask_modes: set[str] = set()
+
+    def __enter__(self) -> "_EXL3NaturalRouteCapture":
+        self._handle = self.router.register_forward_hook(self._capture)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        del exc_value, traceback
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+        if exc_type is None:
+            self.processor._commit_natural_route_capture(self)
+        return False
+
+    def _capture(self, _module, _inputs, output) -> None:
+        paused_tls = getattr(self.processor, "_hooks_paused_tls", None)
+        if paused_tls is not None and getattr(paused_tls, "value", False):
+            return
+        if not isinstance(output, (tuple, list)) or len(output) != 3:
+            raise RuntimeError("EXL3 natural-route capture requires router triplets")
+        logits, weights, indices = output
+        if (
+            not isinstance(logits, torch.Tensor)
+            or not isinstance(weights, torch.Tensor)
+            or not isinstance(indices, torch.Tensor)
+            or weights.shape != indices.shape
+            or weights.ndim != 2
+            or logits.ndim != 2
+            or logits.shape[0] != weights.shape[0]
+        ):
+            raise RuntimeError(
+                "EXL3 natural-route capture received malformed router output"
+            )
+
+        keep_mask = getattr(getattr(self.processor, "_mask_tls", None), "value", None)
+        if keep_mask is None:
+            mask_mode = "absent"
+        else:
+            flat_keep = keep_mask.reshape(-1).to(
+                device=indices.device, dtype=torch.bool
+            )
+            if flat_keep.numel() != indices.shape[0]:
+                raise RuntimeError(
+                    "EXL3 natural-route mask does not align with router rows"
+                )
+            mask_mode = "all-valid" if bool(flat_keep.all().item()) else "filtered"
+            weights = weights[flat_keep]
+            indices = indices[flat_keep]
+
+        num_experts = int(logits.shape[-1])
+        top_k = int(indices.shape[-1])
+        flat_indices = indices.detach().reshape(-1).to(dtype=torch.int64)
+        flat_weights = weights.detach().reshape(-1).to(dtype=torch.float64)
+        if flat_indices.numel() == 0:
+            return
+        counts = torch.bincount(flat_indices, minlength=num_experts)
+        gate_sums = torch.bincount(
+            flat_indices,
+            weights=flat_weights,
+            minlength=num_experts,
+        )
+        gate_squared_mass = torch.bincount(
+            flat_indices,
+            weights=flat_weights.square(),
+            minlength=num_experts,
+        )
+        if any(
+            value.numel() != num_experts
+            for value in (counts, gate_sums, gate_squared_mass)
+        ):
+            raise RuntimeError(
+                "EXL3 natural-route capture observed an invalid expert id"
+            )
+        counts = counts.to(device="cpu", dtype=torch.int64)
+        gate_sums = gate_sums.to(device="cpu", dtype=torch.float64)
+        gate_squared_mass = gate_squared_mass.to(device="cpu", dtype=torch.float64)
+
+        with self._lock:
+            if self._router_top_k is None:
+                self._router_top_k = top_k
+                self._expert_counts = torch.zeros_like(counts)
+                self._gate_sums = torch.zeros_like(gate_sums)
+                self._gate_squared_mass = torch.zeros_like(gate_squared_mass)
+            elif (
+                self._router_top_k != top_k
+                or self._expert_counts.numel() != num_experts
+            ):
+                raise RuntimeError("EXL3 natural-route geometry changed during replay")
+            self._expert_counts.add_(counts)
+            self._gate_sums.add_(gate_sums)
+            self._gate_squared_mass.add_(gate_squared_mass)
+            self._router_calls += 1
+            self._router_token_count += int(indices.shape[0])
+            self._router_selected_route_count += int(flat_indices.numel())
+            self._router_weight_dtypes.add(str(weights.dtype))
+            self._mask_modes.add(mask_mode)
+
+    def evidence_by_expert(self) -> dict[int, dict[str, Any]]:
+        """Finalize the bounded route metrics needed by expert-family tiering."""
+
+        if (
+            self._router_calls <= 0
+            or self._router_token_count <= 0
+            or self._router_top_k is None
+            or self._expert_counts is None
+            or self._gate_sums is None
+            or self._gate_squared_mass is None
+        ):
+            raise RuntimeError("EXL3 natural-route capture observed no router traffic")
+        total_gate_sum = float(self._gate_sums.sum().item())
+        total_gate_sq = float(self._gate_squared_mass.sum().item())
+        if total_gate_sum <= 0 or total_gate_sq <= 0:
+            raise RuntimeError(
+                "EXL3 natural-route capture observed no positive gate mass"
+            )
+        namespace, logical_layer = next(
+            iter(
+                {
+                    (identity["block_namespace"], identity["logical_layer"])
+                    for identity in self.targets.values()
+                }
+            )
+        )
+        evidence: dict[int, dict[str, Any]] = {}
+        for expert in sorted(
+            {identity["expert"] for identity in self.targets.values()}
+        ):
+            route_count = int(self._expert_counts[expert].item())
+            gate_sum = float(self._gate_sums[expert].item())
+            gate_sq = float(self._gate_squared_mass[expert].item())
+            evidence[expert] = {
+                "schema": ROUTE_EVIDENCE_SCHEMA,
+                "schema_version": ROUTE_EVIDENCE_SCHEMA_VERSION,
+                "block_namespace": namespace,
+                "logical_layer": logical_layer,
+                "expert": expert,
+                "router_calls": self._router_calls,
+                "router_token_count": self._router_token_count,
+                "router_selected_route_count": self._router_selected_route_count,
+                "router_top_k": self._router_top_k,
+                "expert_route_count": route_count,
+                "expert_gate_weight_sum": gate_sum,
+                "expert_gate_squared_mass": gate_sq,
+                "total_gate_weight_sum": total_gate_sum,
+                "total_gate_squared_mass": total_gate_sq,
+                "expert_route_fraction": route_count
+                / self._router_selected_route_count,
+                "expert_gate_weight_mass_fraction": gate_sum / total_gate_sum,
+                "expert_gate_squared_mass_fraction": gate_sq / total_gate_sq,
+                "expert_gate_weight_mean": gate_sum / max(route_count, 1),
+                "expert_gate_weight_rms": math.sqrt(gate_sq / max(route_count, 1)),
+                "router_weight_dtypes": sorted(self._router_weight_dtypes),
+                "mask_modes": sorted(self._mask_modes),
+            }
+        return evidence
+
+
 def clone_exllamav3_config_for_module(
     qcfg: EXL3Config,
     module_full_name: str,
@@ -68,14 +284,16 @@ def clone_exllamav3_config_for_module(
     if not qcfg.module_is_included(module_full_name):
         return None
 
-    if qcfg.dynamic_get(layer_name=module_full_name) == False:
+    if qcfg.dynamic_get(layer_name=module_full_name) is False:
         return None
 
     qcfg_clone = copy.deepcopy(qcfg)
 
     if qcfg.dynamic is not None:
         qcfg_clone.bits = qcfg.dynamic_get(module_full_name, "bits", qcfg_clone.bits)
-        qcfg_clone.head_bits = qcfg.dynamic_get(module_full_name, "head_bits", qcfg_clone.head_bits)
+        qcfg_clone.head_bits = qcfg.dynamic_get(
+            module_full_name, "head_bits", qcfg_clone.head_bits
+        )
 
         out_scales_override = qcfg.dynamic_get(module_full_name, "out_scales", None)
         if out_scales_override is not None:
@@ -130,6 +348,9 @@ class EXL3Processor(LoopProcessor):
         self.avg_losses = []
         self.lm_head_name = lm_head_name
         self._stats_lock = threading.Lock()
+        self._natural_route_evidence_cache: dict[
+            tuple[str, int], dict[int, dict[str, Any]]
+        ] = {}
         self.error_journal_path = os.getenv(JOURNAL_ENV) or str(
             Path(self.log_tmp_log_file_name).with_suffix(".exl3-error-ledger.jsonl")
         )
@@ -137,7 +358,124 @@ class EXL3Processor(LoopProcessor):
     def set_calibration_dataset(self, calibration_dataset):
         """Rejects dataset replacement because EXL3 capture is fixed at construction."""
 
-        raise NotImplementedError("EXL3Processor's calibration_dataset cannot be modified")
+        raise NotImplementedError(
+            "EXL3Processor's calibration_dataset cannot be modified"
+        )
+
+    def _ledger_provenance(self) -> dict[str, Any] | None:
+        """Return the run provenance shared by every EXL3 projection."""
+
+        if not isinstance(self.qcfg.meta, dict):
+            return None
+        provenance = self.qcfg.meta.get("ds4rt_error_ledger")
+        if provenance is not None and not isinstance(provenance, dict):
+            raise ValueError(
+                "EXL3 `meta.ds4rt_error_ledger` provenance must be a dictionary"
+            )
+        return provenance
+
+    def subset_forward_capture_context(
+        self,
+        *,
+        layer_module: Module,
+        subset: Dict[str, NamedModule],
+    ):
+        """Capture natural router exposure in the existing subset forward."""
+
+        provenance = self._ledger_provenance()
+        if not route_evidence_required(provenance):
+            return nullcontext()
+        targets = {
+            task_name: identity
+            for task_name, named_module in subset.items()
+            if task_name in self.tasks
+            and isinstance(getattr(named_module, "full_name", None), str)
+            and (identity := routed_expert_identity(named_module.full_name))
+            is not None
+        }
+        if not targets:
+            return nullcontext()
+        family_ids = {
+            (identity["block_namespace"], identity["logical_layer"])
+            for identity in targets.values()
+        }
+        if len(family_ids) != 1:
+            raise ValueError(
+                "EXL3 natural-route capture requires one routed block per subset"
+            )
+        family_id = next(iter(family_ids))
+        cache = getattr(self, "_natural_route_evidence_cache", None)
+        if cache is None:
+            cache = {}
+            self._natural_route_evidence_cache = cache
+        cached = cache.get(family_id)
+        target_experts = {identity["expert"] for identity in targets.values()}
+        if cached is not None and target_experts.issubset(cached):
+            self._attach_natural_route_evidence(targets, cached)
+            return nullcontext()
+        return _EXL3NaturalRouteCapture(
+            self,
+            layer_module=layer_module,
+            subset=subset,
+        )
+
+    def _commit_natural_route_capture(
+        self,
+        capture: _EXL3NaturalRouteCapture,
+    ) -> None:
+        """Bind one subset's route evidence to its projection capture tasks."""
+
+        evidence_by_expert = capture.evidence_by_expert()
+        family_id = next(
+            iter(
+                {
+                    (identity["block_namespace"], identity["logical_layer"])
+                    for identity in capture.targets.values()
+                }
+            )
+        )
+        cache = getattr(self, "_natural_route_evidence_cache", None)
+        if cache is None:
+            cache = {}
+            self._natural_route_evidence_cache = cache
+        previous_family = cache.get(family_id)
+        if previous_family is not None:
+            for expert, evidence in evidence_by_expert.items():
+                previous = previous_family.get(expert)
+                if previous is not None and previous != evidence:
+                    raise RuntimeError(
+                        f"EXL3 natural-route evidence changed for {family_id} expert {expert}"
+                    )
+            previous_family.update(evidence_by_expert)
+            evidence_by_expert = previous_family
+        else:
+            cache[family_id] = evidence_by_expert
+        self._attach_natural_route_evidence(capture.targets, evidence_by_expert)
+
+    def _attach_natural_route_evidence(
+        self,
+        targets: dict[str, dict[str, Any]],
+        evidence_by_expert: dict[int, dict[str, Any]],
+    ) -> None:
+        """Attach one immutable block distribution to projection tasks."""
+
+        for task_name, identity in targets.items():
+            task = self.tasks.get(task_name)
+            if task is None:
+                raise RuntimeError(
+                    f"EXL3 route capture lost task `{task_name}` before commit"
+                )
+            evidence = evidence_by_expert.get(identity["expert"])
+            if evidence is None:
+                raise RuntimeError(
+                    f"EXL3 route capture lacks expert {identity['expert']}"
+                )
+            previous = task.get("route_evidence")
+            if previous is not None and previous != evidence:
+                raise RuntimeError(
+                    f"EXL3 route evidence changed for task `{task_name}`"
+                )
+            task["route_evidence"] = evidence
 
     def preprocess(self, module: NamedModule, fallback=None, **kwargs):
         """Builds the capture task and effective EXL3 config for one module."""
@@ -172,7 +510,9 @@ class EXL3Processor(LoopProcessor):
 
         return self.tasks.get(module.name, False) is False
 
-    def pre_process_fwd_hook(self, name: str) -> Callable[[Module, Tuple[torch.Tensor, ...], torch.Tensor], None]:
+    def pre_process_fwd_hook(
+        self, name: str
+    ) -> Callable[[Module, Tuple[torch.Tensor, ...], torch.Tensor], None]:
         """Returns the forward hook that feeds captured batches into the EXL3 task."""
 
         def tmp(module, inp: Tuple[torch.Tensor, ...], out: torch.Tensor):
@@ -228,7 +568,9 @@ class EXL3Processor(LoopProcessor):
         normalized = capture.clone_module(copy=True, device=device)
         return normalized.t().contiguous().to(torch.float32)
 
-    def _restore_module_weight(self, module: NamedModule, quantized_weight: torch.Tensor) -> torch.Tensor:
+    def _restore_module_weight(
+        self, module: NamedModule, quantized_weight: torch.Tensor
+    ) -> torch.Tensor:
         """Reshapes the EXL3 output weight back into the wrapped module layout."""
 
         target = module.module if isinstance(module, NamedModule) else module
@@ -239,7 +581,9 @@ class EXL3Processor(LoopProcessor):
         if isinstance(target, (torch.nn.Linear, _ConvNd)):
             return quantized_weight.t().contiguous().view_as(target.weight.data)
 
-        raise NotImplementedError(f"Unsupported EXL3 module type: {target.__class__.__name__}")
+        raise NotImplementedError(
+            f"Unsupported EXL3 module type: {target.__class__.__name__}"
+        )
 
     def process(
         self,
@@ -270,9 +614,13 @@ class EXL3Processor(LoopProcessor):
         capture.finalize_hessian(target_device=target_device)
         hessian = capture.H
         if hessian is None:
-            raise RuntimeError(f"EXL3 failed to capture Hessian for module `{module.full_name}`.")
+            raise RuntimeError(
+                f"EXL3 failed to capture Hessian for module `{module.full_name}`."
+            )
         if capture.nsamples <= 0:
-            raise RuntimeError(f"EXL3 captured no calibration activations for module `{module.full_name}`.")
+            raise RuntimeError(
+                f"EXL3 captured no calibration activations for module `{module.full_name}`."
+            )
 
         h_data = {
             "H": hessian,
@@ -300,11 +648,7 @@ class EXL3Processor(LoopProcessor):
             for tensor in out_tensors.values()
             if isinstance(tensor, torch.Tensor)
         )
-        ledger_provenance = None
-        if isinstance(module_qcfg.meta, dict):
-            ledger_provenance = module_qcfg.meta.get("ds4rt_error_ledger")
-        if ledger_provenance is not None and not isinstance(ledger_provenance, dict):
-            raise ValueError("EXL3 `meta.ds4rt_error_ledger` provenance must be a dictionary")
+        ledger_provenance = self._ledger_provenance()
         ledger_record = build_projection_record(
             module_full_name=module.full_name,
             layer_index=module.layer_index,
@@ -316,6 +660,7 @@ class EXL3Processor(LoopProcessor):
             device_names=[str(device) for device in quant_args["devices"]],
             quantizer_metrics=quantizer_metrics,
             provenance=ledger_provenance,
+            route_evidence=task_entry.get("route_evidence"),
         )
 
         # This synchronous fsync is the commit barrier for the diagnostic
@@ -341,7 +686,11 @@ class EXL3Processor(LoopProcessor):
         if isinstance(proxy_err, str):
             loss_display = proxy_err
         else:
-            loss_display = f"{proxy_err:.10f}" if isinstance(proxy_err, (int, float)) else "unknown"
+            loss_display = (
+                f"{proxy_err:.10f}"
+                if isinstance(proxy_err, (int, float))
+                else "unknown"
+            )
 
         stat = {
             PROCESS_LOG_NAME: self.name(),
@@ -368,14 +717,17 @@ class EXL3Processor(LoopProcessor):
                 chunk_rows = workspace_summary.get("chunk_rows")
                 stat["workspace_cache_requests"] = str(requests)
                 stat["workspace_cache_hit_rate"] = f"{hit_rate:.1%}"
-                stat["workspace_stage_dtype"] = workspace_summary.get("staging_dtype", "")
+                stat["workspace_stage_dtype"] = workspace_summary.get(
+                    "staging_dtype", ""
+                )
                 if chunk_rows is not None:
                     stat["workspace_chunk_rows"] = str(chunk_rows)
         if workspace_totals:
             total_requests = int(workspace_totals.get("requests", 0) or 0)
             if total_requests:
                 cumulative_hit_rate = (
-                    float(workspace_totals.get("materialized_hits", 0) or 0.0) / total_requests
+                    float(workspace_totals.get("materialized_hits", 0) or 0.0)
+                    / total_requests
                 )
                 stat["workspace_total_requests"] = str(total_requests)
                 stat["workspace_total_hit_rate"] = f"{cumulative_hit_rate:.1%}"
@@ -405,7 +757,16 @@ class EXL3Processor(LoopProcessor):
         tensors: Dict[str, torch.Tensor] = {}
         with self._stats_lock:
             module.state.pop("w", None)
-            for tensor_name in ("trellis", "suh", "svh", "su", "sv", "bias", "mcg", "mul1"):
+            for tensor_name in (
+                "trellis",
+                "suh",
+                "svh",
+                "su",
+                "sv",
+                "bias",
+                "mcg",
+                "mul1",
+            ):
                 tensor = module.state.pop(tensor_name, None)
                 if tensor is not None:
                     tensors[tensor_name] = tensor.clone()

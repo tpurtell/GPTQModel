@@ -21,6 +21,8 @@ LEDGER_SCHEMA_VERSION = 1
 LEDGER_FILENAME = "ds4rt-exl3-error-ledger.jsonl"
 LEDGER_MANIFEST_FILENAME = "ds4rt-exl3-error-ledger.manifest.json"
 JOURNAL_ENV = "GPTQMODEL_EXL3_ERROR_JOURNAL"
+ROUTE_EVIDENCE_SCHEMA = "ds4rt.exl3-natural-route"
+ROUTE_EVIDENCE_SCHEMA_VERSION = 1
 
 _BASE_EXPERT = re.compile(
     r"^(?:model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\."
@@ -85,6 +87,107 @@ def routed_expert_identity(module_full_name: str) -> dict[str, Any] | None:
     return None
 
 
+def route_evidence_required(provenance: dict[str, Any] | None) -> bool:
+    """Return whether one run explicitly requires natural-route evidence."""
+
+    if not isinstance(provenance, dict):
+        return False
+    family_join = provenance.get("family_join")
+    return (
+        isinstance(family_join, dict)
+        and family_join.get("route_evidence_contract") == ROUTE_EVIDENCE_SCHEMA
+    )
+
+
+def validate_route_evidence(
+    evidence: dict[str, Any],
+    *,
+    identity: dict[str, Any],
+    sample_count: int,
+) -> dict[str, Any]:
+    """Validate one routed expert's exposure and gate-mass accounting."""
+
+    clean = _finite_json_value(evidence, "route_evidence")
+    integer_fields = (
+        "router_calls",
+        "router_token_count",
+        "router_selected_route_count",
+        "router_top_k",
+        "expert_route_count",
+    )
+    if (
+        clean.get("schema") != ROUTE_EVIDENCE_SCHEMA
+        or clean.get("schema_version") != ROUTE_EVIDENCE_SCHEMA_VERSION
+        or any(
+            isinstance(clean.get(field), bool)
+            or not isinstance(clean.get(field), int)
+            or clean[field] <= 0
+            for field in integer_fields
+        )
+        or clean.get("block_namespace") != identity["block_namespace"]
+        or clean.get("logical_layer") != identity["logical_layer"]
+        or clean.get("expert") != identity["expert"]
+        or clean["expert_route_count"] != int(sample_count)
+        or clean["router_selected_route_count"]
+        != clean["router_token_count"] * clean["router_top_k"]
+        or not isinstance(clean.get("router_weight_dtypes"), list)
+        or not clean["router_weight_dtypes"]
+        or not all(
+            isinstance(value, str) and value for value in clean["router_weight_dtypes"]
+        )
+        or not isinstance(clean.get("mask_modes"), list)
+        or not clean["mask_modes"]
+        or not all(isinstance(value, str) and value for value in clean["mask_modes"])
+    ):
+        raise ValueError("EXL3 natural-route evidence has an invalid contract")
+
+    numeric_fields = (
+        "expert_gate_weight_sum",
+        "expert_gate_squared_mass",
+        "total_gate_weight_sum",
+        "total_gate_squared_mass",
+        "expert_route_fraction",
+        "expert_gate_weight_mass_fraction",
+        "expert_gate_squared_mass_fraction",
+        "expert_gate_weight_mean",
+        "expert_gate_weight_rms",
+    )
+    if any(
+        isinstance(clean.get(field), bool)
+        or not isinstance(clean.get(field), (int, float))
+        or clean[field] < 0
+        for field in numeric_fields
+    ):
+        raise ValueError("EXL3 natural-route evidence has invalid gate metrics")
+
+    route_count = clean["expert_route_count"]
+    selected_count = clean["router_selected_route_count"]
+    gate_sum = float(clean["expert_gate_weight_sum"])
+    gate_sq = float(clean["expert_gate_squared_mass"])
+    total_gate_sum = float(clean["total_gate_weight_sum"])
+    total_gate_sq = float(clean["total_gate_squared_mass"])
+    expected = {
+        "expert_route_fraction": route_count / selected_count,
+        "expert_gate_weight_mass_fraction": gate_sum / max(total_gate_sum, 1e-30),
+        "expert_gate_squared_mass_fraction": gate_sq / max(total_gate_sq, 1e-30),
+        "expert_gate_weight_mean": gate_sum / route_count,
+        "expert_gate_weight_rms": math.sqrt(gate_sq / route_count),
+    }
+    if (
+        route_count > selected_count
+        or gate_sum <= 0
+        or gate_sq <= 0
+        or total_gate_sum < gate_sum
+        or total_gate_sq < gate_sq
+        or any(
+            not math.isclose(float(clean[field]), value, rel_tol=1e-12, abs_tol=1e-15)
+            for field, value in expected.items()
+        )
+    ):
+        raise ValueError("EXL3 natural-route evidence has inconsistent gate metrics")
+    return clean
+
+
 def build_projection_record(
     *,
     module_full_name: str,
@@ -97,6 +200,7 @@ def build_projection_record(
     device_names: list[str],
     quantizer_metrics: dict[str, Any],
     provenance: dict[str, Any] | None,
+    route_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Construct one projection record without discarding raw error terms."""
 
@@ -118,6 +222,18 @@ def build_projection_record(
     identity = routed_expert_identity(module_full_name)
     if identity is not None:
         record.update(identity)
+        if route_evidence is not None:
+            record["route_evidence"] = validate_route_evidence(
+                route_evidence,
+                identity=identity,
+                sample_count=sample_count,
+            )
+        elif route_evidence_required(provenance):
+            raise ValueError(
+                f"EXL3 natural-route evidence is required for `{module_full_name}`"
+            )
+    elif route_evidence is not None:
+        raise ValueError("EXL3 route evidence can only describe routed experts")
     return _finite_json_value(record)
 
 
@@ -144,49 +260,60 @@ def _family_record(records: list[dict[str, Any]]) -> dict[str, Any]:
     hessian_numerator = sum(hessian_numerators) if hessian_complete else None
     hessian_denominator = sum(hessian_denominators) if hessian_complete else None
 
-    return _finite_json_value(
-        {
-            "schema": LEDGER_SCHEMA,
-            "schema_version": LEDGER_SCHEMA_VERSION,
-            "record_kind": "expert_family",
-            "block_namespace": first["block_namespace"],
-            "logical_layer": first["logical_layer"],
-            "expert": first["expert"],
-            "bits": first["bits"],
-            "codebook": first["codebook"],
-            "projections": [record["projection"] for record in records],
-            "projection_modules": [record["module"] for record in records],
-            "sample_counts": [record["sample_count"] for record in records],
-            "duration_seconds": sum(record["duration_seconds"] for record in records),
-            "encoded_bytes": sum(record["encoded_bytes"] for record in records),
-            "provenance": {
-                "family_join": deepcopy(_family_join_provenance(first)),
-                "projections": {
-                    record["projection"]: deepcopy(record.get("provenance"))
-                    for record in records
-                },
+    route_evidence = [record.get("route_evidence") for record in records]
+    if any(value is not None for value in route_evidence):
+        if any(value is None for value in route_evidence) or any(
+            _canonical_json_bytes(value) != _canonical_json_bytes(route_evidence[0])
+            for value in route_evidence[1:]
+        ):
+            raise ValueError(
+                "EXL3 expert-family projections have inconsistent route evidence"
+            )
+
+    family = {
+        "schema": LEDGER_SCHEMA,
+        "schema_version": LEDGER_SCHEMA_VERSION,
+        "record_kind": "expert_family",
+        "block_namespace": first["block_namespace"],
+        "logical_layer": first["logical_layer"],
+        "expert": first["expert"],
+        "bits": first["bits"],
+        "codebook": first["codebook"],
+        "projections": [record["projection"] for record in records],
+        "projection_modules": [record["module"] for record in records],
+        "sample_counts": [record["sample_count"] for record in records],
+        "duration_seconds": sum(record["duration_seconds"] for record in records),
+        "encoded_bytes": sum(record["encoded_bytes"] for record in records),
+        "provenance": {
+            "family_join": deepcopy(_family_join_provenance(first)),
+            "projections": {
+                record["projection"]: deepcopy(record.get("provenance"))
+                for record in records
             },
-            "aggregate_metrics": {
-                "error_sum_sq": error_sum_sq,
-                "reference_sum_sq": reference_sum_sq,
-                "element_count": element_count,
-                "mse": error_sum_sq / max(element_count, 1),
-                "nmse": error_sum_sq / max(reference_sum_sq, 1e-20),
-                "relative_frobenius": math.sqrt(
-                    max(error_sum_sq / max(reference_sum_sq, 1e-20), 0.0)
-                ),
-                "max_abs_error": max(item["max_abs_error"] for item in reconstructions),
-                "hessian_weighted_error_numerator": hessian_numerator,
-                "hessian_weighted_reference_denominator": hessian_denominator,
-                "hessian_weighted_relative_error": (
-                    hessian_numerator / max(hessian_denominator, 1e-8)
-                    if hessian_complete
-                    else None
-                ),
-                "hessian_metric_status": "ok" if hessian_complete else "incomplete",
-            },
-        }
-    )
+        },
+        "aggregate_metrics": {
+            "error_sum_sq": error_sum_sq,
+            "reference_sum_sq": reference_sum_sq,
+            "element_count": element_count,
+            "mse": error_sum_sq / max(element_count, 1),
+            "nmse": error_sum_sq / max(reference_sum_sq, 1e-20),
+            "relative_frobenius": math.sqrt(
+                max(error_sum_sq / max(reference_sum_sq, 1e-20), 0.0)
+            ),
+            "max_abs_error": max(item["max_abs_error"] for item in reconstructions),
+            "hessian_weighted_error_numerator": hessian_numerator,
+            "hessian_weighted_reference_denominator": hessian_denominator,
+            "hessian_weighted_relative_error": (
+                hessian_numerator / max(hessian_denominator, 1e-8)
+                if hessian_complete
+                else None
+            ),
+            "hessian_metric_status": "ok" if hessian_complete else "incomplete",
+        },
+    }
+    if route_evidence[0] is not None:
+        family["route_evidence"] = deepcopy(route_evidence[0])
+    return _finite_json_value(family)
 
 
 def _family_join_provenance(record: dict[str, Any]) -> Any:
@@ -350,9 +477,13 @@ __all__ = [
     "LEDGER_MANIFEST_FILENAME",
     "LEDGER_SCHEMA",
     "LEDGER_SCHEMA_VERSION",
+    "ROUTE_EVIDENCE_SCHEMA",
+    "ROUTE_EVIDENCE_SCHEMA_VERSION",
     "append_exl3_error_journal",
     "build_projection_record",
     "derive_family_records",
+    "route_evidence_required",
     "routed_expert_identity",
+    "validate_route_evidence",
     "write_exl3_error_ledger",
 ]

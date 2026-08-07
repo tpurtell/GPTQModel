@@ -8,6 +8,7 @@ import pytest
 from gptqmodel.utils.exl3_error_ledger import (
     LEDGER_FILENAME,
     LEDGER_MANIFEST_FILENAME,
+    ROUTE_EVIDENCE_SCHEMA,
     append_exl3_error_journal,
     build_projection_record,
     derive_family_records,
@@ -58,7 +59,44 @@ def _metrics(scale: float) -> dict:
     }
 
 
-def _record(projection: str, scale: float = 1.0, provenance=None) -> dict:
+def _route_evidence(scale: float = 1.0) -> dict:
+    route_count = 1024
+    selected_count = 8192
+    gate_sum = 100.0 * scale
+    gate_sq = 20.0 * scale
+    total_gate_sum = 1000.0 * scale
+    total_gate_sq = 200.0 * scale
+    return {
+        "schema": ROUTE_EVIDENCE_SCHEMA,
+        "schema_version": 1,
+        "block_namespace": "base",
+        "logical_layer": 7,
+        "expert": 31,
+        "router_calls": 8,
+        "router_token_count": 1024,
+        "router_selected_route_count": selected_count,
+        "router_top_k": 8,
+        "expert_route_count": route_count,
+        "expert_gate_weight_sum": gate_sum,
+        "expert_gate_squared_mass": gate_sq,
+        "total_gate_weight_sum": total_gate_sum,
+        "total_gate_squared_mass": total_gate_sq,
+        "expert_route_fraction": route_count / selected_count,
+        "expert_gate_weight_mass_fraction": gate_sum / total_gate_sum,
+        "expert_gate_squared_mass_fraction": gate_sq / total_gate_sq,
+        "expert_gate_weight_mean": gate_sum / route_count,
+        "expert_gate_weight_rms": (gate_sq / route_count) ** 0.5,
+        "router_weight_dtypes": ["torch.float32"],
+        "mask_modes": ["all-valid"],
+    }
+
+
+def _record(
+    projection: str,
+    scale: float = 1.0,
+    provenance=None,
+    route_evidence=None,
+) -> dict:
     return build_projection_record(
         module_full_name=f"model.layers.7.mlp.experts.31.{projection}",
         layer_index=7,
@@ -70,6 +108,7 @@ def _record(projection: str, scale: float = 1.0, provenance=None) -> dict:
         device_names=["cuda:0"],
         quantizer_metrics=_metrics(scale),
         provenance=provenance or {"source_revision": "abc", "hessian_sha256": "def"},
+        route_evidence=route_evidence,
     )
 
 
@@ -136,6 +175,34 @@ def test_family_join_aggregates_raw_terms_only_for_exact_provenance():
     assert len(families) == 1
     assert families[0]["provenance"]["family_join"] == common
     assert set(families[0]["provenance"]["projections"]) == {"w1", "w2", "w3"}
+
+
+def test_natural_route_evidence_is_required_and_shared_by_one_expert_family():
+    provenance = {
+        "family_join": {
+            "source_revision": "abc",
+            "route_evidence_contract": ROUTE_EVIDENCE_SCHEMA,
+        }
+    }
+    with pytest.raises(ValueError, match="natural-route evidence is required"):
+        _record("gate_proj", provenance=provenance)
+
+    evidence = _route_evidence()
+    records = [
+        _record(projection, provenance=provenance, route_evidence=evidence)
+        for projection in ("gate_proj", "down_proj", "up_proj")
+    ]
+    family = derive_family_records(records)[0]
+    assert family["route_evidence"] == evidence
+    assert family["route_evidence"]["expert_gate_squared_mass"] == 20.0
+
+    records[-1] = _record(
+        "up_proj",
+        provenance=provenance,
+        route_evidence=_route_evidence(scale=2.0),
+    )
+    with pytest.raises(ValueError, match="inconsistent route evidence"):
+        derive_family_records(records)
 
 
 def test_ledger_is_canonical_content_bound_and_contains_family_record(tmp_path):
