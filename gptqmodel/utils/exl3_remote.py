@@ -40,6 +40,7 @@ REMOTE_RESULT_SCHEMA = "ds4rt.exl3-remote-result"
 ENVELOPE_MAGIC = b"DS4EXL3\x00"
 MAX_HEADER_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024 * 1024
+REMOTE_CHECKPOINT_RETENTION = 2
 
 
 def _sha256(payload: bytes) -> str:
@@ -234,6 +235,10 @@ def execute_remote_projection(
     if existing is not None:
         out_tensors, result = existing
         validate_remote_output_tensors(request, out_tensors)
+        checkpoint_store.prune(
+            max_entries=REMOTE_CHECKPOINT_RETENTION,
+            preserve_request_sha256=(request["request_sha256"],),
+        )
         return out_tensors, result, True
 
     target = torch.device(device)
@@ -292,6 +297,10 @@ def execute_remote_projection(
     loaded = checkpoint_store.load(request)
     if loaded is None:
         raise RuntimeError("EXL3 remote worker result did not commit")
+    checkpoint_store.prune(
+        max_entries=REMOTE_CHECKPOINT_RETENTION,
+        preserve_request_sha256=(request["request_sha256"],),
+    )
     return loaded[0], loaded[1], False
 
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import os
 
 import pytest
 import torch
@@ -120,6 +121,57 @@ def test_projection_checkpoint_contract_is_explicit_in_run_provenance(tmp_path) 
     provenance["run"]["projection_checkpoint"]["contract"] = "wrong"
     with pytest.raises(ValueError, match="run contract"):
         checkpoint_root_from_provenance(provenance)
+
+
+def test_projection_checkpoint_prune_bounds_remote_scratch_and_preserves_retry(
+    tmp_path,
+) -> None:
+    store = EXL3ProjectionCheckpointStore(tmp_path / "checkpoints")
+    requests = [_request(scale=float(index + 1)) for index in range(3)]
+    for index, request in enumerate(requests):
+        store.commit(request, _tensors(), {**_result(), "sequence": index})
+        manifest_path, tensor_path = store._paths(request["request_sha256"])
+        timestamp = 1_000_000_000 + index
+        os.utime(manifest_path, ns=(timestamp, timestamp))
+        os.utime(tensor_path, ns=(timestamp, timestamp))
+
+    summary = store.prune(
+        max_entries=2,
+        preserve_request_sha256=(requests[0]["request_sha256"],),
+    )
+    assert summary["retained_entries"] == 2
+    assert summary["removed_entries"] == 1
+    assert summary["removed_bytes"] > 0
+    assert summary["removed_orphans"] == 0
+    assert store.load(requests[0]) is not None
+    assert store.load(requests[1]) is None
+    assert store.load(requests[2]) is not None
+    assert len(list(store.root.rglob("*.json"))) == 2
+    assert len(list(store.root.rglob("*.safetensors"))) == 2
+
+
+def test_projection_checkpoint_prune_removes_only_validated_tensor_orphans(
+    tmp_path,
+) -> None:
+    store = EXL3ProjectionCheckpointStore(tmp_path / "checkpoints")
+    request = _request()
+    _manifest_path, tensor_path = store._paths(request["request_sha256"])
+    tensor_path.parent.mkdir(parents=True)
+    tensor_path.write_bytes(b"interrupted-commit")
+    summary = store.prune(max_entries=2)
+    assert summary == {
+        "retained_entries": 0,
+        "removed_entries": 0,
+        "removed_bytes": len(b"interrupted-commit"),
+        "removed_orphans": 1,
+    }
+    assert not tensor_path.exists()
+
+    unexpected = store.root / "not-a-checkpoint"
+    unexpected.write_text("do not delete", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsafe entry"):
+        store.prune(max_entries=2)
+    assert unexpected.read_text(encoding="utf-8") == "do not delete"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="EXL3 requires CUDA")

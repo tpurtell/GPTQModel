@@ -12,7 +12,7 @@ import os
 import tempfile
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import torch
 from safetensors.torch import load as load_safetensors
@@ -280,6 +280,160 @@ class EXL3ProjectionCheckpointStore:
         if loaded is None or loaded[1] != clean_result:
             raise RuntimeError("EXL3 projection checkpoint did not commit durably")
         return clean_result
+
+    def prune(
+        self,
+        *,
+        max_entries: int,
+        preserve_request_sha256: Iterable[str] = (),
+    ) -> dict[str, int]:
+        """Bound packed-result scratch without touching live request payloads.
+
+        Remote workers serialize projection execution, so retaining the current
+        request plus the newest preceding request preserves the coordinator's
+        commit/retry handoff while preventing a full model run from accumulating
+        one checkpoint per projection. Coordinator stores never call this method.
+        """
+
+        if (
+            isinstance(max_entries, bool)
+            or not isinstance(max_entries, int)
+            or max_entries <= 0
+        ):
+            raise ValueError("EXL3 checkpoint retention must be positive")
+        preserve = {str(value) for value in preserve_request_sha256}
+        for request_sha256 in preserve:
+            self._paths(request_sha256)
+        if len(preserve) > max_entries:
+            raise ValueError(
+                "EXL3 checkpoint retention cannot preserve too many entries"
+            )
+        if not self.root.exists():
+            if preserve:
+                raise ValueError("preserved EXL3 checkpoint does not exist")
+            return {
+                "retained_entries": 0,
+                "removed_entries": 0,
+                "removed_bytes": 0,
+                "removed_orphans": 0,
+            }
+        if not self.root.is_dir() or self.root.is_symlink():
+            raise ValueError("EXL3 checkpoint root is not a regular directory")
+
+        entries: list[tuple[int, str, Path, Path]] = []
+        orphan_tensors: list[Path] = []
+        seen_manifests: set[str] = set()
+        seen_tensors: set[str] = set()
+        hex_chars = frozenset("0123456789abcdef")
+        for first in self.root.iterdir():
+            if (
+                not first.is_dir()
+                or first.is_symlink()
+                or len(first.name) != 2
+                or any(char not in hex_chars for char in first.name)
+            ):
+                raise ValueError("EXL3 checkpoint root contains an unsafe entry")
+            for second in first.iterdir():
+                if (
+                    not second.is_dir()
+                    or second.is_symlink()
+                    or len(second.name) != 2
+                    or any(char not in hex_chars for char in second.name)
+                ):
+                    raise ValueError("EXL3 checkpoint root contains an unsafe prefix")
+                for path in second.iterdir():
+                    if not path.is_file() or path.is_symlink():
+                        raise ValueError("EXL3 checkpoint contains a non-regular file")
+                    if path.suffix not in {".json", ".safetensors"}:
+                        raise ValueError("EXL3 checkpoint contains an unexpected file")
+                    request_sha256 = path.name.removesuffix(path.suffix)
+                    self._paths(request_sha256)
+                    if (
+                        request_sha256[:2] != first.name
+                        or request_sha256[2:4] != second.name
+                    ):
+                        raise ValueError(
+                            "EXL3 checkpoint file is under the wrong prefix"
+                        )
+                    target = (
+                        seen_manifests if path.suffix == ".json" else seen_tensors
+                    )
+                    if request_sha256 in target:
+                        raise ValueError("EXL3 checkpoint contains a duplicate file")
+                    target.add(request_sha256)
+
+        for request_sha256 in sorted(seen_manifests):
+            manifest_path, tensor_path = self._paths(request_sha256)
+            if request_sha256 not in seen_tensors:
+                raise ValueError("EXL3 checkpoint manifest has no tensor payload")
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "cannot inspect EXL3 checkpoint retention entry"
+                ) from error
+            request = manifest.get("request") if isinstance(manifest, dict) else None
+            if not isinstance(request, dict) or self.load(request) is None:
+                raise ValueError("EXL3 checkpoint retention entry is invalid")
+            entries.append(
+                (
+                    manifest_path.stat().st_mtime_ns,
+                    request_sha256,
+                    manifest_path,
+                    tensor_path,
+                )
+            )
+        for request_sha256 in sorted(seen_tensors - seen_manifests):
+            orphan_tensors.append(self._paths(request_sha256)[1])
+
+        available = {entry[1] for entry in entries}
+        missing_preserved = preserve - available
+        if missing_preserved:
+            raise ValueError("preserved EXL3 checkpoint is not committed")
+        keep = set(preserve)
+        for _mtime_ns, request_sha256, _manifest_path, _tensor_path in sorted(
+            entries, reverse=True
+        ):
+            if len(keep) >= max_entries:
+                break
+            keep.add(request_sha256)
+
+        removed_entries = 0
+        removed_bytes = 0
+        touched_directories: set[Path] = set()
+        for _mtime_ns, request_sha256, manifest_path, tensor_path in entries:
+            if request_sha256 in keep:
+                continue
+            removed_bytes += manifest_path.stat().st_size + tensor_path.stat().st_size
+            # Removing the manifest first makes an interrupted prune look like
+            # an uncommitted tensor orphan, never a committed corrupt result.
+            manifest_path.unlink()
+            _fsync_directory(manifest_path.parent)
+            tensor_path.unlink()
+            touched_directories.add(manifest_path.parent)
+            removed_entries += 1
+        for tensor_path in orphan_tensors:
+            removed_bytes += tensor_path.stat().st_size
+            tensor_path.unlink()
+            touched_directories.add(tensor_path.parent)
+        for directory in sorted(
+            touched_directories,
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            _fsync_directory(directory)
+            if not any(directory.iterdir()):
+                directory.rmdir()
+                parent = directory.parent
+                if parent != self.root and not any(parent.iterdir()):
+                    parent.rmdir()
+        _fsync_directory(self.root)
+        return {
+            "retained_entries": len(keep),
+            "removed_entries": removed_entries,
+            "removed_bytes": removed_bytes,
+            "removed_orphans": len(orphan_tensors),
+        }
 
 
 __all__ = [
