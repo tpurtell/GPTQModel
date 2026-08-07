@@ -62,7 +62,11 @@ from ..utils.exl3_projection_checkpoint import (
     build_projection_request,
     checkpoint_root_from_provenance,
 )
-from ..utils.exl3_remote import remote_client_from_provenance
+from ..utils.exl3_remote import (
+    CoordinatorSlot,
+    RemoteEndpoint,
+    remote_client_from_provenance,
+)
 from ..utils.exllamav3 import create_exllamav3_module
 from ..utils.logger import setup_logger
 from ..utils.module_locks import parent_module_lock
@@ -361,7 +365,7 @@ class EXL3Processor(LoopProcessor):
         ] = {}
         self._remote_client_initialized = False
         self._remote_client = None
-        self._distributed_local_quant_lock = threading.Lock()
+        self._distributed_local_quant_locks: dict[str, threading.Lock] = {}
         self.error_journal_path = os.getenv(JOURNAL_ENV) or str(
             Path(self.log_tmp_log_file_name).with_suffix(".exl3-error-ledger.jsonl")
         )
@@ -395,6 +399,17 @@ class EXL3Processor(LoopProcessor):
                 self._remote_client = remote_client_from_provenance(provenance)
                 self._remote_client_initialized = True
             return getattr(self, "_remote_client", None)
+
+    def _distributed_local_quant_lock(self, device: torch.device) -> threading.Lock:
+        """Serialize trellis search independently on each coordinator GPU."""
+
+        device_key = str(device)
+        with self._stats_lock:
+            locks = getattr(self, "_distributed_local_quant_locks", None)
+            if locks is None:
+                locks = {}
+                self._distributed_local_quant_locks = locks
+            return locks.setdefault(device_key, threading.Lock())
 
     @staticmethod
     def _expert_assignment_key(module: NamedModule) -> str:
@@ -537,6 +552,20 @@ class EXL3Processor(LoopProcessor):
             "capture": task,
             "qcfg": module_qcfg,
         }
+        remote_client = self._remote_client_for_run(self._ledger_provenance())
+        if remote_client is not None:
+            if routed_expert_identity(module.full_name) is None:
+                raise ValueError(
+                    "EXL3 distributed dispatch only accepts routed-expert projections"
+                )
+            execution_slot = remote_client.assigned_slot(
+                self._expert_assignment_key(module)
+            )
+            self.tasks[module.name]["execution_slot"] = execution_slot
+            if isinstance(execution_slot, CoordinatorSlot):
+                coordinator_device = torch.device(execution_slot.device)
+                module.state["distributed_quant_device"] = coordinator_device
+                module.state["preferred_quant_device"] = coordinator_device
 
     def is_skipped(self, module: NamedModule) -> bool:
         """Reports whether preprocessing omitted this module from EXL3 work."""
@@ -638,7 +667,16 @@ class EXL3Processor(LoopProcessor):
         capture: GPTQ = task_entry["capture"]
         module_qcfg: EXL3Config = task_entry["qcfg"]
 
+        ledger_provenance = self._ledger_provenance()
+        remote_client = self._remote_client_for_run(ledger_provenance)
+        execution_slot = task_entry.get("execution_slot")
+        if remote_client is not None and execution_slot is None:
+            execution_slot = remote_client.assigned_slot(
+                self._expert_assignment_key(module)
+            )
         target_device = device or get_device(module.module)
+        if isinstance(execution_slot, CoordinatorSlot):
+            target_device = execution_slot.device
         target_device = torch.device(target_device)
         if target_device.type != "cuda":
             raise ValueError("EXL3 quantization requires CUDA/HIP execution.")
@@ -660,8 +698,6 @@ class EXL3Processor(LoopProcessor):
             "finalized": False,
         }
 
-        ledger_provenance = self._ledger_provenance()
-        remote_client = self._remote_client_for_run(ledger_provenance)
         remote_endpoint = None
         execution_contract = None
         projection_provenance = ledger_provenance
@@ -670,10 +706,12 @@ class EXL3Processor(LoopProcessor):
                 raise ValueError(
                     "EXL3 remote dispatch only accepts routed-expert projections"
                 )
-            remote_endpoint = remote_client.assigned_endpoint(
-                self._expert_assignment_key(module)
+            if not isinstance(execution_slot, (CoordinatorSlot, RemoteEndpoint)):
+                raise ValueError("EXL3 distributed execution slot is invalid")
+            remote_endpoint = (
+                execution_slot if isinstance(execution_slot, RemoteEndpoint) else None
             )
-            execution_contract = remote_client.execution_contract(remote_endpoint)
+            execution_contract = remote_client.execution_contract(execution_slot)
             projection_provenance = copy.deepcopy(ledger_provenance)
             projection_provenance["execution"] = copy.deepcopy(execution_contract)
         quant_args = self._build_quant_args(module, module_qcfg, target_device)
@@ -757,7 +795,7 @@ class EXL3Processor(LoopProcessor):
             else:
                 wait_started = time.perf_counter()
                 quant_lock = (
-                    self._distributed_local_quant_lock
+                    self._distributed_local_quant_lock(target_device)
                     if remote_client is not None
                     else nullcontext()
                 )

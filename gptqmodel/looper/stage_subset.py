@@ -531,6 +531,18 @@ def build_subset_plan(
 
             for module_name, named_module in subset.items():
                 preferred_device = forward_device_map.get(module_name)
+                distributed_device = normalize_device_like(
+                    named_module.state.get("distributed_quant_device")
+                )
+                if distributed_device is not None:
+                    if distributed_device not in moe_devices:
+                        raise ValueError(
+                            "Distributed expert quantization assigned "
+                            f"{module_name} to {distributed_device}, outside the "
+                            f"configured MoE device pool {moe_devices}."
+                        )
+                    preferred_device = distributed_device
+                    forward_device_map[module_name] = distributed_device
                 if preferred_device is not None:
                     named_module.state["preferred_quant_device"] = preferred_device
 

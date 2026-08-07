@@ -11,6 +11,7 @@ from gptqmodel.utils.exl3_projection_checkpoint import (
     build_projection_request,
 )
 from gptqmodel.utils.exl3_remote import (
+    CoordinatorSlot,
     REMOTE_CONTRACT,
     REMOTE_RESULT_SCHEMA,
     REMOTE_SCHEDULER,
@@ -30,6 +31,16 @@ def _endpoint(name: str) -> RemoteEndpoint:
         url=f"http://{name}:17841",
         preflight_sha256=(name.encode().hex() + "0" * 64)[:64],
         image_digest="sha256:" + (name.encode().hex() + "1" * 64)[:64],
+    )
+
+
+def _coordinator(device: str) -> CoordinatorSlot:
+    index = device.split(":", 1)[1]
+    return CoordinatorSlot(
+        device=device,
+        gpu_uuid=f"GPU-coordinator-{index}",
+        preflight_sha256="a" * 64,
+        image_digest="sha256:" + "b" * 64,
     )
 
 
@@ -96,32 +107,40 @@ def test_scheduler_is_order_independent_and_binds_worker_identity() -> None:
     forward = EXL3RemoteClient(
         endpoints=endpoints,
         token=b"secret",
-        coordinator_slot=True,
+        coordinator_slots=[_coordinator("cuda:0"), _coordinator("cuda:1")],
         timeout_seconds=1,
     )
     reverse = EXL3RemoteClient(
         endpoints=list(reversed(endpoints)),
         token=b"secret",
-        coordinator_slot=True,
+        coordinator_slots=[_coordinator("cuda:1"), _coordinator("cuda:0")],
         timeout_seconds=1,
     )
     keys = [f"base:17:{expert}" for expert in range(128)]
-    assert [forward.assigned_endpoint(key) for key in keys] == [
-        reverse.assigned_endpoint(key) for key in keys
+    assert [forward.assigned_slot(key) for key in keys] == [
+        reverse.assigned_slot(key) for key in keys
     ]
-    assert {forward.assigned_endpoint(key) for key in keys} == {
-        None,
+    assert {forward.assigned_slot(key) for key in keys} == {
+        _coordinator("cuda:0"),
+        _coordinator("cuda:1"),
         *endpoints,
     }
-    endpoint = forward.assigned_endpoint("base:17:31")
-    if endpoint is None:
-        endpoint = endpoints[0]
+    endpoint = endpoints[0]
     assert forward.execution_contract(endpoint) == {
         "kind": "remote_worker",
         "remote_contract": REMOTE_CONTRACT,
         "name": endpoint.name,
         "preflight_sha256": endpoint.preflight_sha256,
         "image_digest": endpoint.image_digest,
+    }
+    local = _coordinator("cuda:1")
+    assert forward.execution_contract(local) == {
+        "kind": "coordinator",
+        "remote_contract": REMOTE_CONTRACT,
+        "device": "cuda:1",
+        "gpu_uuid": "GPU-coordinator-1",
+        "preflight_sha256": "a" * 64,
+        "image_digest": "sha256:" + "b" * 64,
     }
 
 
@@ -133,7 +152,14 @@ def test_provenance_requires_token_and_preserves_retry_contract(monkeypatch) -> 
                 "contract": REMOTE_CONTRACT,
                 "scheduler": REMOTE_SCHEDULER,
                 "token_env": "TEST_EXL3_TOKEN",
-                "coordinator_slot": True,
+                "coordinator_slots": [
+                    {
+                        "device": "cuda:0",
+                        "gpu_uuid": "GPU-coordinator-0",
+                        "preflight_sha256": "a" * 64,
+                        "image_digest": "sha256:" + "b" * 64,
+                    }
+                ],
                 "timeout_seconds": 42,
                 "max_attempts": 3,
                 "orchestration_workers": 2,
@@ -172,7 +198,7 @@ def test_retry_stays_on_the_assigned_worker_and_retains_history(monkeypatch) -> 
     client = EXL3RemoteClient(
         endpoints=[endpoint],
         token=b"secret",
-        coordinator_slot=False,
+        coordinator_slots=[],
         timeout_seconds=1,
         max_attempts=2,
     )

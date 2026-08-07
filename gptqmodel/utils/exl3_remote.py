@@ -10,6 +10,7 @@ import hmac
 import json
 import math
 import os
+import re
 import struct
 import threading
 import time
@@ -34,7 +35,7 @@ from .exl3_projection_checkpoint import (
 )
 
 REMOTE_CONTRACT = "ds4rt.exl3-remote-worker-v1"
-REMOTE_SCHEDULER = "sha256-family-modulo-sorted-slots-v1"
+REMOTE_SCHEDULER = "sha256-family-modulo-explicit-slots-v2"
 REMOTE_REQUEST_SCHEMA = "ds4rt.exl3-remote-request"
 REMOTE_RESULT_SCHEMA = "ds4rt.exl3-remote-result"
 ENVELOPE_MAGIC = b"DS4EXL3\x00"
@@ -312,6 +313,19 @@ class RemoteEndpoint:
     image_digest: str
 
 
+@dataclass(frozen=True)
+class CoordinatorSlot:
+    """One explicitly qualified coordinator GPU execution slot."""
+
+    device: str
+    gpu_uuid: str
+    preflight_sha256: str
+    image_digest: str
+
+
+ExecutionSlot = CoordinatorSlot | RemoteEndpoint
+
+
 class EXL3RemoteClient:
     """Deterministically assign whole expert families to qualified workers."""
 
@@ -320,7 +334,7 @@ class EXL3RemoteClient:
         *,
         endpoints: list[RemoteEndpoint],
         token: bytes,
-        coordinator_slot: bool,
+        coordinator_slots: list[CoordinatorSlot],
         timeout_seconds: float,
         max_attempts: int = 2,
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
@@ -342,9 +356,24 @@ class EXL3RemoteClient:
         names = [endpoint.name for endpoint in endpoints]
         if len(set(names)) != len(names):
             raise ValueError("EXL3 remote client has duplicate endpoint names")
+        devices = [slot.device for slot in coordinator_slots]
+        if (
+            len(set(devices)) != len(devices)
+            or any(
+                not isinstance(device, str)
+                or re.fullmatch(r"cuda:\d+", device) is None
+                for device in devices
+            )
+        ):
+            raise ValueError("EXL3 remote client has invalid coordinator slots")
         self.endpoints = tuple(sorted(endpoints, key=lambda endpoint: endpoint.name))
+        self.coordinator_slots = tuple(
+            sorted(
+                coordinator_slots,
+                key=lambda slot: int(slot.device.split(":", 1)[1]),
+            )
+        )
         self.token = token
-        self.coordinator_slot = bool(coordinator_slot)
         self.timeout_seconds = float(timeout_seconds)
         self.max_attempts = max_attempts
         self.max_body_bytes = int(max_body_bytes)
@@ -354,22 +383,27 @@ class EXL3RemoteClient:
             endpoint.name: threading.Lock() for endpoint in self.endpoints
         }
 
-    def assigned_endpoint(self, assignment_key: str) -> RemoteEndpoint | None:
-        slots: list[RemoteEndpoint | None] = list(self.endpoints)
-        if self.coordinator_slot:
-            slots.insert(0, None)
+    def assigned_slot(self, assignment_key: str) -> ExecutionSlot:
+        slots: list[ExecutionSlot] = [*self.coordinator_slots, *self.endpoints]
+        if not slots:
+            raise ValueError("EXL3 remote client has no execution slots")
         index = int(hashlib.sha256(assignment_key.encode()).hexdigest()[:16], 16) % len(slots)
         return slots[index]
 
     @staticmethod
-    def execution_contract(endpoint: RemoteEndpoint | None) -> dict[str, Any]:
+    def execution_contract(slot: ExecutionSlot) -> dict[str, Any]:
         """Return the immutable slot identity bound into a projection request."""
 
-        if endpoint is None:
+        if isinstance(slot, CoordinatorSlot):
             return {
                 "kind": "coordinator",
                 "remote_contract": REMOTE_CONTRACT,
+                "device": slot.device,
+                "gpu_uuid": slot.gpu_uuid,
+                "preflight_sha256": slot.preflight_sha256,
+                "image_digest": slot.image_digest,
             }
+        endpoint = slot
         return {
             "kind": "remote_worker",
             "remote_contract": REMOTE_CONTRACT,
@@ -524,6 +558,7 @@ def remote_client_from_provenance(
         or remote.get("scheduler") != REMOTE_SCHEDULER
         or not isinstance(remote.get("endpoints"), list)
         or not remote["endpoints"]
+        or not isinstance(remote.get("coordinator_slots"), list)
         or not isinstance(remote.get("token_env"), str)
         or not remote["token_env"]
         or isinstance(remote.get("timeout_seconds", 7200), bool)
@@ -564,15 +599,41 @@ def remote_client_from_provenance(
                 image_digest=value["image_digest"],
             )
         )
-    expected_orchestration_workers = len(endpoints) + int(
-        remote.get("coordinator_slot") is True
-    )
+    coordinator_slots = []
+    devices = set()
+    gpu_uuids = set()
+    for value in remote["coordinator_slots"]:
+        if (
+            not isinstance(value, dict)
+            or not isinstance(value.get("device"), str)
+            or re.fullmatch(r"cuda:\d+", value["device"]) is None
+            or value["device"] in devices
+            or not isinstance(value.get("gpu_uuid"), str)
+            or not value["gpu_uuid"]
+            or value["gpu_uuid"] in gpu_uuids
+            or not isinstance(value.get("preflight_sha256"), str)
+            or len(value["preflight_sha256"]) != 64
+            or not isinstance(value.get("image_digest"), str)
+            or not value["image_digest"].startswith("sha256:")
+        ):
+            raise ValueError("invalid EXL3 coordinator-slot contract")
+        devices.add(value["device"])
+        gpu_uuids.add(value["gpu_uuid"])
+        coordinator_slots.append(
+            CoordinatorSlot(
+                device=value["device"],
+                gpu_uuid=value["gpu_uuid"],
+                preflight_sha256=value["preflight_sha256"],
+                image_digest=value["image_digest"],
+            )
+        )
+    expected_orchestration_workers = len(endpoints) + len(coordinator_slots)
     if remote.get("orchestration_workers") != expected_orchestration_workers:
         raise ValueError("invalid EXL3 remote-worker orchestration width")
     return EXL3RemoteClient(
         endpoints=endpoints,
         token=token_value.encode(),
-        coordinator_slot=remote.get("coordinator_slot") is True,
+        coordinator_slots=coordinator_slots,
         timeout_seconds=float(remote.get("timeout_seconds", 7200)),
         max_attempts=int(remote.get("max_attempts", 2)),
     )
@@ -585,6 +646,8 @@ __all__ = [
     "REMOTE_RESULT_SCHEMA",
     "REMOTE_SCHEDULER",
     "EXL3RemoteClient",
+    "CoordinatorSlot",
+    "ExecutionSlot",
     "RemoteEndpoint",
     "decode_tensor_envelope",
     "encode_tensor_envelope",
