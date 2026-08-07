@@ -299,6 +299,26 @@ def test_deepseek_v4_mtp_quantization_adapter_replays_one_exact_block() -> None:
     assert not any(name.startswith("self_attn.") for name in modules)
     assert not any(name.startswith("mlp.shared_experts.") for name in modules)
 
+    target.model = SimpleNamespace(config=config)
+    target.quant_log = []
+    adapter.quantized = True
+    adapter.quant_log = [
+        {
+            "exl3_error_ledger_record": {
+                "block_namespace": "mtp",
+                "module": (
+                    f"mtp.{block}.mlp.experts.{expert}.{projection}"
+                ),
+            }
+        }
+        for block in range(3)
+        for expert in range(config.n_routed_experts)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+    target.attach_mtp_quantization_model(adapter)
+    assert target._mtp_quantization_model_for_save is adapter
+    assert len(target.quant_log) == 27
+
     batch = DeepSeekV4MTPReplayBatch(
         target_taps=None,
         projected_main=torch.randn(2, 4, config.hidden_size, dtype=torch.bfloat16),

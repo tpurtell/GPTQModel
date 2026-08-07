@@ -1700,11 +1700,17 @@ def _resolve_offload_entry(
     )
 
 
-def _collect_state_dict_with_offload(model: nn.Module, offload_root: str) -> Dict[str, TensorSource]:
+def _collect_state_dict_with_offload(
+    model: nn.Module,
+    offload_root: str,
+    include_prefixes: Optional[Tuple[str, ...]] = None,
+) -> Dict[str, TensorSource]:
     state_dict: Dict[str, TensorSource] = collections.OrderedDict()
     index_cache: Dict[str, Optional[Dict]] = {}
 
     for name, param in model.named_parameters():
+        if include_prefixes is not None and not name.startswith(include_prefixes):
+            continue
         module_path, leaf = _split_parameter_path(name)
         source = None
         if getattr(param, "is_meta", False) or param.device.type == "meta":
@@ -1733,6 +1739,8 @@ def _collect_state_dict_with_offload(model: nn.Module, offload_root: str) -> Dic
             if buffer_name in non_persistent:
                 continue
             name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+            if include_prefixes is not None and not name.startswith(include_prefixes):
+                continue
             if name in state_dict:
                 continue
             module_path, leaf = _split_parameter_path(name)
@@ -1756,7 +1764,11 @@ def _collect_state_dict_with_offload(model: nn.Module, offload_root: str) -> Dic
     return state_dict
 
 
-def get_state_dict_for_save(model: nn.Module, offload_root: Optional[str] = None) -> Dict[str, TensorSource]:
+def get_state_dict_for_save(
+    model: nn.Module,
+    offload_root: Optional[str] = None,
+    include_prefixes: Optional[Tuple[str, ...]] = None,
+) -> Dict[str, TensorSource]:
     """
     Filter weight-sharing tensors.
     Referenced from transformers.modeling_utils.PreTrainedModel.save_pretrained.
@@ -1764,10 +1776,16 @@ def get_state_dict_for_save(model: nn.Module, offload_root: Optional[str] = None
     See https://github.com/huggingface/transformers/blob/v4.38.2/src/transformers/modeling_utils.py#L2369
     """
     if offload_root:
-        state_dict = _collect_state_dict_with_offload(model, offload_root)
+        state_dict = _collect_state_dict_with_offload(
+            model,
+            offload_root,
+            include_prefixes=include_prefixes,
+        )
     else:
         state_dict = collections.OrderedDict()
         for name, param in model.named_parameters():
+            if include_prefixes is not None and not name.startswith(include_prefixes):
+                continue
             state_dict[name] = TensorSource(name=name, torch_dtype=param.dtype, shape=tuple(param.shape), source=param)
         # Collect persistent buffers in a single module-tree walk, skipping
         # non-persistent buffers inline via `_non_persistent_buffers_set`.
@@ -1777,6 +1795,8 @@ def get_state_dict_for_save(model: nn.Module, offload_root: Optional[str] = None
                 if buffer_name in non_persistent:
                     continue
                 name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+                if include_prefixes is not None and not name.startswith(include_prefixes):
+                    continue
                 if name in state_dict:
                     continue
                 state_dict[name] = TensorSource(name=name, torch_dtype=buf.dtype, shape=tuple(buf.shape), source=buf)

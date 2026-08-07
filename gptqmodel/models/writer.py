@@ -314,6 +314,99 @@ def _merge_prefix_tensors_into_state_dict(
         log.warn(f"Model: No tensors matched prefixes {normalized_prefixes} while merging into the state dict")
 
 
+def _apply_save_state_overlay(owner, state_dict: Dict[str, TensorSource]) -> None:
+    """Replace complete tensor prefixes from an attached quantization model."""
+
+    provider = getattr(owner, "save_state_overlay", None)
+    if not callable(provider):
+        return
+    contract = provider()
+    if contract is None:
+        return
+    if not isinstance(contract, dict):
+        raise TypeError("save-state overlay contract must be a dictionary")
+    overlay_model = contract.get("model")
+    prefixes = contract.get("replace_prefixes")
+    if not isinstance(overlay_model, torch.nn.Module):
+        raise TypeError("save-state overlay has no torch module")
+    if (
+        not isinstance(prefixes, (list, tuple))
+        or not prefixes
+        or any(not isinstance(prefix, str) or not prefix for prefix in prefixes)
+        or len(set(prefixes)) != len(prefixes)
+    ):
+        raise ValueError("save-state overlay prefixes must be unique non-empty strings")
+    normalized = tuple(
+        prefix if prefix.endswith(".") else f"{prefix}." for prefix in prefixes
+    )
+    overlay = get_state_dict_for_save(
+        overlay_model,
+        offload_root=contract.get("offload_root"),
+        include_prefixes=normalized,
+    )
+    selected = {
+        name: source
+        for name, source in overlay.items()
+        if any(name.startswith(prefix) for prefix in normalized)
+    }
+    missing = [
+        prefix
+        for prefix in normalized
+        if not any(name.startswith(prefix) for name in selected)
+    ]
+    if missing:
+        raise ValueError(
+            "save-state overlay has no replacement tensors for " + ", ".join(missing)
+        )
+    expected_suffixes = contract.get("expected_suffixes")
+    if expected_suffixes is not None:
+        if (
+            not isinstance(expected_suffixes, (list, tuple))
+            or not expected_suffixes
+            or any(
+                not isinstance(suffix, str) or not suffix
+                for suffix in expected_suffixes
+            )
+            or len(set(expected_suffixes)) != len(expected_suffixes)
+        ):
+            raise ValueError(
+                "save-state overlay expected suffixes must be unique non-empty strings"
+            )
+        expected_suffixes = set(expected_suffixes)
+        for prefix in normalized:
+            actual_suffixes = {
+                name[len(prefix) :]
+                for name in selected
+                if name.startswith(prefix)
+            }
+            if actual_suffixes != expected_suffixes:
+                raise ValueError(
+                    f"save-state overlay tensor contract differs for {prefix}: "
+                    f"actual={sorted(actual_suffixes)} "
+                    f"expected={sorted(expected_suffixes)}"
+                )
+    stale = [
+        name
+        for name in state_dict
+        if any(name.startswith(prefix) for prefix in normalized)
+    ]
+    for name in stale:
+        del state_dict[name]
+    collisions = set(selected).intersection(state_dict)
+    if collisions:
+        raise ValueError(
+            "save-state overlay collides outside replacement prefixes: "
+            + ", ".join(sorted(collisions))
+        )
+    state_dict.update(selected)
+    log.info(
+        "Model: Replaced %s tensor prefixes (%s source tensors -> %s overlay tensors)",
+        len(normalized),
+        len(stale),
+        len(selected),
+    )
+
+
 def _normalize_out_of_model_tensors_entries(
     entries: Optional[List[Union[str, Dict[str, Any]]]]
 ) -> tuple[List[str], List[str]]:
@@ -782,6 +875,7 @@ def ModelWriter(cls):
         )
         if prefix_entries:
             _merge_prefix_tensors_into_state_dict(prefix_entries, self.model_local_path, state_dict)
+        _apply_save_state_overlay(self, state_dict)
 
         model_base_name = "model"
         model_save_name = model_base_name + ".safetensors"

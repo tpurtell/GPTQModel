@@ -1272,6 +1272,90 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         },
     ]
 
+    def attach_mtp_quantization_model(
+        self,
+        adapter: "DeepSeekV4MTPQuantizationModel",
+    ) -> None:
+        """Attach the completed disjoint MTP adapter for one atomic target save."""
+
+        if not isinstance(adapter, DeepSeekV4MTPQuantizationModel):
+            raise TypeError("MTP save attachment requires DeepSeekV4MTPQuantizationModel")
+        if getattr(self, "_mtp_quantization_model_for_save", None) is not None:
+            raise RuntimeError("an MTP quantization adapter is already attached")
+        if not adapter.quantized:
+            raise RuntimeError("MTP quantization adapter is not complete")
+        if adapter.model_local_path != self.model_local_path:
+            raise RuntimeError("MTP adapter and target model use different source snapshots")
+        expected = deepseek_v4_mtp_target_layer_ids(self.model.config)
+        if len(adapter.model.mtp) != len(expected):
+            raise RuntimeError("MTP adapter block geometry differs from the target model")
+        expected_projection_count = (
+            MTP_BLOCK_COUNT * int(self.model.config.n_routed_experts) * 3
+        )
+        mtp_log = list(adapter.quant_log)
+        mtp_records = [
+            entry.get("exl3_error_ledger_record")
+            for entry in mtp_log
+            if isinstance(entry.get("exl3_error_ledger_record"), dict)
+        ]
+        if len(mtp_records) != expected_projection_count or any(
+            record.get("block_namespace") != "mtp" for record in mtp_records
+        ):
+            raise RuntimeError(
+                "MTP EXL3 error-ledger coverage mismatch: "
+                f"actual={len(mtp_records)} expected={expected_projection_count}"
+            )
+        existing_modules = {
+            entry.get("exl3_error_ledger_record", {}).get("module")
+            for entry in self.quant_log
+            if isinstance(entry.get("exl3_error_ledger_record"), dict)
+        }
+        mtp_modules = {record.get("module") for record in mtp_records}
+        if None in mtp_modules or len(mtp_modules) != expected_projection_count:
+            raise RuntimeError("MTP EXL3 error ledger has missing or duplicate modules")
+        collisions = existing_modules.intersection(mtp_modules)
+        if collisions:
+            raise RuntimeError(
+                "MTP EXL3 error ledger collides with target records: "
+                + ", ".join(sorted(collisions))
+            )
+        self.quant_log.extend(mtp_log)
+        self._mtp_quantization_model_for_save = adapter
+
+    def save_state_overlay(self) -> dict | None:
+        """Replace native MTP expert leaves with attached EXL3 module tensors."""
+
+        adapter = getattr(self, "_mtp_quantization_model_for_save", None)
+        if adapter is None:
+            return None
+        from ...nn_modules.exllamav3 import ExllamaV3Linear
+
+        prefixes = sorted(
+            name
+            for name, module in adapter.model.named_modules()
+            if isinstance(module, ExllamaV3Linear)
+            and name.startswith("mtp.")
+            and ".mlp.experts." in name
+        )
+        expected_count = (
+            MTP_BLOCK_COUNT * int(self.model.config.n_routed_experts) * 3
+        )
+        if len(prefixes) != expected_count:
+            raise RuntimeError(
+                "MTP EXL3 save overlay coverage mismatch: "
+                f"actual={len(prefixes)} expected={expected_count}"
+            )
+        return {
+            "model": adapter.model,
+            "offload_root": (
+                adapter.quantize_config.offload_to_disk_path
+                if adapter.quantize_config.offload_to_disk
+                else None
+            ),
+            "replace_prefixes": prefixes,
+            "expected_suffixes": ["trellis", "suh", "svh", "mcg"],
+        }
+
     def after_model_load(self, model, load_quantized_model=False):
         precision = patch_deepseek_v4_checkpoint_precision(model)
         expected_layers = int(getattr(model.config, "num_hidden_layers", 0))
