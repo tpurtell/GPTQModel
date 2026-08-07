@@ -711,7 +711,12 @@ def serialize_quant_bits(bits: Union[int, str, GGUFBits]) -> Union[int, str]:
 
 
 def _normalize_exl3_bits(bits: Union[int, float, str]) -> float:
-    """Normalize EXL3 fractional bits-per-weight values."""
+    """Normalize an integer EXL3 Trellis width.
+
+    ExLlamaV3 encodes each matrix with an integer K. A fractional value is an
+    artifact-level average that must be represented by explicit per-module
+    integer overrides; silently flooring it would produce the wrong artifact.
+    """
 
     if isinstance(bits, str):
         bits = float(bits.strip())
@@ -724,6 +729,12 @@ def _normalize_exl3_bits(bits: Union[int, float, str]) -> float:
         raise ValueError("EXL3Config: `bits` must be finite.")
     if bits < 1.0 or bits > 8.0:
         raise ValueError("EXL3Config: `bits` must be between 1.0 and 8.0.")
+    if not bits.is_integer():
+        raise ValueError(
+            "EXL3Config: fractional `bits` is not a matrix encoding; use an "
+            "integer base width plus explicit per-module integer `dynamic` "
+            "overrides for a mixed-bitrate artifact."
+        )
     return float(bits)
 
 

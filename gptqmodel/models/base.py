@@ -1843,6 +1843,18 @@ class BaseQModel(nn.Module):
             return [move_to(args[0], device=batch_device)]
         return []
 
+    def begin_input_capture_example(
+        self,
+        example: Dict[str, Any],
+        batch_device: torch.device,
+    ) -> None:
+        """Expose original model inputs while the first-layer hook executes."""
+
+        del example, batch_device
+
+    def end_input_capture_example(self) -> None:
+        """Release any model-specific original-input capture state."""
+
     def capture_first_layer_input_kwargs(
         self,
         args: tuple[Any, ...],
@@ -1853,6 +1865,45 @@ class BaseQModel(nn.Module):
         """Allow model definitions to persist extra first-layer replay metadata during calibration capture."""
 
         return layer_input_kwargs
+
+    def quantization_layer_output_required(
+        self,
+        *,
+        layer_index: int,
+        layer_name: str,
+        layer_count: int,
+    ) -> bool:
+        """Return whether a model-specific consumer needs this replay output.
+
+        The default layer loop does not replay the final transformer layer
+        because no ordinary successor consumes it. Auxiliary graphs can opt
+        into a bounded callback without pretending to be additional decoder
+        layers.
+        """
+
+        del layer_index, layer_name, layer_count
+        return False
+
+    def receive_quantization_layer_outputs(
+        self,
+        *,
+        layer_index: int,
+        layer_name: str,
+        layer_outputs: List[List[torch.Tensor]],
+        layer_input_kwargs: List[Dict[str, Any]],
+        position_ids: List[torch.Tensor],
+        attention_masks: List[torch.Tensor | None],
+    ) -> None:
+        """Receive an opted-in post-quantization replay boundary."""
+
+        del (
+            layer_index,
+            layer_name,
+            layer_outputs,
+            layer_input_kwargs,
+            position_ids,
+            attention_masks,
+        )
 
     def prepare_layer_replay_kwargs(
         self,

@@ -484,6 +484,19 @@ def run_layer_stage(
             layer_input_kwargs = processor.inputs_cache.layer_input_kwargs
             position_ids = processor.inputs_cache.position_ids
             attention_masks = processor.inputs_cache.attention_masks
+            output_requirement = getattr(
+                looper.gptq_model, "quantization_layer_output_required", None
+            )
+            output_required = (
+                not is_lm_head_module
+                and p_index == len(looper.processors) - 1
+                and callable(output_requirement)
+                and output_requirement(
+                    layer_index=layer_index,
+                    layer_name=layer_name,
+                    layer_count=layer_count,
+                )
+            )
 
             processed_subset: Dict[str, NamedModule] = {}
             last_subset_plan: Optional[SubsetPlan] = None
@@ -620,12 +633,18 @@ def run_layer_stage(
             # current layer. In that case, replay the layer once using the
             # metadata already computed by the final subset plan.
             replay_after_process = (
-                not is_last_module
-                and replay_plan is not None
+                replay_plan is not None
                 and replay_plan.replay_after_process
+                and (not is_last_module or output_required)
             )
 
-            if replay_skipped_layer or replay_after_process:
+            replay_for_output_consumer = (
+                output_required
+                and not replay_after_process
+                and execution_config.require_fwd
+            )
+
+            if replay_skipped_layer or replay_after_process or replay_for_output_consumer:
                 # Pass `replay_plan` through unconditionally: the helper uses
                 # subset metadata when available and falls back to generic
                 # untouched-layer replay when it is `None`.
@@ -646,6 +665,28 @@ def run_layer_stage(
                     log=log,
                     region_timer=region_timer,
                     replay_plan=replay_plan,
+                )
+
+            if output_required:
+                if not layer_outputs:
+                    raise RuntimeError(
+                        "model-specific quantization layer output consumer received "
+                        f"no replay output for layer {layer_index} ({layer_name})"
+                    )
+                output_receiver = getattr(
+                    looper.gptq_model, "receive_quantization_layer_outputs", None
+                )
+                if not callable(output_receiver):
+                    raise RuntimeError(
+                        "model requested quantization layer outputs without a receiver"
+                    )
+                output_receiver(
+                    layer_index=layer_index,
+                    layer_name=layer_name,
+                    layer_outputs=layer_outputs,
+                    layer_input_kwargs=layer_input_kwargs,
+                    position_ids=position_ids,
+                    attention_masks=attention_masks,
                 )
 
             # Finalize module after last processor

@@ -256,6 +256,14 @@ class StageInputsCapture:
                         else cur_layer_device
                     )
                 example = self.gptq_model.move_input_capture_example(example, data_device)
+                begin_example = getattr(
+                    self.gptq_model, "begin_input_capture_example", None
+                )
+                end_example = getattr(
+                    self.gptq_model, "end_input_capture_example", None
+                )
+                if callable(begin_example):
+                    begin_example(example=example, batch_device=data_device)
                 try:
                     with ctx(
                         DEVICE_THREAD_POOL.read_lock(self.gptq_model.quantize_config.device),
@@ -269,6 +277,8 @@ class StageInputsCapture:
                 except StopForward:
                     pass
                 finally:
+                    if callable(end_example):
+                        end_example()
                     processed_batches = batch_index
                     if cache_forward_pb is not None:
                         rows_for_batch = 0

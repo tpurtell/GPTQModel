@@ -4,13 +4,25 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    DeepseekV4ForCausalLM,
+    DeepseekV4HyperHead,
+    DeepseekV4RMSNorm,
+)
 
 from gptqmodel.models import auto
 from gptqmodel.models.definitions.deepseek_v4 import (
+    DeepSeekV4MTPAuxiliary,
     DeepSeekV4MTPAuxiliaryShell,
+    DeepSeekV4MTPPrefixRuntime,
     DeepSeekV4MTPReplay,
     DeepSeekV4MTPReplayBatch,
+    DeepSeekV4MTPTargetTapEvent,
     DeepSeekV4QModel,
+    DeepSeekV4TargetAnchorResolver,
+    MTP_CAPTURE_ATTENTION_MASK,
+    MTP_CAPTURE_DECODE_MASK,
+    MTP_CAPTURE_INPUT_IDS,
     expected_deepseek_v4_mtp_checkpoint_keys,
     patch_deepseek_v4_router_precision,
     validate_deepseek_v4_mtp_checkpoint_keys,
@@ -217,6 +229,162 @@ def test_deepseek_v4_mtp_replay_keeps_five_rows_joint_and_uses_target_lane_means
         assert route.logits.dtype is torch.float32
         assert route.weights.dtype is torch.float32
 
+    projected_result = replay.replay(
+        DeepSeekV4MTPReplayBatch(
+            target_taps=None,
+            projected_main=result.projected_main,
+            anchor_token_ids=batch.anchor_token_ids,
+            main_position_ids=batch.main_position_ids,
+            main_attention_mask=batch.main_attention_mask,
+        )
+    )
+    assert torch.equal(projected_result.terminal_residual, result.terminal_residual)
+    for projected_route, tap_route in zip(projected_result.routes, result.routes):
+        assert torch.equal(projected_route.indices, tap_route.indices)
+        assert torch.equal(projected_route.weights, tap_route.weights)
+
+
+def test_deepseek_v4_target_anchor_resolver_matches_native_fp32_greedy_head() -> None:
+    torch.manual_seed(0xA4C40)
+    config = _tiny_v4_config()
+    hc_head = DeepseekV4HyperHead(config).to(dtype=torch.bfloat16)
+    norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps).to(
+        dtype=torch.bfloat16
+    )
+    lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(
+        dtype=torch.bfloat16
+    )
+    resolver = DeepSeekV4TargetAnchorResolver(
+        hc_head=hc_head,
+        norm=norm,
+        lm_head=lm_head,
+        position_chunk_size=2,
+        vocab_chunk_size=7,
+    )
+    raw = torch.randn(
+        2, 4, config.hc_mult, config.hidden_size, dtype=torch.bfloat16
+    )
+    input_ids = torch.arange(8).reshape(2, 4)
+    attention_mask = torch.tensor(
+        [[False, True, True, True], [True, True, True, False]]
+    )
+    decode_mask = torch.tensor(
+        [[False, True, False, True], [True, False, True, True]]
+    )
+    position_ids = torch.tensor([[0, 3, 4, 5], [8, 9, 10, 0]])
+
+    anchors = resolver(
+        raw,
+        input_ids,
+        attention_mask,
+        decode_mask,
+        position_ids,
+    )
+    eligible = attention_mask & decode_mask
+    selected = raw[eligible].unsqueeze(0)
+    reference_hidden = norm(hc_head(selected)).squeeze(0)
+    reference = F.linear(reference_hidden.float(), lm_head.weight.float()).argmax(-1)
+    assert torch.equal(anchors[eligible], reference)
+    assert torch.equal(anchors[~eligible], torch.full_like(anchors[~eligible], -1))
+
+
+def test_deepseek_v4_target_tap_sink_receives_only_official_lane_means() -> None:
+    config = _tiny_v4_config()
+    harness = object.__new__(DeepSeekV4QModel)
+    harness.model = SimpleNamespace(config=config)
+    events = []
+
+    assert not harness.quantization_layer_output_required(
+        layer_index=2, layer_name="model.layers.2", layer_count=3
+    )
+    harness.set_mtp_target_tap_sink(events.append)
+    assert harness.quantization_layer_output_required(
+        layer_index=2, layer_name="model.layers.2", layer_count=3
+    )
+    assert not harness.quantization_layer_output_required(
+        layer_index=3, layer_name="model.layers.3", layer_count=3
+    )
+
+    raw = torch.randn(2, 5, config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
+    positions = torch.arange(5).unsqueeze(0).expand(2, -1)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    harness.receive_quantization_layer_outputs(
+        layer_index=2,
+        layer_name="model.layers.2",
+        layer_outputs=[[raw]],
+        layer_input_kwargs=[{"input_ids": torch.arange(10).reshape(2, 5)}],
+        position_ids=[positions],
+        attention_masks=[mask],
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, DeepSeekV4MTPTargetTapEvent)
+    assert event.layer_index == 2
+    assert event.layer_name == "model.layers.2"
+    assert event.raw_layer_outputs[0] is raw
+    assert event.position_ids[0] is positions
+    assert event.attention_masks[0] is mask
+    torch.testing.assert_close(event.collapsed_target_taps[0], raw.mean(dim=2))
+
+
+def test_deepseek_v4_target_tap_sink_rejects_uncollapsible_output() -> None:
+    config = _tiny_v4_config()
+    harness = object.__new__(DeepSeekV4QModel)
+    harness.model = SimpleNamespace(config=config)
+    harness.set_mtp_target_tap_sink(lambda _event: None)
+    try:
+        harness.receive_quantization_layer_outputs(
+            layer_index=2,
+            layer_name="model.layers.2",
+            layer_outputs=[[torch.zeros(2, 5, config.hidden_size)]],
+            layer_input_kwargs=[{}],
+            position_ids=[],
+            attention_masks=[],
+        )
+    except RuntimeError as exc:
+        assert "[batch, sequence, hc, hidden]" in str(exc)
+    else:
+        raise AssertionError("a rank-3 target boundary was accepted as a raw mHC tap")
+
+
+def test_deepseek_v4_preserves_original_token_mask_metadata_without_forwarding_it() -> None:
+    config = _tiny_v4_config()
+    harness = object.__new__(DeepSeekV4QModel)
+    harness.model = SimpleNamespace(config=config)
+    input_ids = torch.tensor([[1, 2, 3]])
+    attention_mask = torch.tensor([[0, 1, 1]])
+    labels = torch.tensor([[-100, -100, 3]])
+    harness.begin_input_capture_example(
+        {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        },
+        batch_device=torch.device("cpu"),
+    )
+    captured = harness.capture_first_layer_input_kwargs(
+        args=(),
+        kwargs={},
+        batch_device=torch.device("cpu"),
+        layer_input_kwargs={"ordinary": torch.tensor(1)},
+    )
+    harness.end_input_capture_example()
+
+    assert torch.equal(captured[MTP_CAPTURE_INPUT_IDS], input_ids)
+    assert torch.equal(captured[MTP_CAPTURE_ATTENTION_MASK], attention_mask)
+    assert captured[MTP_CAPTURE_DECODE_MASK].tolist() == [[False, True, False]]
+    replay_kwargs = harness.prepare_layer_replay_kwargs(
+        layer=nn.Identity(),
+        layer_input=[torch.zeros(1, 3, config.hidden_size)],
+        additional_inputs=dict(captured),
+        target_device=torch.device("cpu"),
+    )
+    assert MTP_CAPTURE_INPUT_IDS not in replay_kwargs
+    assert MTP_CAPTURE_ATTENTION_MASK not in replay_kwargs
+    assert MTP_CAPTURE_DECODE_MASK not in replay_kwargs
+    assert "ordinary" in replay_kwargs
+
 
 class _LearnedRouter(nn.Module):
     def __init__(self) -> None:
@@ -295,14 +463,110 @@ def test_deepseek_v4_router_patch_uses_fp32_without_promoting_stored_weights() -
     assert hash_weights.dtype is torch.float32
 
 
-def test_deepseek_v4_after_load_requires_every_router_to_be_patched() -> None:
-    model = _RouterModel()
+def test_deepseek_v4_after_load_preserves_source_fp32_and_requires_router_coverage() -> None:
+    model = DeepseekV4ForCausalLM(_tiny_v4_config()).to(dtype=torch.bfloat16)
     harness = object.__new__(DeepSeekV4QModel)
     assert DeepSeekV4QModel.after_model_load(harness, model) is model
-    model.config.num_hidden_layers = 3
+
+    assert model.model.hc_head.hc_fn.dtype is torch.float32
+    assert model.model.hc_head.hc_base.dtype is torch.float32
+    assert model.model.hc_head.hc_scale.dtype is torch.float32
+    assert model.model.norm.weight.dtype is torch.bfloat16
+    assert model.lm_head.weight.dtype is torch.bfloat16
+    for layer in model.model.layers:
+        assert layer.attn_hc.fn.dtype is torch.float32
+        assert layer.attn_hc.base.dtype is torch.float32
+        assert layer.attn_hc.scale.dtype is torch.float32
+        assert layer.ffn_hc.fn.dtype is torch.float32
+        assert layer.ffn_hc.base.dtype is torch.float32
+        assert layer.ffn_hc.scale.dtype is torch.float32
+        assert layer.self_attn.sinks.dtype is torch.float32
+
+    model.model.layers[-1].mlp.gate = nn.Identity()
     try:
         DeepSeekV4QModel.after_model_load(harness, model)
     except RuntimeError as exc:
+        assert "router" in str(exc)
         assert "coverage mismatch" in str(exc)
     else:
         raise AssertionError("missing DeepSeek V4 router coverage was accepted")
+
+
+def test_deepseek_v4_prefix_runtime_owns_exact_projector_anchor_and_embedding(
+    monkeypatch,
+) -> None:
+    torch.manual_seed(0xA4C41)
+    config = _tiny_v4_config()
+    model = DeepseekV4ForCausalLM(config).to(dtype=torch.bfloat16)
+    harness = object.__new__(DeepSeekV4QModel)
+    nn.Module.__init__(harness)
+    harness.model = DeepSeekV4QModel.after_model_load(harness, model)
+
+    shell = DeepSeekV4MTPAuxiliaryShell(config, device="cpu")
+    with torch.no_grad():
+        for parameter in shell.parameters():
+            if parameter.is_floating_point():
+                parameter.normal_(mean=0.0, std=0.02)
+    auxiliary = DeepSeekV4MTPAuxiliary(
+        model=shell,
+        turtle_model=SimpleNamespace(),
+        checkpoint_contract={"test": True},
+    )
+
+    from gptqmodel.utils.structure import LazyTurtle
+
+    harness.turtle_model = object.__new__(LazyTurtle)
+    mtp_materialized = []
+    target_materialized = []
+    monkeypatch.setattr(
+        harness,
+        "build_mtp_auxiliary",
+        lambda *, device="meta": auxiliary,
+    )
+    monkeypatch.setattr(
+        harness,
+        "materialize_mtp_replay_submodule",
+        lambda _auxiliary, module, **_kwargs: mtp_materialized.append(module) or module,
+    )
+    monkeypatch.setattr(
+        harness,
+        "shell_module_materialize",
+        lambda *, target_submodule, module_path, **_kwargs: (
+            target_materialized.append(module_path) or target_submodule
+        ),
+    )
+
+    runtime = harness.build_mtp_prefix_runtime(
+        device="cpu",
+        position_chunk_size=2,
+        vocab_chunk_size=7,
+    )
+    assert isinstance(runtime, DeepSeekV4MTPPrefixRuntime)
+    assert mtp_materialized == [shell.mtp[0].main_proj, shell.mtp[0].main_norm]
+    assert target_materialized == [
+        "model.hc_head",
+        "model.norm",
+        "lm_head",
+        "model.embed_tokens",
+    ]
+
+    taps = tuple(
+        torch.randn(2, 3, config.hidden_size, dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    expected = shell.mtp[0].main_norm(shell.mtp[0].main_proj(torch.cat(taps, -1)))
+    torch.testing.assert_close(runtime.project_target_taps(taps), expected)
+    assert runtime.build_replay().embedding_weight is model.model.embed_tokens.weight
+
+    raw = torch.randn(
+        2, 3, config.hc_mult, config.hidden_size, dtype=torch.bfloat16
+    )
+    input_ids = torch.arange(6).reshape(2, 3)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    decode_mask = torch.tensor([[False, True, True], [True, False, True]])
+    position_ids = torch.arange(3).expand(2, -1)
+    anchors = runtime.anchor_resolver(
+        raw, input_ids, attention_mask, decode_mask, position_ids
+    )
+    assert torch.all(anchors[decode_mask] >= 0)
+    assert torch.all(anchors[~decode_mask] == -1)
