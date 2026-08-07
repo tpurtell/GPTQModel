@@ -19,7 +19,10 @@ import transformers
 from torch.nn import Module
 from torch.nn.modules.conv import _ConvNd
 
-from ..exllamav3.modules.quant.exl3_lib.quantize import quantize_exl3
+from ..exllamav3.modules.quant.exl3_lib.quantize import (
+    quantize_exl3,
+    reconstruct_exl3_tensors,
+)
 from ..looper.loop_processor import (
     DTYPE_SIZE_COLUMN,
     ExecutionConfig,
@@ -55,6 +58,11 @@ from ..utils.exl3_error_ledger import (
     routed_expert_identity,
 )
 from ..utils.exllamav3 import create_exllamav3_module
+from ..utils.exl3_projection_checkpoint import (
+    EXL3ProjectionCheckpointStore,
+    build_projection_request,
+    checkpoint_root_from_provenance,
+)
 from ..utils.logger import setup_logger
 from ..utils.module_locks import parent_module_lock
 
@@ -390,8 +398,7 @@ class EXL3Processor(LoopProcessor):
             for task_name, named_module in subset.items()
             if task_name in self.tasks
             and isinstance(getattr(named_module, "full_name", None), str)
-            and (identity := routed_expert_identity(named_module.full_name))
-            is not None
+            and (identity := routed_expert_identity(named_module.full_name)) is not None
         }
         if not targets:
             return nullcontext()
@@ -628,44 +635,133 @@ class EXL3Processor(LoopProcessor):
             "finalized": False,
         }
 
+        ledger_provenance = self._ledger_provenance()
         quant_args = self._build_quant_args(module, module_qcfg, target_device)
         input_weight = self._quant_input_weight(capture, target_device)
-        weight_q, proxy_err, out_tensors = quantize_exl3(
-            weight=input_weight,
-            H_data=h_data,
-            quant_args=quant_args,
-            return_weight_q=True,
+        checkpoint_root = checkpoint_root_from_provenance(ledger_provenance)
+        checkpoint_store = (
+            EXL3ProjectionCheckpointStore(checkpoint_root)
+            if checkpoint_root is not None
+            else None
         )
-        duration = time.perf_counter() - start_time
-
-        quantizer_metrics = quant_args.get("error_metrics")
-        if not isinstance(quantizer_metrics, dict):
-            raise RuntimeError(
-                f"EXL3 quantizer returned no structured error metrics for `{module.full_name}`."
+        checkpoint_request = None
+        checkpoint_result = None
+        checkpoint_hit = False
+        if checkpoint_store is not None:
+            family_join = (
+                ledger_provenance.get("family_join")
+                if isinstance(ledger_provenance, dict)
+                else None
             )
-        encoded_bytes = sum(
-            tensor.numel() * tensor.element_size()
-            for tensor in out_tensors.values()
-            if isinstance(tensor, torch.Tensor)
-        )
-        ledger_provenance = self._ledger_provenance()
-        ledger_record = build_projection_record(
-            module_full_name=module.full_name,
-            layer_index=module.layer_index,
-            bits=int(quant_args["K"]),
-            codebook=module_qcfg.codebook,
-            sample_count=capture.nsamples,
-            duration_seconds=duration,
-            encoded_bytes=encoded_bytes,
-            device_names=[str(device) for device in quant_args["devices"]],
-            quantizer_metrics=quantizer_metrics,
-            provenance=ledger_provenance,
-            route_evidence=task_entry.get("route_evidence"),
-        )
+            checkpoint_request = build_projection_request(
+                module_full_name=module.full_name,
+                layer_index=module.layer_index,
+                input_weight=input_weight,
+                hessian=hessian,
+                sample_count=capture.nsamples,
+                quantizer_contract={
+                    "bits": int(quant_args["K"]),
+                    "codebook": module_qcfg.codebook,
+                    "apply_out_scales": quant_args["apply_out_scales"],
+                    "sigma_reg": float(quant_args["sigma_reg"]),
+                    "seed": int(quant_args["seed"]),
+                },
+                family_join=family_join,
+                route_evidence=task_entry.get("route_evidence"),
+            )
+            loaded_checkpoint = checkpoint_store.load(checkpoint_request)
+        else:
+            loaded_checkpoint = None
 
-        # This synchronous fsync is the commit barrier for the diagnostic
-        # record. Only after it succeeds may the packed tensor payload enter
-        # the module's asynchronous CPU stream/save lifecycle.
+        if loaded_checkpoint is None:
+            _weight_q, proxy_err, out_tensors = quantize_exl3(
+                weight=input_weight,
+                H_data=h_data,
+                quant_args=quant_args,
+                return_weight_q=False,
+            )
+            del _weight_q
+            duration = time.perf_counter() - start_time
+            quantizer_metrics = quant_args.get("error_metrics")
+            if not isinstance(quantizer_metrics, dict):
+                raise RuntimeError(
+                    f"EXL3 quantizer returned no structured error metrics for `{module.full_name}`."
+                )
+            if isinstance(proxy_err, torch.Tensor):
+                proxy_err = proxy_err.item()
+            device_names = [str(device) for device in quant_args["devices"]]
+            encoded_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in out_tensors.values()
+                if isinstance(tensor, torch.Tensor)
+            )
+            ledger_record = build_projection_record(
+                module_full_name=module.full_name,
+                layer_index=module.layer_index,
+                bits=int(quant_args["K"]),
+                codebook=module_qcfg.codebook,
+                sample_count=capture.nsamples,
+                duration_seconds=duration,
+                encoded_bytes=encoded_bytes,
+                device_names=device_names,
+                quantizer_metrics=quantizer_metrics,
+                provenance=ledger_provenance,
+                route_evidence=task_entry.get("route_evidence"),
+            )
+            checkpoint_result = {
+                "duration_seconds": duration,
+                "proxy_error": proxy_err,
+                "device_names": device_names,
+                "quantizer_metrics": quantizer_metrics,
+                "ledger_record": ledger_record,
+            }
+            if checkpoint_store is not None:
+                checkpoint_store.commit(
+                    checkpoint_request,
+                    out_tensors,
+                    checkpoint_result,
+                )
+        else:
+            out_tensors, checkpoint_result = loaded_checkpoint
+            duration = checkpoint_result.get("duration_seconds")
+            proxy_err = checkpoint_result.get("proxy_error")
+            device_names = checkpoint_result.get("device_names")
+            quantizer_metrics = checkpoint_result.get("quantizer_metrics")
+            ledger_record = checkpoint_result.get("ledger_record")
+            encoded_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in out_tensors.values()
+                if isinstance(tensor, torch.Tensor)
+            )
+            if (
+                not isinstance(duration, (int, float))
+                or isinstance(duration, bool)
+                or not isinstance(device_names, list)
+                or not all(isinstance(value, str) for value in device_names)
+                or not isinstance(quantizer_metrics, dict)
+                or not isinstance(ledger_record, dict)
+            ):
+                raise ValueError("EXL3 projection checkpoint result is malformed")
+            expected_ledger_record = build_projection_record(
+                module_full_name=module.full_name,
+                layer_index=module.layer_index,
+                bits=int(quant_args["K"]),
+                codebook=module_qcfg.codebook,
+                sample_count=capture.nsamples,
+                duration_seconds=duration,
+                encoded_bytes=encoded_bytes,
+                device_names=device_names,
+                quantizer_metrics=quantizer_metrics,
+                provenance=ledger_provenance,
+                route_evidence=task_entry.get("route_evidence"),
+            )
+            if ledger_record != expected_ledger_record:
+                raise ValueError("EXL3 projection checkpoint ledger is inconsistent")
+            checkpoint_hit = True
+
+        # The packed result and its exact ledger are now durable when the run
+        # opted into projection checkpoints. The journal remains the ordered
+        # coordinator commit barrier before tensors enter async save state.
         with self._stats_lock:
             ledger_record_sha256 = append_exl3_error_journal(
                 self.error_journal_path,
@@ -677,7 +773,12 @@ class EXL3Processor(LoopProcessor):
             stream_payload["bias"] = module.bias.detach()
         module.stream_state_payload_to_cpu(stream_payload)
 
-        restored_weight = self._restore_module_weight(module, weight_q)
+        runtime_weight = reconstruct_exl3_tensors(
+            out_tensors,
+            device=target_device,
+            dtype=module.weight.dtype,
+        )
+        restored_weight = self._restore_module_weight(module, runtime_weight)
         module.weight.data = restored_weight.to(dtype=module.weight.dtype)
 
         workspace_summary = getattr(capture, "_borrow_workspace_last_summary", None)
@@ -708,6 +809,12 @@ class EXL3Processor(LoopProcessor):
             "exl3_error_ledger_record": ledger_record,
             "exl3_error_journal": self.error_journal_path,
             "exl3_error_record_sha256": ledger_record_sha256,
+            "exl3_projection_checkpoint": (
+                checkpoint_request.get("request_sha256")
+                if checkpoint_request is not None
+                else None
+            ),
+            "exl3_projection_checkpoint_hit": checkpoint_hit,
         }
 
         if workspace_summary:
@@ -745,7 +852,7 @@ class EXL3Processor(LoopProcessor):
         self.log_new_row(stat)
 
         capture.free()
-        del input_weight, restored_weight, weight_q, out_tensors, stream_payload
+        del input_weight, runtime_weight, restored_weight, out_tensors, stream_payload
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         """Builds and installs the ExLlamaV3 module from the staged tensors."""

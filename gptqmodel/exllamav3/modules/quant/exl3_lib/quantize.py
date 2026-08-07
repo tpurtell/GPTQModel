@@ -637,6 +637,54 @@ def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
     return packed
 
 
+def reconstruct_exl3_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Reconstruct the exact runtime EXL3 weight represented by packed tensors."""
+
+    required = {"trellis", "suh", "svh"}
+    if not required.issubset(tensors):
+        raise ValueError("EXL3 reconstruction is missing trellis/suh/svh tensors")
+    trellis = tensors["trellis"]
+    suh = tensors["suh"]
+    svh = tensors["svh"]
+    if (
+        trellis.ndim != 3
+        or suh.ndim != 1
+        or svh.ndim != 1
+        or suh.numel() != trellis.shape[0] * 16
+        or svh.numel() != trellis.shape[1] * 16
+        or trellis.shape[-1] % 16
+    ):
+        raise ValueError("EXL3 reconstruction received inconsistent tensor geometry")
+    K = int(trellis.shape[-1] // 16)
+    if K < 1 or K > 8:
+        raise ValueError(f"EXL3 reconstruction received invalid K={K}")
+
+    target = torch.device(device)
+    packed = trellis.to(device=target, non_blocking=True).contiguous()
+    reconstructed = torch.empty(
+        (suh.numel(), svh.numel()),
+        dtype=torch.float16,
+        device=target,
+    )
+    ext.reconstruct(
+        reconstructed,
+        packed,
+        K,
+        "mcg" in tensors,
+        "mul1" in tensors,
+    )
+    reconstructed = preapply_had_l(reconstructed, had_k)
+    reconstructed *= suh.to(device=target, dtype=torch.float16).unsqueeze(1)
+    reconstructed = preapply_had_r(reconstructed, had_n)
+    reconstructed *= svh.to(device=target, dtype=torch.float16).unsqueeze(0)
+    return reconstructed.to(dtype=dtype)
+
+
 def pack_signs(signs: torch.Tensor, quant_args: dict) -> torch.Tensor:
     signs = signs.half().flatten().contiguous()
     assert signs.shape[0] % 16 == 0
