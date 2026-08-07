@@ -14,6 +14,7 @@ class _Owner:
     def __init__(self, prefixes, expected_suffixes=None):
         self.prefixes = prefixes
         self.expected_suffixes = expected_suffixes
+        self.model = torch.nn.Linear(1, 1)
 
     def save_state_overlay(self):
         contract = {
@@ -55,6 +56,64 @@ def test_save_state_overlay_replaces_only_declared_prefixes(monkeypatch):
         "mtp.0.mlp.experts.7.gate_proj.trellis": trellis,
         "mtp.0.mlp.experts.7.gate_proj.suh": suh,
     }
+
+
+def test_save_tensor_storage_includes_exact_overlay_modules(monkeypatch):
+    base = {"model.layers.0.expert": {"stored_tensors": {}}}
+    mtp_module = "mtp.0.mlp.experts.7.gate_proj"
+    overlay = {
+        mtp_module: {
+            "stored_tensors": {
+                f"{mtp_module}.trellis": {},
+                f"{mtp_module}.suh": {},
+                f"{mtp_module}.svh": {},
+                f"{mtp_module}.mcg": {},
+            }
+        }
+    }
+    storage_by_model = iter((base, overlay))
+    monkeypatch.setattr(
+        writer,
+        "build_exllamav3_tensor_storage",
+        lambda _model: next(storage_by_model),
+    )
+
+    storage = writer._build_exllamav3_tensor_storage_for_save(
+        _Owner([mtp_module], ["trellis", "suh", "svh", "mcg"])
+    )
+
+    assert storage == {**base, **overlay}
+
+
+def test_save_tensor_storage_fails_closed_on_missing_overlay_module(monkeypatch):
+    monkeypatch.setattr(
+        writer,
+        "build_exllamav3_tensor_storage",
+        lambda _model: {},
+    )
+    with pytest.raises(ValueError, match="no EXL3 tensor-storage metadata"):
+        writer._build_exllamav3_tensor_storage_for_save(
+            _Owner(["mtp.0.missing"])
+        )
+
+
+def test_save_tensor_storage_fails_closed_on_tensor_contract(monkeypatch):
+    module = "mtp.0.expert"
+    storage_by_model = iter(
+        (
+            {},
+            {module: {"stored_tensors": {f"{module}.trellis": {}}}},
+        )
+    )
+    monkeypatch.setattr(
+        writer,
+        "build_exllamav3_tensor_storage",
+        lambda _model: next(storage_by_model),
+    )
+    with pytest.raises(ValueError, match="tensor-storage contract differs"):
+        writer._build_exllamav3_tensor_storage_for_save(
+            _Owner([module], ["trellis", "suh", "svh", "mcg"])
+        )
 
 
 def test_save_state_overlay_fails_closed_on_missing_prefix(monkeypatch):

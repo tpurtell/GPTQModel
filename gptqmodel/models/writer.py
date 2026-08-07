@@ -314,15 +314,15 @@ def _merge_prefix_tensors_into_state_dict(
         log.warn(f"Model: No tensors matched prefixes {normalized_prefixes} while merging into the state dict")
 
 
-def _apply_save_state_overlay(owner, state_dict: Dict[str, TensorSource]) -> None:
-    """Replace complete tensor prefixes from an attached quantization model."""
+def _validated_save_state_overlay(owner):
+    """Return one validated out-of-tree model overlay contract, if attached."""
 
     provider = getattr(owner, "save_state_overlay", None)
     if not callable(provider):
-        return
+        return None
     contract = provider()
     if contract is None:
-        return
+        return None
     if not isinstance(contract, dict):
         raise TypeError("save-state overlay contract must be a dictionary")
     overlay_model = contract.get("model")
@@ -339,6 +339,96 @@ def _apply_save_state_overlay(owner, state_dict: Dict[str, TensorSource]) -> Non
     normalized = tuple(
         prefix if prefix.endswith(".") else f"{prefix}." for prefix in prefixes
     )
+    return contract, overlay_model, normalized
+
+
+def _validated_save_state_overlay_suffixes(contract):
+    expected_suffixes = contract.get("expected_suffixes")
+    if expected_suffixes is None:
+        return None
+    if (
+        not isinstance(expected_suffixes, (list, tuple))
+        or not expected_suffixes
+        or any(
+            not isinstance(suffix, str) or not suffix
+            for suffix in expected_suffixes
+        )
+        or len(set(expected_suffixes)) != len(expected_suffixes)
+    ):
+        raise ValueError(
+            "save-state overlay expected suffixes must be unique non-empty strings"
+        )
+    return set(expected_suffixes)
+
+
+def _build_exllamav3_tensor_storage_for_save(
+    owner,
+    validated_overlay=None,
+) -> Dict[str, Dict[str, Any]]:
+    """Include EXL3 modules supplied by a disjoint save-state overlay.
+
+    DeepSeek V4 quantizes its MTP body through an attached model rather than
+    placing those modules in the target model tree. The tensor payload overlay
+    already replaces the native MTP prefixes during save; its EXL3 metadata
+    must be assembled from the same exact prefix contract before config files
+    are written.
+    """
+
+    storage = build_exllamav3_tensor_storage(owner.model)
+    validated = validated_overlay or _validated_save_state_overlay(owner)
+    if validated is None:
+        return storage
+    contract, overlay_model, normalized = validated
+    overlay_storage = build_exllamav3_tensor_storage(overlay_model)
+    expected_modules = {prefix[:-1] for prefix in normalized}
+    selected = {
+        name: entry
+        for name, entry in overlay_storage.items()
+        if name in expected_modules
+    }
+    if set(selected) != expected_modules:
+        missing = sorted(expected_modules - set(selected))
+        raise ValueError(
+            "save-state overlay has no EXL3 tensor-storage metadata for "
+            + ", ".join(missing)
+        )
+    expected_suffixes = _validated_save_state_overlay_suffixes(contract)
+    if expected_suffixes is not None:
+        for module, entry in selected.items():
+            stored_tensors = entry.get("stored_tensors") if isinstance(entry, dict) else None
+            prefix = f"{module}."
+            actual_names = set(stored_tensors) if isinstance(stored_tensors, dict) else set()
+            expected_names = {f"{prefix}{suffix}" for suffix in expected_suffixes}
+            actual_suffixes = {name[len(prefix):] for name in actual_names if name.startswith(prefix)}
+            if actual_names != expected_names or actual_suffixes != expected_suffixes:
+                raise ValueError(
+                    f"save-state overlay tensor-storage contract differs for {module}: "
+                    f"actual={sorted(actual_suffixes)} "
+                    f"expected={sorted(expected_suffixes)}"
+                )
+    for module in expected_modules:
+        storage.pop(module, None)
+    collisions = set(selected).intersection(storage)
+    if collisions:
+        raise ValueError(
+            "save-state overlay tensor-storage collides outside replacement prefixes: "
+            + ", ".join(sorted(collisions))
+        )
+    storage.update(selected)
+    return storage
+
+
+def _apply_save_state_overlay(
+    owner,
+    state_dict: Dict[str, TensorSource],
+    validated_overlay=None,
+) -> None:
+    """Replace complete tensor prefixes from an attached quantization model."""
+
+    validated = validated_overlay or _validated_save_state_overlay(owner)
+    if validated is None:
+        return
+    contract, overlay_model, normalized = validated
     overlay = get_state_dict_for_save(
         overlay_model,
         offload_root=contract.get("offload_root"),
@@ -358,21 +448,8 @@ def _apply_save_state_overlay(owner, state_dict: Dict[str, TensorSource]) -> Non
         raise ValueError(
             "save-state overlay has no replacement tensors for " + ", ".join(missing)
         )
-    expected_suffixes = contract.get("expected_suffixes")
+    expected_suffixes = _validated_save_state_overlay_suffixes(contract)
     if expected_suffixes is not None:
-        if (
-            not isinstance(expected_suffixes, (list, tuple))
-            or not expected_suffixes
-            or any(
-                not isinstance(suffix, str) or not suffix
-                for suffix in expected_suffixes
-            )
-            or len(set(expected_suffixes)) != len(expected_suffixes)
-        ):
-            raise ValueError(
-                "save-state overlay expected suffixes must be unique non-empty strings"
-            )
-        expected_suffixes = set(expected_suffixes)
         for prefix in normalized:
             actual_suffixes = {
                 name[len(prefix) :]
@@ -770,6 +847,7 @@ def ModelWriter(cls):
         if not self.quantized:
             raise ValueError("Save aborted as model is not quantized. Please call `quantize()` first.")
 
+        save_state_overlay = _validated_save_state_overlay(self)
         quant_method = getattr(quantize_config, "method", getattr(quantize_config, "quant_method", None))
         runtime_format = resolve_quant_format(quantize_config.format, quant_method)
 
@@ -779,7 +857,10 @@ def ModelWriter(cls):
             )
 
         if runtime_format == FORMAT.EXL3:
-            tensor_storage = build_exllamav3_tensor_storage(self.model)
+            tensor_storage = _build_exllamav3_tensor_storage_for_save(
+                self,
+                validated_overlay=save_state_overlay,
+            )
             quantize_config.tensor_storage = tensor_storage
             self.quantize_config.tensor_storage = copy.deepcopy(tensor_storage)
 
@@ -875,7 +956,11 @@ def ModelWriter(cls):
         )
         if prefix_entries:
             _merge_prefix_tensors_into_state_dict(prefix_entries, self.model_local_path, state_dict)
-        _apply_save_state_overlay(self, state_dict)
+        _apply_save_state_overlay(
+            self,
+            state_dict,
+            validated_overlay=save_state_overlay,
+        )
 
         model_base_name = "model"
         model_save_name = model_base_name + ".safetensors"
