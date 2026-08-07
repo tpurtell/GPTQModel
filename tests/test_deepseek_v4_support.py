@@ -534,6 +534,30 @@ def test_deepseek_v4_preserves_original_token_mask_metadata_without_forwarding_i
     assert "ordinary" in replay_kwargs
 
 
+def test_deepseek_v4_raw_text_calibration_marks_causal_replay_positions() -> None:
+    config = _tiny_v4_config()
+    harness = object.__new__(DeepSeekV4QModel)
+    harness.model = SimpleNamespace(config=config)
+    input_ids = torch.tensor([[1, 2, 3, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 0]])
+
+    harness.begin_input_capture_example(
+        {"input_ids": input_ids, "attention_mask": attention_mask},
+        batch_device=torch.device("cpu"),
+    )
+    captured = harness.capture_first_layer_input_kwargs(
+        args=(),
+        kwargs={},
+        batch_device=torch.device("cpu"),
+        layer_input_kwargs={},
+    )
+    harness.end_input_capture_example()
+
+    assert captured[MTP_CAPTURE_DECODE_MASK].tolist() == [
+        [True, True, False, False]
+    ]
+
+
 class _LearnedRouter(nn.Module):
     def __init__(self) -> None:
         super().__init__()

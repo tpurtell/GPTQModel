@@ -1451,10 +1451,19 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         labels = example.get("labels")
         input_ids = example.get("input_ids")
         attention_mask = example.get("attention_mask")
+        if labels is not None and (
+            not isinstance(labels, torch.Tensor)
+            or not isinstance(input_ids, torch.Tensor)
+            or tuple(labels.shape) != tuple(input_ids.shape)
+        ):
+            raise ValueError(
+                "DeepSeek V4 calibration labels must match rank-2 input_ids"
+            )
+        effective_labels = labels if labels is not None else input_ids
         if (
-            isinstance(labels, torch.Tensor)
+            isinstance(effective_labels, torch.Tensor)
             and isinstance(input_ids, torch.Tensor)
-            and tuple(labels.shape) == tuple(input_ids.shape)
+            and tuple(effective_labels.shape) == tuple(input_ids.shape)
         ):
             valid = (
                 attention_mask.to(dtype=torch.bool)
@@ -1463,7 +1472,11 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
                 else torch.ones_like(input_ids, dtype=torch.bool)
             )
             decode_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-            decode_mask[:, :-1] = (labels[:, 1:] != -100) & valid[:, :-1] & valid[:, 1:]
+            decode_mask[:, :-1] = (
+                (effective_labels[:, 1:] != -100)
+                & valid[:, :-1]
+                & valid[:, 1:]
+            )
             metadata[MTP_CAPTURE_DECODE_MASK] = decode_mask.detach().to(
                 device=batch_device
             )
