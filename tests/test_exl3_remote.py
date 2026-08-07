@@ -105,6 +105,7 @@ def test_quantization_failure_message_identifies_hessian_and_minor() -> None:
         hessian=hessian,
         sample_count=1024,
         sigma_reg=0.025,
+        raw_hessian=torch.eye(2, dtype=torch.float32) * 4.0,
     )
 
     diagnostics = json.loads(message.removeprefix("EXL3 quantization failed: "))
@@ -122,6 +123,22 @@ def test_quantization_failure_message_identifies_hessian_and_minor() -> None:
         "diagonal_min": -1.0,
         "diagonal_mean": 0.5,
         "diagonal_max": 2.0,
+        "symmetrized_cholesky": {
+            "attempted": True,
+            "succeeded": False,
+            "leading_minor": 2,
+        },
+    }
+    assert diagnostics["raw_hessian"] == {
+        "state": "unmodified-raw-xtx-sum",
+        "shape": [2, 2],
+        "dtype": "torch.float32",
+        "sample_count": 1024,
+        "nonfinite_count": 0,
+        "symmetry_max_abs": 0.0,
+        "diagonal_min": 4.0,
+        "diagonal_mean": 4.0,
+        "diagonal_max": 4.0,
     }
 
 

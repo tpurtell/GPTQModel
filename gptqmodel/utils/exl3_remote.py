@@ -66,6 +66,78 @@ def _finite_scalar(value: torch.Tensor) -> float | None:
 
 
 @torch.no_grad()
+def _hessian_matrix_diagnostics(hessian: torch.Tensor) -> dict[str, Any]:
+    """Collect bounded, non-mutating diagnostics for one Hessian matrix."""
+
+    rows = int(hessian.shape[0]) if hessian.ndim == 2 else 0
+    columns = int(hessian.shape[1]) if hessian.ndim == 2 else 0
+    diagnostics: dict[str, Any] = {
+        "shape": [rows, columns],
+        "dtype": str(hessian.dtype),
+        "nonfinite_count": 0,
+        "symmetry_max_abs": 0.0,
+        "diagonal_min": None,
+        "diagonal_mean": None,
+        "diagonal_max": None,
+    }
+    if not rows or rows != columns:
+        return diagnostics
+
+    chunk_rows = min(rows, 1024)
+    for start in range(0, rows, chunk_rows):
+        stop = min(start + chunk_rows, rows)
+        block = hessian[start:stop]
+        diagnostics["nonfinite_count"] += int(
+            (~torch.isfinite(block)).sum().item()
+        )
+        difference = block - hessian[:, start:stop].transpose(0, 1)
+        block_max = _finite_scalar(difference.abs().max())
+        if block_max is not None:
+            diagnostics["symmetry_max_abs"] = max(
+                diagnostics["symmetry_max_abs"],
+                block_max,
+            )
+
+    diagonal = torch.diagonal(hessian)
+    diagnostics.update(
+        {
+            "diagonal_min": _finite_scalar(diagonal.min()),
+            "diagonal_mean": _finite_scalar(diagonal.mean()),
+            "diagonal_max": _finite_scalar(diagonal.max()),
+        }
+    )
+    return diagnostics
+
+
+@torch.no_grad()
+def _symmetrized_cholesky_diagnostics(hessian: torch.Tensor) -> dict[str, Any]:
+    """Test the mathematically equivalent symmetric matrix after a failure."""
+
+    rows = int(hessian.shape[0]) if hessian.ndim == 2 else 0
+    columns = int(hessian.shape[1]) if hessian.ndim == 2 else 0
+    diagnostics: dict[str, Any] = {
+        "attempted": False,
+        "succeeded": None,
+        "leading_minor": None,
+    }
+    if not rows or rows != columns or not torch.isfinite(hessian).all():
+        return diagnostics
+
+    diagnostics["attempted"] = True
+    try:
+        symmetric = (hessian + hessian.transpose(0, 1)) * 0.5
+        factor, info = torch.linalg.cholesky_ex(symmetric, check_errors=False)
+        info_value = int(info.item())
+        diagnostics["succeeded"] = info_value == 0
+        diagnostics["leading_minor"] = info_value or None
+        del factor, symmetric
+    except Exception as probe_error:
+        diagnostics["error_type"] = type(probe_error).__name__
+        diagnostics["error"] = str(probe_error)
+    return diagnostics
+
+
+@torch.no_grad()
 def _exl3_quantization_failure_message(
     *,
     error: Exception,
@@ -74,26 +146,23 @@ def _exl3_quantization_failure_message(
     hessian: torch.Tensor,
     sample_count: int,
     sigma_reg: float,
+    raw_hessian: torch.Tensor | None = None,
 ) -> str:
     """Create bounded diagnostics from EXL3's current Hessian on failure."""
 
-    rows = int(hessian.shape[0]) if hessian.ndim == 2 else 0
-    columns = int(hessian.shape[1]) if hessian.ndim == 2 else 0
-    nonfinite_count = 0
-    symmetry_max_abs = 0.0
-    if rows and rows == columns:
-        chunk_rows = min(rows, 1024)
-        for start in range(0, rows, chunk_rows):
-            stop = min(start + chunk_rows, rows)
-            block = hessian[start:stop]
-            nonfinite_count += int((~torch.isfinite(block)).sum().item())
-            difference = block - hessian[:, start:stop].transpose(0, 1)
-            block_max = _finite_scalar(difference.abs().max())
-            if block_max is not None:
-                symmetry_max_abs = max(symmetry_max_abs, block_max)
-    diagonal = torch.diagonal(hessian) if rows and rows == columns else None
     error_text = str(error)
     minor_match = _CHOLESKY_MINOR_PATTERN.search(error_text)
+    current_diagnostics = _hessian_matrix_diagnostics(hessian)
+    current_diagnostics.update(
+        {
+            # quantize_exl3 mutates the raw X^T X input during finalization. At
+            # Cholesky time this is the regularized, Hadamard-transformed matrix.
+            "state": "quantizer-owned-current-matrix",
+            "sample_count": int(sample_count),
+            "sigma_reg": float(sigma_reg),
+            "symmetrized_cholesky": _symmetrized_cholesky_diagnostics(hessian),
+        }
+    )
     diagnostics = {
         "schema": "gptqmodel.exl3-quantization-failure",
         "schema_version": 1,
@@ -104,26 +173,16 @@ def _exl3_quantization_failure_message(
         "cholesky_leading_minor": (
             int(minor_match.group(1)) if minor_match is not None else None
         ),
-        "hessian": {
-            # quantize_exl3 mutates the raw X^T X input during finalization. At
-            # Cholesky time this is the regularized, Hadamard-transformed matrix.
-            "state": "quantizer-owned-current-matrix",
-            "shape": [rows, columns],
-            "dtype": str(hessian.dtype),
-            "sample_count": int(sample_count),
-            "sigma_reg": float(sigma_reg),
-            "nonfinite_count": nonfinite_count,
-            "symmetry_max_abs": symmetry_max_abs,
-            "diagonal_min": (
-                _finite_scalar(diagonal.min()) if diagonal is not None else None
-            ),
-            "diagonal_mean": (
-                _finite_scalar(diagonal.mean()) if diagonal is not None else None
-            ),
-            "diagonal_max": (
-                _finite_scalar(diagonal.max()) if diagonal is not None else None
-            ),
-        },
+        "hessian": current_diagnostics,
+        "raw_hessian": (
+            {
+                **_hessian_matrix_diagnostics(raw_hessian),
+                "state": "unmodified-raw-xtx-sum",
+                "sample_count": int(sample_count),
+            }
+            if raw_hessian is not None
+            else None
+        ),
     }
     return "EXL3 quantization failed: " + json.dumps(
         diagnostics,
@@ -140,6 +199,7 @@ def exl3_quantization_failure_message(
     hessian: torch.Tensor,
     sample_count: int,
     sigma_reg: float,
+    raw_hessian: torch.Tensor | None = None,
 ) -> str:
     """Never let diagnostic collection mask the original quantizer failure."""
 
@@ -151,6 +211,7 @@ def exl3_quantization_failure_message(
             hessian=hessian,
             sample_count=sample_count,
             sigma_reg=sigma_reg,
+            raw_hessian=raw_hessian,
         )
     except Exception as diagnostic_error:
         fallback = {
@@ -394,11 +455,12 @@ def execute_remote_projection(
         raise RuntimeError(
             exl3_quantization_failure_message(
                 error=error,
-                module_full_name=request["module_full_name"],
+                module_full_name=request["module"],
                 request_sha256=request["request_sha256"],
                 hessian=device_hessian,
                 sample_count=request["sample_count"],
                 sigma_reg=float(contract["sigma_reg"]),
+                raw_hessian=hessian,
             )
         ) from error
     del _weight_q
