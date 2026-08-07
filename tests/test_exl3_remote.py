@@ -5,8 +5,11 @@ import hashlib
 import hmac
 import io
 import json
+import threading
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 
+import gptqmodel.utils.exl3_remote as exl3_remote
 import pytest
 import torch
 
@@ -122,6 +125,31 @@ def test_quantization_failure_message_identifies_hessian_and_minor() -> None:
     }
 
 
+def test_quantization_failure_message_preserves_error_when_diagnostics_fail(
+    monkeypatch,
+) -> None:
+    def fail_diagnostics(**_kwargs):
+        raise KeyError("diagnostic-field")
+
+    monkeypatch.setattr(
+        exl3_remote,
+        "_exl3_quantization_failure_message",
+        fail_diagnostics,
+    )
+    message = exl3_quantization_failure_message(
+        error=RuntimeError("original cholesky failure"),
+        module_full_name="model.layers.0.mlp.experts.29.down_proj",
+        request_sha256="b" * 64,
+        hessian=torch.eye(2),
+        sample_count=1024,
+        sigma_reg=0.025,
+    )
+    diagnostics = json.loads(message.removeprefix("EXL3 quantization failed: "))
+    assert diagnostics["error"] == "original cholesky failure"
+    assert diagnostics["diagnostic_error_type"] == "KeyError"
+    assert diagnostics["hessian"]["state"] == "diagnostic-collection-failed"
+
+
 def test_tensor_envelope_is_content_bound() -> None:
     payload = encode_tensor_envelope(
         {"schema": "test", "value": 7},
@@ -149,7 +177,7 @@ def test_scheduler_reuses_next_free_slot_and_durably_resumes(tmp_path) -> None:
         timeout_seconds=1,
         assignment_store_path=assignment_store,
     )
-    keys = [f"model.layers.17.mlp.experts.{expert}.gate_proj" for expert in range(6)]
+    keys = [f"model.layers.17.mlp.experts.{expert}.gate_proj" for expert in range(9)]
     leases = [forward.acquire_slot(key) for key in keys[:5]]
     assert [lease.slot for lease in leases] == [
         _coordinator("cuda:0"),
@@ -158,12 +186,20 @@ def test_scheduler_reuses_next_free_slot_and_durably_resumes(tmp_path) -> None:
         _endpoint("spark-c"),
         _endpoint("spark-d"),
     ]
+    staged = [forward.acquire_slot(key) for key in keys[5:8]]
+    assert [lease.slot for lease in staged] == [
+        _endpoint("spark-a"),
+        _endpoint("spark-c"),
+        _endpoint("spark-d"),
+    ]
     leases[0].release()
-    replacement = forward.acquire_slot(keys[5])
+    replacement = forward.acquire_slot(keys[8])
     assert replacement.slot == _coordinator("cuda:0")
     assert replacement.new_assignment is True
     replacement.release()
     for lease in leases[1:]:
+        lease.release()
+    for lease in staged:
         lease.release()
 
     records = [json.loads(path.read_text()) for path in assignment_store.rglob("*.json")]
@@ -223,7 +259,7 @@ def test_provenance_requires_token_and_preserves_retry_contract(
                 ],
                 "timeout_seconds": 42,
                 "max_attempts": 3,
-                "orchestration_workers": 3,
+                "orchestration_workers": 4,
                 "endpoints": [endpoint.__dict__],
             }
         }
@@ -315,6 +351,63 @@ def test_retry_stays_on_the_assigned_worker_and_retains_history(monkeypatch) -> 
             "message": "simulated lost response",
         }
     ]
+
+
+def test_client_allows_two_transports_to_stage_for_one_worker(monkeypatch) -> None:
+    endpoint = _endpoint("spark-a")
+    client = EXL3RemoteClient(
+        endpoints=[endpoint],
+        token=b"secret",
+        coordinator_slots=[],
+        timeout_seconds=1,
+        max_attempts=1,
+    )
+    weight, hessian = _inputs()
+    request = _request(weight, hessian, endpoint)
+    result = {
+        "duration_seconds": 1.0,
+        "proxy_error": 0.125,
+        "device_names": ["remote:spark-a/cuda:0"],
+        "quantizer_metrics": {"reported_metric_kind": "test"},
+        "worker": {
+            "name": endpoint.name,
+            "preflight_sha256": endpoint.preflight_sha256,
+            "image_digest": endpoint.image_digest,
+        },
+    }
+    response = encode_tensor_envelope(
+        {
+            "schema": REMOTE_RESULT_SCHEMA,
+            "contract": REMOTE_CONTRACT,
+            "request_sha256": request["request_sha256"],
+            "checkpoint_hit": False,
+            "result": result,
+        },
+        _packed_tensors(),
+    )
+    barrier = threading.Barrier(2)
+    monkeypatch.setattr(client, "qualify", lambda value: None)
+
+    def staged_request(_endpoint, _request):
+        barrier.wait(timeout=2)
+        return response
+
+    monkeypatch.setattr(client, "_request", staged_request)
+
+    def quantize_once():
+        return client.quantize(
+            endpoint=endpoint,
+            request_manifest=request,
+            input_weight=weight,
+            hessian=hessian,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [future.result(timeout=5) for future in [
+            executor.submit(quantize_once),
+            executor.submit(quantize_once),
+        ]]
+    assert all(returned == result for _, returned, _ in results)
 
 
 def test_request_surfaces_authenticated_worker_error(monkeypatch) -> None:

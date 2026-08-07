@@ -823,6 +823,9 @@ class EXL3Processor(LoopProcessor):
                 device_names = remote_result.get("device_names")
                 quantizer_metrics = remote_result.get("quantizer_metrics")
                 worker = remote_result.get("worker")
+                worker_queue_wait_seconds = remote_result.get(
+                    "worker_queue_wait_seconds"
+                )
                 if (
                     isinstance(duration, bool)
                     or not isinstance(duration, (int, float))
@@ -832,6 +835,10 @@ class EXL3Processor(LoopProcessor):
                     or not all(isinstance(value, str) for value in device_names)
                     or not isinstance(quantizer_metrics, dict)
                     or not isinstance(worker, dict)
+                    or isinstance(worker_queue_wait_seconds, bool)
+                    or not isinstance(worker_queue_wait_seconds, (int, float))
+                    or not math.isfinite(worker_queue_wait_seconds)
+                    or worker_queue_wait_seconds < 0
                 ):
                     raise RuntimeError(
                         f"EXL3 remote worker returned malformed results for `{module.full_name}`."
@@ -844,6 +851,7 @@ class EXL3Processor(LoopProcessor):
                     "scheduler_wait_seconds": execution_lease.wait_seconds,
                     "scheduler_new_assignment": execution_lease.new_assignment,
                     "scheduler_assignment_key": execution_lease.assignment_key,
+                    "worker_queue_wait_seconds": worker_queue_wait_seconds,
                 }
             else:
                 wait_started = time.perf_counter()
@@ -882,11 +890,16 @@ class EXL3Processor(LoopProcessor):
                 quantizer_metrics = quant_args.get("error_metrics")
                 execution_result = {
                     "kind": "coordinator",
-                    "scheduler_wait_seconds": execution_lease.wait_seconds,
-                    "scheduler_new_assignment": execution_lease.new_assignment,
-                    "scheduler_assignment_key": execution_lease.assignment_key,
                     "coordinator_quant_lock_wait_seconds": quant_started - wait_started,
                 }
+                if execution_lease is not None:
+                    execution_result.update(
+                        {
+                            "scheduler_wait_seconds": execution_lease.wait_seconds,
+                            "scheduler_new_assignment": execution_lease.new_assignment,
+                            "scheduler_assignment_key": execution_lease.assignment_key,
+                        }
+                    )
             if not isinstance(quantizer_metrics, dict):
                 raise RuntimeError(
                     f"EXL3 quantizer returned no structured error metrics for `{module.full_name}`."
