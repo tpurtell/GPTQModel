@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -685,6 +686,40 @@ def test_deepseek_v4_target_tap_sink_receives_only_official_lane_means() -> None
     assert event.position_ids[0] is positions
     assert event.attention_masks[0] is mask
     torch.testing.assert_close(event.collapsed_target_taps[0], raw.mean(dim=2))
+
+
+def test_deepseek_v4_mtp_output_boundary_prunes_superseded_capture(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    capture_root = tmp_path / "capture"
+    capture_root.mkdir()
+    layer_zero = capture_root / "layer-000000-subset-0000-of-0002-0123456789abcdef"
+    layer_one = capture_root / "layer-000001-subset-0000-of-0002-fedcba9876543210"
+    layer_zero.mkdir()
+    layer_one.mkdir()
+    monkeypatch.setenv("GPTQMODEL_EXL3_CAPTURE_FRONTIER", str(capture_root))
+
+    harness = object.__new__(DeepSeekV4MTPQuantizationModel)
+    harness.configure_mtp_activation_store(
+        str(tmp_path / "activations"),
+        provenance={
+            "plan_sha256": "a" * 64,
+            "family_join": {"recipe": "test"},
+        },
+    )
+    writer = harness.create_quantization_layer_output_writer(
+        layer_index=0,
+        expected_batches=1,
+        progress_stage="Forward replay",
+        apply_moe_config=False,
+    )
+    assert writer is not None
+    writer.put(0, [torch.zeros(1, 2)])
+    writer.finalize()
+
+    assert not layer_zero.exists()
+    assert layer_one.is_dir()
 
 
 def test_deepseek_v4_target_tap_sink_rejects_uncollapsible_output() -> None:

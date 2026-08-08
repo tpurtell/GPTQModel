@@ -92,3 +92,38 @@ def test_disk_backed_layer_outputs_reject_provenance_drift(tmp_path):
             expected_batches=1,
             provenance={"plan": "two"},
         )
+
+
+def test_disk_backed_layer_outputs_retry_post_commit_finalizer(tmp_path):
+    root = tmp_path / "activations"
+    calls = []
+
+    def fail_once(sequence):
+        calls.append(sequence.manifest["manifest_sha256"])
+        if len(calls) == 1:
+            raise RuntimeError("injected finalizer interruption")
+
+    writer = DiskBackedLayerOutputWriter(
+        root,
+        layer_index=0,
+        expected_batches=1,
+        provenance={"plan": "callback"},
+        on_finalize=fail_once,
+    )
+    writer.put(0, [torch.zeros(1, 2)])
+    with pytest.raises(RuntimeError, match="injected"):
+        writer.finalize()
+    assert (root / "layer-000000" / "manifest.json").is_file()
+
+    resumed = DiskBackedLayerOutputWriter(
+        root,
+        layer_index=0,
+        expected_batches=1,
+        provenance={"plan": "callback"},
+        on_finalize=fail_once,
+    )
+    sequence = resumed.finalize()
+    assert len(sequence) == 1
+    assert calls == [sequence.manifest["manifest_sha256"]] * 2
+    assert resumed.finalize() is sequence
+    assert len(calls) == 2

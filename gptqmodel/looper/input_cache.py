@@ -9,7 +9,7 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Callable, Dict, List, Sequence
 
 import torch
 from safetensors import safe_open
@@ -179,11 +179,14 @@ class DiskBackedLayerOutputWriter:
         expected_batches: int,
         provenance: dict[str, Any],
         shard_batches: int = 128,
+        on_finalize: Callable[["DiskBackedLayerOutputSequence"], None] | None = None,
     ) -> None:
         if layer_index < 0 or expected_batches <= 0 or shard_batches <= 0:
             raise ValueError("disk-backed output geometry must be positive")
         if not isinstance(provenance, dict) or not provenance:
             raise ValueError("disk-backed outputs require provenance")
+        if on_finalize is not None and not callable(on_finalize):
+            raise TypeError("disk-backed output finalizer must be callable")
         self.parent = Path(root).expanduser().resolve()
         self.parent.mkdir(parents=True, exist_ok=True)
         self.destination = self.parent / f"layer-{layer_index:06d}"
@@ -198,6 +201,8 @@ class DiskBackedLayerOutputWriter:
         self._lock = threading.RLock()
         self._closed = False
         self._complete: DiskBackedLayerOutputSequence | None = None
+        self._on_finalize = on_finalize
+        self._on_finalize_called = False
 
         if self.destination.exists():
             complete = DiskBackedLayerOutputSequence.open(
@@ -378,7 +383,7 @@ class DiskBackedLayerOutputWriter:
         with self._lock:
             if self._complete is not None:
                 self._closed = True
-                return self._complete
+                return self._notify_finalized()
             for shard_index in list(self._pending):
                 self._flush_shard(shard_index)
             if len(self._committed_indices) != self.expected_batches or self._pending:
@@ -404,7 +409,15 @@ class DiskBackedLayerOutputWriter:
                 self.destination, verify_hashes=False
             )
             self._closed = True
-            return self._complete
+            return self._notify_finalized()
+
+    def _notify_finalized(self) -> DiskBackedLayerOutputSequence:
+        if self._complete is None:
+            raise RuntimeError("disk-backed outputs are not finalized")
+        if self._on_finalize is not None and not self._on_finalize_called:
+            self._on_finalize(self._complete)
+            self._on_finalize_called = True
+        return self._complete
 
     def abort(self) -> None:
         # Complete shards and their progress manifest deliberately survive.

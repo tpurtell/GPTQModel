@@ -4,6 +4,7 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import copy
+import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -2187,6 +2188,23 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         if not isinstance(root, str) or not isinstance(provenance, dict):
             raise RuntimeError("MTP activation store was not configured")
         from ...looper.input_cache import DiskBackedLayerOutputWriter
+        from ...utils.exl3_capture_frontier import (
+            CAPTURE_FRONTIER_ENV,
+            EXL3CaptureFrontierStore,
+        )
+
+        capture_root = os.getenv(CAPTURE_FRONTIER_ENV)
+
+        def discard_superseded_capture(_outputs) -> None:
+            if capture_root is None:
+                return
+            family_join = provenance.get("family_join")
+            if not isinstance(family_join, dict):
+                raise RuntimeError("MTP activation provenance has no family join")
+            EXL3CaptureFrontierStore(
+                capture_root,
+                family_join=family_join,
+            ).discard_through(layer_index)
 
         return DiskBackedLayerOutputWriter(
             root,
@@ -2197,6 +2215,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 "block_index": int(layer_index),
                 "replay_contract": "deepseek-v4-mtp-joint-five-row-v1",
             },
+            on_finalize=discard_superseded_capture,
         )
 
     def prepare_input_capture_layer(
