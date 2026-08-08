@@ -780,6 +780,40 @@ def test_rehome_processor_task_rebinds_dict_capture_to_quant_source():
     assert capture.module is quant_source
 
 
+def test_quant_prepare_materializes_meta_source_when_capture_skips_forward():
+    named = NamedModule(
+        torch.nn.Linear(4, 4, bias=False, device="meta"),
+        name="mlp.experts.0.gate_proj",
+        full_name="model.layers.0.mlp.experts.0.gate_proj",
+        layer_index=0,
+    )
+    dense_source = torch.nn.Linear(4, 4, bias=False)
+    calls = []
+
+    class DummyQModel:
+        def shell_module_materialize(self, **kwargs):
+            calls.append(kwargs)
+            named.state["quant_source_module"] = dense_source
+            return dense_source
+
+    looper = object.__new__(ModuleLooper)
+    looper.gptq_model = DummyQModel()
+    looper._assign_quant_device_for_module = lambda *_, **__: torch.device("cpu")
+    processor = types.SimpleNamespace(tasks={})
+
+    target = looper._prepare_named_module_for_quantization(
+        processor=processor,
+        named_module=named,
+        fallback_device=torch.device("cpu"),
+    )
+
+    assert target == torch.device("cpu")
+    assert named.module is dense_source
+    assert dense_source.weight.device.type == "cpu"
+    assert calls[0]["role"] == "quant_source"
+    assert calls[0]["named_module"] is named
+
+
 def test_stage_inputs_capture_collects_real_inputs():
     gptq_model = _TinyGptqModel()
     looper = _TinyLooper(gptq_model)

@@ -1187,7 +1187,12 @@ class ModuleLooper():
             fallback_device=fallback_device,
         )
 
-        if isinstance(named_module.state.get("quant_source_module"), torch.nn.Module):
+        quant_source = named_module.state.get("quant_source_module")
+        if isinstance(quant_source, torch.nn.Module) or get_device(named_module.module) == META:
+            # A durable capture frontier can skip the subset forward entirely.
+            # In that path the lazy packed shell has not yet passed through
+            # forward-role decoder materialization, so build its dense
+            # quantization source here before attempting any device move.
             prepared = self.gptq_model.shell_module_materialize(
                 target_submodule=named_module.module,
                 device=target_device,
