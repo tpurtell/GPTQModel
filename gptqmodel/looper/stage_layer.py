@@ -64,7 +64,13 @@ def _should_drain_finalize_futures_synchronously(
     practice, the overlap is not worth the allocator pressure risk, so
     multi-device runs drain per-layer finalizers synchronously.
     """
-    if looper.gptq_model.quantize_config.wait_for_submodule_finalizers:
+    if (
+        looper.gptq_model.quantize_config.wait_for_submodule_finalizers
+        or getattr(
+            looper.gptq_model, "quantization_layer_boundary_checkpoint", None
+        )
+        is not None
+    ):
         return True
 
     quant_devices = getattr(looper, "_quant_devices", None) or []
@@ -361,6 +367,7 @@ def run_layer_stage(
     layer_count: int,
     region_timer,
     finalize_progress_cls,
+    start_layer_index: int = 0,
     logger=None,
 ) -> None:
     """Execute the main per-layer quantization loop."""
@@ -383,6 +390,14 @@ def run_layer_stage(
         if looper._check_loop_stop():
             break
         is_lm_head_module = layer_index >= layer_count
+
+        if not is_lm_head_module and layer_index < start_layer_index:
+            if durable_progress_logs:
+                log.info(
+                    "StageLayer: restored layer=%s from durable boundary index",
+                    layer_index,
+                )
+            continue
 
         if (
             not is_lm_head_module
@@ -487,7 +502,7 @@ def run_layer_stage(
             output_requirement = getattr(
                 looper.gptq_model, "quantization_layer_output_required", None
             )
-            output_required = (
+            model_output_required = (
                 not is_lm_head_module
                 and p_index == len(looper.processors) - 1
                 and callable(output_requirement)
@@ -497,6 +512,17 @@ def run_layer_stage(
                     layer_count=layer_count,
                 )
             )
+            layer_boundary_checkpoint = getattr(
+                looper.gptq_model,
+                "quantization_layer_boundary_checkpoint",
+                None,
+            )
+            boundary_output_required = (
+                not is_lm_head_module
+                and p_index == len(looper.processors) - 1
+                and layer_boundary_checkpoint is not None
+            )
+            output_required = model_output_required or boundary_output_required
 
             processed_subset: Dict[str, NamedModule] = {}
             last_subset_plan: Optional[SubsetPlan] = None
@@ -667,7 +693,7 @@ def run_layer_stage(
                     replay_plan=replay_plan,
                 )
 
-            if output_required:
+            if model_output_required:
                 if not layer_outputs:
                     raise RuntimeError(
                         "model-specific quantization layer output consumer received "
@@ -967,6 +993,22 @@ def run_layer_stage(
                             "StageLayer: layer=%s complete (no finalize tasks)",
                             layer_index if not is_lm_head_module else "lm_head",
                         )
+
+                if layer_boundary_checkpoint is not None and not is_lm_head_module:
+                    commit_boundary = getattr(
+                        layer_boundary_checkpoint, "commit_layer", None
+                    )
+                    if not callable(commit_boundary):
+                        raise TypeError(
+                            "quantization layer-boundary checkpoint has no "
+                            "commit_layer() method"
+                        )
+                    commit_boundary(
+                        model=looper.gptq_model,
+                        processor=processor,
+                        layer_index=layer_index,
+                        layer_name=layer_descriptor,
+                    )
 
         if durable_progress_logs:
             log.info(

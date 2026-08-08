@@ -1612,6 +1612,29 @@ class ModuleLooper():
 
         shared_kv_cache_dict = {}
 
+        layer_boundary_checkpoint = getattr(
+            self.gptq_model, "quantization_layer_boundary_checkpoint", None
+        )
+        start_layer_index = 0
+        if layer_boundary_checkpoint is not None:
+            restore_boundary = getattr(layer_boundary_checkpoint, "restore", None)
+            if not callable(restore_boundary):
+                raise TypeError(
+                    "quantization layer-boundary checkpoint has no restore() method"
+                )
+            start_layer_index = restore_boundary(
+                model=self.gptq_model,
+                processors=self.processors,
+            )
+            if (
+                isinstance(start_layer_index, bool)
+                or not isinstance(start_layer_index, int)
+                or not 0 <= start_layer_index <= layer_count
+            ):
+                raise ValueError(
+                    "quantization layer-boundary restore returned an invalid layer"
+                )
+
         if self.gptq_model.quantize_config.lm_head:
             lm_head_module = get_module(self.gptq_model.model, key=self.gptq_model.lm_head)
             if lm_head_module and isinstance(lm_head_module, torch.nn.Linear):
@@ -1634,6 +1657,7 @@ class ModuleLooper():
             layer_count=layer_count,
             region_timer=region_timer,
             finalize_progress_cls=FinalizeProgressInfo,
+            start_layer_index=start_layer_index,
             logger=log,
         )
 

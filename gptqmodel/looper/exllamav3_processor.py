@@ -76,6 +76,7 @@ from ..utils.exl3_remote import (
 from ..utils.exllamav3 import create_exllamav3_module
 from ..utils.logger import setup_logger
 from ..utils.module_locks import parent_module_lock
+from ..utils.offload import offload_to_disk
 
 setup_logger()
 
@@ -1136,6 +1137,193 @@ class EXL3Processor(LoopProcessor):
         module.unregister_parameter("weight")
         if getattr(module, "bias", None) is not None:
             module.unregister_parameter("bias")
+
+    def completed_layer_checkpoint_entries(
+        self, layer_index: int
+    ) -> list[dict[str, str]]:
+        """Return the packed/error identities committed for one decoder layer."""
+
+        entries: dict[str, dict[str, str]] = {}
+        with self._stats_lock:
+            log_snapshot = list(self.log)
+        for stat in log_snapshot:
+            if stat.get(PROCESS_LOG_LAYER) != layer_index:
+                continue
+            record = stat.get("exl3_error_ledger_record")
+            request_sha256 = stat.get("exl3_projection_checkpoint")
+            record_sha256 = stat.get("exl3_error_record_sha256")
+            module_name = record.get("module") if isinstance(record, dict) else None
+            if not all(
+                isinstance(value, str) and value
+                for value in (module_name, request_sha256, record_sha256)
+            ):
+                raise RuntimeError(
+                    f"EXL3 layer {layer_index} has an uncommitted projection result"
+                )
+            entry = {
+                "module": module_name,
+                "request_sha256": request_sha256,
+                "record_sha256": record_sha256,
+            }
+            previous = entries.setdefault(module_name, entry)
+            if previous != entry:
+                raise RuntimeError(
+                    f"EXL3 layer {layer_index} has conflicting projection identities"
+                )
+        return [entries[name] for name in sorted(entries)]
+
+    def restore_completed_layer_checkpoints(
+        self,
+        *,
+        model: BaseQModel,
+        layer_index: int,
+        projection_entries: list[dict[str, str]],
+    ) -> None:
+        """Install packed modules directly, without Hessian/corpus reconstruction."""
+
+        ledger_provenance = self._ledger_provenance()
+        checkpoint_root = checkpoint_root_from_provenance(ledger_provenance)
+        if checkpoint_root is None:
+            raise RuntimeError("EXL3 layer restore requires projection checkpoints")
+        checkpoint_store = EXL3ProjectionCheckpointStore(checkpoint_root)
+        family_join = (
+            ledger_provenance.get("family_join")
+            if isinstance(ledger_provenance, dict)
+            else None
+        )
+        offload_path = getattr(self.qcfg, "offload_to_disk_path", None)
+        if not getattr(self.qcfg, "offload_to_disk", False) or not offload_path:
+            raise RuntimeError("EXL3 layer restore requires durable disk offload")
+
+        restored_stats: list[dict[str, Any]] = []
+        seen_modules: set[str] = set()
+        for entry in sorted(projection_entries, key=lambda item: item.get("module", "")):
+            module_name = entry.get("module")
+            request_sha256 = entry.get("request_sha256")
+            expected_record_sha256 = entry.get("record_sha256")
+            if (
+                not isinstance(module_name, str)
+                or module_name in seen_modules
+                or not isinstance(request_sha256, str)
+                or not isinstance(expected_record_sha256, str)
+            ):
+                raise RuntimeError(
+                    f"EXL3 layer {layer_index} restore index is malformed"
+                )
+            loaded = checkpoint_store.load_committed(request_sha256)
+            if loaded is None:
+                raise RuntimeError(
+                    f"EXL3 packed checkpoint disappeared for `{module_name}`"
+                )
+            request, tensors, result = loaded
+            ledger_record = result.get("ledger_record")
+            actual_record_sha256 = (
+                append_exl3_error_journal(self.error_journal_path, ledger_record)
+                if isinstance(ledger_record, dict)
+                else None
+            )
+            if (
+                request.get("module") != module_name
+                or request.get("processor_layer_index") != layer_index
+                or request.get("family_join") != family_join
+                or actual_record_sha256 != expected_record_sha256
+                or ledger_record.get("module") != module_name
+                or ledger_record.get("processor_layer_index") != layer_index
+            ):
+                raise RuntimeError(
+                    f"EXL3 packed checkpoint identity differs for `{module_name}`"
+                )
+            try:
+                source_module = model.model.get_submodule(module_name)
+            except AttributeError as error:
+                raise RuntimeError(
+                    f"EXL3 restore target is absent: `{module_name}`"
+                ) from error
+            if isinstance(source_module, ExllamaV3Linear):
+                raise RuntimeError(f"EXL3 restore target is already packed: `{module_name}`")
+            bias = getattr(source_module, "bias", None)
+            if bias is not None:
+                if getattr(bias, "is_meta", False):
+                    raise RuntimeError(
+                        f"EXL3 restore cannot recover META bias for `{module_name}`"
+                    )
+                tensors = {**tensors, "bias": bias.detach().to(device="cpu")}
+            relative_name = module_name.removeprefix(
+                f"model.layers.{layer_index}."
+            )
+            named = NamedModule(
+                source_module,
+                name=relative_name,
+                full_name=module_name,
+                layer_index=layer_index,
+            )
+            packed = create_exllamav3_module(
+                module_root=model.model,
+                name=module_name,
+                submodule=named,
+                tensors=tensors,
+            )
+            offload_to_disk(
+                model=model.model,
+                module=packed,
+                disk_path=offload_path,
+            )
+
+            duration = result.get("duration_seconds")
+            proxy_error = result.get("proxy_error")
+            quantizer_metrics = result.get("quantizer_metrics")
+            if (
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not isinstance(quantizer_metrics, dict)
+            ):
+                raise RuntimeError(
+                    f"EXL3 packed checkpoint result is malformed for `{module_name}`"
+                )
+            restored_stats.append(
+                {
+                    PROCESS_LOG_NAME: self.name(),
+                    PROCESS_LOG_LAYER: layer_index,
+                    PROCESS_LOG_MODULE: relative_name,
+                    MODULE_FEATURE_COLUMN: self.module_feature_summary(named),
+                    DTYPE_SIZE_COLUMN: self.module_dtype_size_summary(named),
+                    QUANT_LOG_LOSS: (
+                        f"{proxy_error:.10f}"
+                        if isinstance(proxy_error, (int, float))
+                        else str(proxy_error)
+                    ),
+                    QUANT_LOG_NSAMPLES: str(request.get("sample_count")),
+                    QUANT_LOG_DAMP: f"{_EXL3_SIGMA_REG:.5f}",
+                    PROCESS_LOG_TIME: f"{float(duration):.3f}",
+                    PROCESS_LOG_FWD_TIME: "0.000",
+                    PROCESS_USED_MEMORY: "restored",
+                    QUANT_LOG_LOSS_KIND: quantizer_metrics.get(
+                        "reported_metric_kind", "unknown"
+                    ),
+                    "exl3_error_ledger_record": ledger_record,
+                    "exl3_error_journal": self.error_journal_path,
+                    "exl3_error_record_sha256": actual_record_sha256,
+                    "exl3_projection_checkpoint": request_sha256,
+                    "exl3_projection_checkpoint_hit": True,
+                    "exl3_execution_contract": result.get("execution_contract"),
+                    "exl3_execution_result": result.get("execution_result"),
+                    "exl3_layer_boundary_restore": True,
+                }
+            )
+            seen_modules.add(module_name)
+
+        with self._stats_lock:
+            for stat in restored_stats:
+                self.log.append(stat)
+                self.module_names.append(
+                    f"layer-{layer_index}-{stat[PROCESS_LOG_MODULE]}"
+                )
+                proxy_error = stat[QUANT_LOG_LOSS]
+                try:
+                    self.avg_losses.append(float(proxy_error))
+                except (TypeError, ValueError):
+                    pass
+                self.durations.append(float(stat[PROCESS_LOG_TIME]))
 
     def finalize(self, model: BaseQModel, **kwargs):
         """Marks the model as EXL3-quantized and runs shared finalization logic."""

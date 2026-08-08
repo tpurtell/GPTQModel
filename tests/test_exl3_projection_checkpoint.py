@@ -80,7 +80,39 @@ def test_projection_checkpoint_round_trips_and_is_idempotent(tmp_path) -> None:
     assert all(
         torch.equal(loaded_tensors[name], tensor) for name, tensor in tensors.items()
     )
+    stored_request, committed_tensors, committed_result = store.load_committed(
+        request["request_sha256"]
+    )
+    assert stored_request == request
+    assert committed_result == result
+    assert all(
+        torch.equal(committed_tensors[name], tensor)
+        for name, tensor in tensors.items()
+    )
     assert store.load(_request(scale=2.0)) is None
+
+
+def test_projection_checkpoint_load_committed_rejects_stored_request_tampering(
+    tmp_path,
+) -> None:
+    store = EXL3ProjectionCheckpointStore(tmp_path / "checkpoints")
+    request = _request()
+    store.commit(request, _tensors(), _result())
+    manifest_path = next(store.root.rglob("*.json"))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["request"]["sample_count"] += 1
+    body = {
+        key: value for key, value in manifest.items() if key != "manifest_sha256"
+    }
+    from gptqmodel.utils.exl3_projection_checkpoint import (
+        canonical_json_bytes,
+        sha256_bytes,
+    )
+
+    manifest["manifest_sha256"] = sha256_bytes(canonical_json_bytes(body))
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="content validation"):
+        store.load_committed(request["request_sha256"])
 
 
 def test_projection_checkpoint_rejects_corrupt_payload_and_manifest(tmp_path) -> None:

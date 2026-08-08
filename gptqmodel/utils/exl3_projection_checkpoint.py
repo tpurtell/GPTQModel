@@ -182,11 +182,20 @@ class EXL3ProjectionCheckpointStore:
             prefix / f"{request_sha256}.safetensors",
         )
 
-    def load(
+    def load_committed(
         self,
-        request: dict[str, Any],
-    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
-        request_sha256 = request.get("request_sha256")
+        request_sha256: str,
+    ) -> tuple[dict[str, Any], dict[str, torch.Tensor], dict[str, Any]] | None:
+        """Load one self-authenticating checkpoint without rebuilding its Hessian.
+
+        A completed layer-boundary checkpoint records the request digest for
+        every projection in that layer.  Resuming from that boundary must be
+        able to restore the packed modules without replaying the calibration
+        corpus merely to recreate the request object.  The stored request is
+        still fully validated here, including its own digest, before any tensor
+        is returned.
+        """
+
         manifest_path, tensor_path = self._paths(str(request_sha256))
         if not manifest_path.exists():
             return None
@@ -203,14 +212,30 @@ class EXL3ProjectionCheckpointStore:
             raise ValueError("cannot read EXL3 projection checkpoint") from error
         if not isinstance(manifest, dict):
             raise ValueError("EXL3 projection checkpoint manifest is not an object")
-        manifest_digest = manifest.pop("manifest_sha256", None)
+        manifest_digest = manifest.get("manifest_sha256")
+        manifest_body = {
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        }
+        stored_request = manifest.get("request")
+        stored_request_body = (
+            {
+                key: value
+                for key, value in stored_request.items()
+                if key != "request_sha256"
+            }
+            if isinstance(stored_request, dict)
+            else None
+        )
         if (
             manifest.get("schema") != CHECKPOINT_SCHEMA
             or manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
-            or manifest.get("request") != request
             or manifest.get("request_sha256") != request_sha256
+            or not isinstance(stored_request, dict)
+            or stored_request.get("request_sha256") != request_sha256
+            or sha256_bytes(canonical_json_bytes(stored_request_body))
+            != request_sha256
             or manifest.get("tensor_file") != tensor_path.name
-            or manifest_digest != sha256_bytes(canonical_json_bytes(manifest))
+            or manifest_digest != sha256_bytes(canonical_json_bytes(manifest_body))
             or manifest.get("tensor_sha256") != sha256_file(tensor_path)
         ):
             raise ValueError("EXL3 projection checkpoint failed content validation")
@@ -232,6 +257,19 @@ class EXL3ProjectionCheckpointStore:
         result = manifest.get("result")
         if not isinstance(result, dict):
             raise ValueError("EXL3 projection checkpoint result is malformed")
+        return stored_request, tensors, result
+
+    def load(
+        self,
+        request: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
+        request_sha256 = request.get("request_sha256")
+        loaded = self.load_committed(str(request_sha256))
+        if loaded is None:
+            return None
+        stored_request, tensors, result = loaded
+        if stored_request != request:
+            raise ValueError("EXL3 projection checkpoint request is inconsistent")
         return tensors, result
 
     def commit(

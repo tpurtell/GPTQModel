@@ -12,7 +12,13 @@ from torch import nn
 import gptqmodel.looper.exllamav3_processor as processor_module
 from gptqmodel.looper.exllamav3_processor import EXL3Processor
 from gptqmodel.looper.named_module import NamedModule
-from gptqmodel.utils.exl3_projection_checkpoint import CHECKPOINT_CONTRACT
+from gptqmodel.nn_modules.exllamav3 import ExllamaV3Linear
+from gptqmodel.utils.exl3_error_ledger import append_exl3_error_journal
+from gptqmodel.utils.exl3_projection_checkpoint import (
+    CHECKPOINT_CONTRACT,
+    EXL3ProjectionCheckpointStore,
+    build_projection_request,
+)
 
 
 class _Capture:
@@ -127,3 +133,115 @@ def test_process_resumes_from_packed_checkpoint_without_requantizing(
         second_module.module.weight.detach().cpu().view(torch.int16),
         first_replay_weight.view(torch.int16),
     )
+
+
+def test_restore_completed_layer_installs_packed_modules_without_hessian(
+    tmp_path,
+) -> None:
+    checkpoint_root = tmp_path / "projection-checkpoints"
+    offload_root = tmp_path / "offload"
+    journal = tmp_path / "error-journal.jsonl"
+    family_join = {"source_revision": "test-source", "corpus": "test-corpus"}
+    store = EXL3ProjectionCheckpointStore(checkpoint_root)
+
+    class Expert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(2, 4, bias=False, dtype=torch.bfloat16)
+            self.up_proj = nn.Linear(2, 4, bias=False, dtype=torch.bfloat16)
+            self.down_proj = nn.Linear(4, 2, bias=False, dtype=torch.bfloat16)
+
+    root = nn.Module()
+    root.model = nn.Module()
+    root.model.layers = nn.ModuleList([nn.Module()])
+    root.model.layers[0].mlp = nn.Module()
+    root.model.layers[0].mlp.experts = nn.ModuleList([Expert(), Expert()])
+    model = SimpleNamespace(model=root)
+
+    entries = []
+    for expert in range(2):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            module_name = f"model.layers.0.mlp.experts.{expert}.{projection}"
+            request = build_projection_request(
+                module_full_name=module_name,
+                layer_index=0,
+                input_weight=torch.arange(8, dtype=torch.float32).reshape(4, 2),
+                hessian=torch.eye(4, dtype=torch.float32),
+                sample_count=32,
+                quantizer_contract={"bits": 2, "codebook": "mcg"},
+                family_join=family_join,
+                route_evidence=None,
+            )
+            ledger_record = {
+                "schema": "ds4rt.exl3-error-ledger",
+                "schema_version": 1,
+                "record_kind": "projection",
+                "module": module_name,
+                "processor_layer_index": 0,
+                "provenance": {"family_join": family_join},
+            }
+            record_sha256 = append_exl3_error_journal(journal, ledger_record)
+            store.commit(
+                request,
+                {
+                    "trellis": torch.arange(4096, dtype=torch.int16).reshape(1, 1, 4096),
+                    "suh": torch.ones(4, dtype=torch.float16),
+                    "svh": torch.ones(4, dtype=torch.float16),
+                    "mcg": torch.tensor([123], dtype=torch.int32),
+                },
+                {
+                    "duration_seconds": 1.0,
+                    "proxy_error": 0.1,
+                    "device_names": ["cuda:0"],
+                    "quantizer_metrics": {"reported_metric_kind": "test"},
+                    "ledger_record": ledger_record,
+                    "execution_contract": None,
+                    "execution_result": {"kind": "test"},
+                },
+            )
+            entries.append(
+                {
+                    "module": module_name,
+                    "request_sha256": request["request_sha256"],
+                    "record_sha256": record_sha256,
+                }
+            )
+
+    processor = EXL3Processor.__new__(EXL3Processor)
+    processor.qcfg = SimpleNamespace(
+        meta={
+            "ds4rt_error_ledger": {
+                "family_join": family_join,
+                "run": {
+                    "projection_checkpoint": {
+                        "contract": CHECKPOINT_CONTRACT,
+                        "root": str(checkpoint_root),
+                    }
+                },
+            }
+        },
+        offload_to_disk=True,
+        offload_to_disk_path=str(offload_root),
+    )
+    processor.error_journal_path = str(journal)
+    processor._stats_lock = threading.Lock()
+    processor.durations = []
+    processor.avg_losses = []
+    processor.module_names = []
+    processor.log = []
+
+    processor.restore_completed_layer_checkpoints(
+        model=model,
+        layer_index=0,
+        projection_entries=entries,
+    )
+
+    restored = [
+        root.get_submodule(entry["module"])
+        for entry in entries
+    ]
+    assert all(isinstance(module, ExllamaV3Linear) for module in restored)
+    assert all(hasattr(module, "_hf_hook") for module in restored)
+    assert len(processor.log) == 6
+    assert all(stat["exl3_layer_boundary_restore"] for stat in processor.log)
+    assert len(list(offload_root.rglob("module.safetensors"))) == 6

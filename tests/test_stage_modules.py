@@ -379,6 +379,25 @@ def test_stage_layer_keeps_async_finalizers_for_non_paroquant_when_unset():
     ) is False
 
 
+def test_stage_layer_forces_sync_finalizers_for_durable_boundary():
+    looper = types.SimpleNamespace(
+        gptq_model=types.SimpleNamespace(
+            quantize_config=QuantizeConfig(
+                bits=4,
+                group_size=128,
+                wait_for_submodule_finalizers=False,
+            ),
+            quantization_layer_boundary_checkpoint=object(),
+        ),
+        _quant_devices=[torch.device("cuda:0")],
+    )
+
+    assert _should_drain_finalize_futures_synchronously(
+        looper,
+        finalize_tasks=[(types.SimpleNamespace(), None, None, None, None)],
+    ) is True
+
+
 def test_stage_layer_forces_sync_finalizers_for_multi_device_generic_processor():
     looper = types.SimpleNamespace(
         gptq_model=types.SimpleNamespace(
