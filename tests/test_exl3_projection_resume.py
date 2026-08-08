@@ -8,12 +8,14 @@ import threading
 import pytest
 import torch
 from torch import nn
+from safetensors.torch import save_file as save_safetensors_file
 
 import gptqmodel.looper.exllamav3_processor as processor_module
 from gptqmodel.looper.exllamav3_processor import EXL3Processor
 from gptqmodel.looper.named_module import NamedModule
 from gptqmodel.nn_modules.exllamav3 import ExllamaV3Linear
 from gptqmodel.utils.exl3_error_ledger import append_exl3_error_journal
+from gptqmodel.utils.exl3_capture_frontier import EXL3CaptureRecord
 from gptqmodel.utils.exl3_projection_checkpoint import (
     CHECKPOINT_CONTRACT,
     EXL3ProjectionCheckpointStore,
@@ -26,12 +28,18 @@ class _Capture:
         self.module = module
         self.H = hessian
         self.nsamples = 1024
+        self._device_hessian_partials = {}
+        self._device_sample_counts = {}
+        self._hessian_dirty = False
+        self._final_hessian_device_hint = None
+        self.clone_devices = []
 
     def finalize_hessian(self, target_device=None):
         self.H = self.H.to(target_device)
         return self.H
 
     def clone_module(self, copy=True, device=None):
+        self.clone_devices.append(torch.device(device))
         return self.module.module.weight.detach().to(device=device, copy=copy).float()
 
     def free(self):
@@ -121,6 +129,28 @@ def test_process_resumes_from_packed_checkpoint_without_requantizing(
         weight,
         hessian,
     )
+    frontier_root = tmp_path / "capture-frontier"
+    frontier_root.mkdir()
+    frontier_payload = frontier_root / "expert-31-gate.safetensors"
+    save_safetensors_file({"H": hessian.cpu()}, frontier_payload)
+    second_capture = second_processor.tasks[second_module.name]["capture"]
+    second_capture.H = None
+    second_processor.tasks[second_module.name]["capture_frontier_record"] = (
+        EXL3CaptureRecord(
+            module=second_module.full_name,
+            path=frontier_payload,
+            payload={
+                "tensor": {
+                    "dtype": "torch.float32",
+                    "shape": [128, 128],
+                    "bytes": 128 * 128 * 4,
+                }
+            },
+            sample_count=1024,
+            route_evidence=None,
+        )
+    )
+    monkeypatch.setenv("GPTQMODEL_EXL3_CAPTURE_FRONTIER", str(frontier_root))
 
     def fail_requantization(*args, **kwargs):
         raise AssertionError("checkpoint hit attempted to run trellis quantization")
@@ -128,6 +158,7 @@ def test_process_resumes_from_packed_checkpoint_without_requantizing(
     monkeypatch.setattr(processor_module, "quantize_exl3", fail_requantization)
     second_processor.process(second_module)
     second_module.stream_sync()
+    assert second_capture.clone_devices == [torch.device("cpu")]
     assert second_processor.log[-1]["exl3_projection_checkpoint_hit"] is True
     assert torch.equal(
         second_module.module.weight.detach().cpu().view(torch.int16),

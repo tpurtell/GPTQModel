@@ -673,10 +673,11 @@ class EXL3Processor(LoopProcessor):
             capture, "_device_hessian_partials", {}
         ):
             raise RuntimeError("EXL3 refused to mix lazy and live capture state")
-        # Load through an owned host tensor. Direct concurrent safetensors
-        # hydration onto CUDA exposed storage/lifetime corruption under the
-        # real six-slot resume workload even though the persisted CPU payload
-        # remained hash-valid and positive semidefinite.
+        # Keep durable frontier payloads in owned host storage. Checkpoint
+        # lookup and Spark transport consume CPU tensors directly; only a
+        # coordinator miss should ever create a CUDA copy. Besides bounding
+        # VRAM, this prevents queued distributed jobs from leaving mutable
+        # Hessians resident beside an active local EXL3 kernel.
         host_hessian = store.load_record_hessian(record, device="cpu")
         hessian = host_hessian.to(
             device=target_device,
@@ -1076,22 +1077,20 @@ class EXL3Processor(LoopProcessor):
         if target_device.type != "cuda":
             raise ValueError("EXL3 quantization requires CUDA/HIP execution.")
 
+        restored_frontier = task_entry.get("capture_frontier_record") is not None
+        staging_device = (
+            torch.device("cpu") if restored_frontier else target_device
+        )
         self._hydrate_capture_frontier(
             task_entry=task_entry,
             capture=capture,
-            target_device=target_device,
+            target_device=staging_device,
         )
         hessian = prepare_exl3_hessian(
             capture,
-            target_device=target_device,
+            target_device=staging_device,
             module_full_name=module.full_name,
         )
-
-        h_data = {
-            "H": hessian,
-            "count": capture.nsamples,
-            "finalized": False,
-        }
 
         remote_endpoint = None
         execution_contract = None
@@ -1110,7 +1109,7 @@ class EXL3Processor(LoopProcessor):
             projection_provenance = copy.deepcopy(ledger_provenance)
             projection_provenance["execution"] = copy.deepcopy(execution_contract)
         quant_args = self._build_quant_args(module, module_qcfg, target_device)
-        input_weight = self._quant_input_weight(capture, target_device)
+        input_weight = self._quant_input_weight(capture, staging_device)
         checkpoint_store = self._projection_checkpoint_store_for_run(
             ledger_provenance
         )
@@ -1207,6 +1206,26 @@ class EXL3Processor(LoopProcessor):
                     else nullcontext()
                 )
                 with quant_lock:
+                    if hessian.device != target_device:
+                        hessian = hessian.to(
+                            device=target_device,
+                            dtype=torch.float32,
+                            non_blocking=False,
+                            copy=True,
+                        )
+                    if input_weight.device != target_device:
+                        input_weight = input_weight.to(
+                            device=target_device,
+                            dtype=torch.float32,
+                            non_blocking=False,
+                            copy=True,
+                        )
+                    torch.cuda.synchronize(target_device)
+                    h_data = {
+                        "H": hessian,
+                        "count": capture.nsamples,
+                        "finalized": False,
+                    }
                     quant_started = time.perf_counter()
                     try:
                         _weight_q, proxy_err, out_tensors = quantize_exl3(
