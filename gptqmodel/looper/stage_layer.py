@@ -496,6 +496,35 @@ def run_layer_stage(
             if needs_group_pristine:
                 pristine_group_module = copy.deepcopy(module) if needs_pristine_group_clone else None
 
+            if is_catchup_layer:
+                # Restored routed experts are already packed and therefore do
+                # not appear in ``find_modules``.  Every remaining supported
+                # leaf is native source state (attention, router, shared
+                # expert, and so on) and must traverse the active FP8 decoder
+                # before this layer can be replayed.
+                catchup_layer_descriptor = layer_name or str(layer_index)
+                for relative_name, native_module in find_modules(module).items():
+                    full_name = (
+                        f"{catchup_layer_descriptor}.{relative_name}"
+                        if relative_name
+                        else catchup_layer_descriptor
+                    )
+                    named_native = NamedModule(
+                        native_module,
+                        name=relative_name,
+                        full_name=full_name,
+                        layer_index=layer_index,
+                    )
+                    prepared_native = looper._prepare_named_module_for_forward(
+                        named_module=named_native,
+                        fallback_device=normalize_device_like(
+                            looper.gptq_model.quantize_config.device
+                        )
+                        or CPU,
+                    )
+                    if not relative_name and prepared_native is not module:
+                        module = prepared_native
+
             replace_module_with_hooked_legacy(
                 module,
                 quant_lm_head=looper.gptq_model.quantize_config.lm_head,

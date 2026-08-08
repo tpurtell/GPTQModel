@@ -2409,6 +2409,7 @@ def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
             self.gptq_model = DummyGptqModel(self.boundary)
             self.events = []
             self.direct_state_calls = []
+            self.native_prepare_calls = []
 
         def _check_loop_stop(self):
             return False
@@ -2418,6 +2419,10 @@ def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
 
         def _prepare_layer_direct_state_for_forward(self, *args, **kwargs):
             self.direct_state_calls.append((args, kwargs))
+
+        def _prepare_named_module_for_forward(self, **kwargs):
+            self.native_prepare_calls.append(kwargs)
+            return kwargs["named_module"].module
 
     looper = DummyLooper()
     layers = [torch.nn.Linear(1, 1, bias=False)]
@@ -2441,6 +2446,7 @@ def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
     assert replay_calls[0]["force_serial"] is True
     assert not subset_calls
     assert len(looper.direct_state_calls) == 1
+    assert len(looper.native_prepare_calls) == 1
     assert looper.processors[0].inputs_cache.layer_inputs is sentinel_outputs
     assert len(looper.boundary.finalized) == 1
     assert len(looper.boundary.committed) == 1
