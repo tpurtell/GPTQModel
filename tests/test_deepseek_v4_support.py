@@ -608,6 +608,262 @@ def test_deepseek_v4_mtp_quantization_adapter_replays_one_exact_block() -> None:
         assert indices.shape == (2 * 5, config.num_experts_per_tok)
 
 
+class _RecoveryExpert(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(4, 3, bias=False)
+        self.up_proj = nn.Linear(4, 3, bias=False)
+        self.down_proj = nn.Linear(3, 4, bias=False)
+
+
+class _RecoveryRouter(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hidden_dim = 4
+        self.top_k = 6
+        self.weight = nn.Parameter(torch.zeros(13, 4))
+        self.register_buffer(
+            "e_score_correction_bias",
+            torch.arange(13, 0, -1, dtype=torch.float32),
+        )
+        self.score_fn = torch.sigmoid
+
+    def forward(self, hidden_states: torch.Tensor):
+        flat = hidden_states.reshape(-1, self.hidden_dim)
+        logits = F.linear(flat.float(), self.weight.float())
+        scores = self.score_fn(logits)
+        indices = torch.topk(
+            scores + self.e_score_correction_bias,
+            self.top_k,
+            dim=-1,
+            sorted=False,
+        ).indices
+        weights = scores.gather(1, indices)
+        return logits, weights, indices
+
+
+class _RecoveryMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = _RecoveryRouter()
+        self.experts = nn.ModuleList([_RecoveryExpert() for _ in range(13)])
+        self.act_fn = F.silu
+        self.limit = 2.5
+
+
+def _recovery_processor(task_names: tuple[str, ...], natural_count: int):
+    return SimpleNamespace(
+        tasks={
+            task_name: {
+                "route_evidence": {"expert_route_count": natural_count}
+            }
+            for task_name in task_names
+        }
+    )
+
+
+def test_deepseek_v4_recovery_uses_rank_seven_for_declared_expert_only() -> None:
+
+    block = nn.Module()
+    block.mlp = _RecoveryMLP()
+    block._gptqmodel_mtp_block_index = 0
+    shell = nn.Module()
+    shell.mtp = nn.ModuleList([block])
+    adapter = object.__new__(DeepSeekV4MTPQuantizationModel)
+    nn.Module.__init__(adapter)
+    adapter.model = shell
+    subset = {
+        "mlp.experts.6.gate_proj": SimpleNamespace(
+            full_name="mtp.0.mlp.experts.6.gate_proj"
+        ),
+        "mlp.experts.6.up_proj": SimpleNamespace(
+            full_name="mtp.0.mlp.experts.6.up_proj"
+        ),
+    }
+    task_names = tuple(sorted(subset))
+    processor = _recovery_processor(task_names, natural_count=0)
+    calls = []
+    handles = []
+    for expert_index, expert in enumerate(block.mlp.experts):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            handles.append(
+                getattr(expert, projection).register_forward_hook(
+                    lambda _module, _args, _output, key=(expert_index, projection): calls.append(key)
+                )
+            )
+    pause_events = []
+    looper = SimpleNamespace(
+        _set_processor_hooks_paused=lambda _processor, value: pause_events.append(
+            value
+        )
+    )
+    try:
+        with adapter.zero_route_recovery_context(
+            looper=looper,
+            processor=processor,
+            layer_module=block,
+            subset=subset,
+            task_names=task_names,
+        ):
+            ffn_input = torch.randn(1, 1024, 4)
+            block._gptqmodel_mtp_zero_route_force(
+                0,
+                block,
+                ffn_input,
+                torch.zeros(1, 1024, dtype=torch.long),
+            )
+            block.mlp.gate(ffn_input)
+            with block._gptqmodel_mtp_normal_mlp_capture_context():
+                pass
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert calls == [(6, "gate_proj"), (6, "up_proj")]
+    assert pause_events == [True, False]
+    assert {
+        task["zero_route_recovery_capture"]["candidate_rows_selected"]
+        for task in processor.tasks.values()
+    } == {1024}
+    assert {
+        task["zero_route_recovery_capture"]["candidate_rank_histogram"]["7"]
+        for task in processor.tasks.values()
+    } == {1024}
+    assert not hasattr(block, "_gptqmodel_mtp_zero_route_force")
+    assert not hasattr(block, "_gptqmodel_mtp_normal_mlp_capture_context")
+
+
+def test_deepseek_v4_zero_route_down_recovery_uses_native_swiglu_input() -> None:
+    torch.manual_seed(0xD0A4)
+    block = nn.Module()
+    block.mlp = _RecoveryMLP()
+    block.mlp.act_fn = torch.tanh
+    block.mlp.limit = 0.25
+    block._gptqmodel_mtp_block_index = 0
+    shell = nn.Module()
+    shell.mtp = nn.ModuleList([block])
+    adapter = object.__new__(DeepSeekV4MTPQuantizationModel)
+    nn.Module.__init__(adapter)
+    adapter.model = shell
+    subset = {
+        "mlp.experts.6.down_proj": SimpleNamespace(
+            full_name="mtp.0.mlp.experts.6.down_proj"
+        )
+    }
+    expert_input = torch.randn(2, 5, 4)
+    expert = block.mlp.experts[6]
+    expected = torch.tanh(
+        expert.gate_proj(expert_input.reshape(-1, 4)).clamp(max=0.25)
+    ) * expert.up_proj(expert_input.reshape(-1, 4)).clamp(
+        min=-0.25, max=0.25
+    )
+    observed = []
+    handle = expert.down_proj.register_forward_pre_hook(
+        lambda _module, args: observed.append(args[0].detach().clone())
+    )
+    looper = SimpleNamespace(
+        _set_processor_hooks_paused=lambda _processor, _value: None
+    )
+    task_names = ("mlp.experts.6.down_proj",)
+    processor = _recovery_processor(task_names, natural_count=1014)
+    try:
+        with adapter.zero_route_recovery_context(
+            looper=looper,
+            processor=processor,
+            layer_module=block,
+            subset=subset,
+            task_names=task_names,
+        ):
+            block._gptqmodel_mtp_zero_route_force(
+                0,
+                block,
+                expert_input,
+                torch.zeros(2, 5, dtype=torch.long),
+            )
+            block.mlp.gate(expert_input)
+    finally:
+        handle.remove()
+
+    assert len(observed) == 1
+    torch.testing.assert_close(observed[0], expected)
+
+
+def test_deepseek_v4_true_zero_without_near_rows_uses_identity_hessian() -> None:
+    block = nn.Module()
+    block.mlp = _RecoveryMLP()
+    block._gptqmodel_mtp_block_index = 0
+    shell = nn.Module()
+    shell.mtp = nn.ModuleList([block])
+    adapter = object.__new__(DeepSeekV4MTPQuantizationModel)
+    nn.Module.__init__(adapter)
+    adapter.model = shell
+    subset = {
+        f"mlp.experts.12.{projection}": SimpleNamespace(
+            full_name=f"mtp.0.mlp.experts.12.{projection}"
+        )
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+    task_names = tuple(sorted(subset))
+    columns = {"gate_proj": 4, "up_proj": 4, "down_proj": 3}
+    processor = SimpleNamespace(tasks={})
+    for task_name in task_names:
+        projection = task_name.rsplit(".", 1)[-1]
+        processor.tasks[task_name] = {
+            "route_evidence": {"expert_route_count": 0},
+            "capture": SimpleNamespace(
+                columns=columns[projection],
+                nsamples=0,
+                H=None,
+                _device_hessian_partials={},
+                _device_sample_counts={},
+                _hessian_dirty=False,
+                _final_hessian_device_hint=None,
+            ),
+        }
+    looper = SimpleNamespace(
+        _set_processor_hooks_paused=lambda _processor, _value: None
+    )
+    ffn_input = torch.randn(1, 1024, 4)
+    with adapter.zero_route_recovery_context(
+        looper=looper,
+        processor=processor,
+        layer_module=block,
+        subset=subset,
+        task_names=task_names,
+    ):
+        block._gptqmodel_mtp_zero_route_force(
+            0,
+            block,
+            ffn_input,
+            torch.zeros(1, 1024, dtype=torch.long),
+        )
+        block.mlp.gate(ffn_input)
+
+    for task_name, task in processor.tasks.items():
+        capture = task["capture"]
+        assert capture.nsamples == 1024
+        torch.testing.assert_close(
+            capture.H,
+            torch.eye(capture.columns, dtype=torch.float32) * 2.0,
+        )
+        assert task["zero_route_recovery_capture"] == {
+            "recovery_mode": "identity-hessian",
+            "router_augmented_sample_count": 0,
+            "identity_calibration_count": 1024,
+            "candidate_rows_observed": 0,
+            "candidate_rows_selected": 0,
+            "candidate_rank_histogram": {
+                "7": 0,
+                "8": 0,
+                "9": 0,
+                "10": 0,
+                "11": 0,
+                "12": 0,
+            },
+            "candidate_score_gap": None,
+        }
+
+
 def test_deepseek_v4_target_anchor_resolver_matches_native_fp32_greedy_head() -> None:
     torch.manual_seed(0xA4C40)
     config = _tiny_v4_config()

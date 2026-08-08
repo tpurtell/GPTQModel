@@ -49,6 +49,7 @@ class EXL3CaptureState:
     hessian: torch.Tensor
     sample_count: int
     route_evidence: dict[str, Any] | None
+    zero_route_recovery: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class EXL3CaptureDescriptor:
     module: str
     sample_count: int
     route_evidence: dict[str, Any] | None
+    zero_route_recovery: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,7 @@ class EXL3CaptureRecord:
     payload: dict[str, Any]
     sample_count: int
     route_evidence: dict[str, Any] | None
+    zero_route_recovery: dict[str, Any] | None = None
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -345,6 +348,9 @@ class EXL3CaptureFrontierStore:
                 payload=deepcopy(payload),
                 sample_count=sample_count,
                 route_evidence=deepcopy(record.get("route_evidence")),
+                zero_route_recovery=deepcopy(
+                    record.get("zero_route_recovery")
+                ),
             )
 
         actual_files: set[str] = set()
@@ -418,6 +424,9 @@ class EXL3CaptureFrontierStore:
                 hessian=hessian,
                 sample_count=record.sample_count,
                 route_evidence=deepcopy(record.route_evidence),
+                zero_route_recovery=deepcopy(
+                    record.zero_route_recovery
+                ),
             )
         return states
 
@@ -436,6 +445,9 @@ class EXL3CaptureFrontierStore:
                 module=module,
                 sample_count=state.sample_count,
                 route_evidence=deepcopy(state.route_evidence),
+                zero_route_recovery=deepcopy(
+                    state.zero_route_recovery
+                ),
             )
             for module, state in state_by_module.items()
         }
@@ -534,6 +546,8 @@ class EXL3CaptureFrontierStore:
                         and candidate_hessian.shape == reference_hessian.shape
                         and candidate.sample_count == reference.sample_count
                         and candidate.route_evidence == reference.route_evidence
+                        and candidate.zero_route_recovery
+                        == reference.zero_route_recovery
                         and torch.equal(candidate_hessian, reference_hessian)
                     )
                     del candidate_hessian
@@ -571,6 +585,9 @@ class EXL3CaptureFrontierStore:
                         "phase": _projection_phase(identity),
                         "sample_count": int(state.sample_count),
                         "route_evidence": deepcopy(state.route_evidence),
+                        "zero_route_recovery": deepcopy(
+                            state.zero_route_recovery
+                        ),
                         "hessian": payload_by_module[module_name],
                     }
                 )

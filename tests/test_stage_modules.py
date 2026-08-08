@@ -701,6 +701,306 @@ def test_subset_pass_restored_capture_skips_forward(monkeypatch):
     assert processor.restored["subset_index"] == 2
 
 
+def test_subset_pass_finishes_zero_route_recovery_before_quant_fanout(monkeypatch):
+    events = []
+
+    class DummyPB:
+        def manual(self):
+            return self
+
+        def set(self, **_kwargs):
+            return self
+
+        def title(self, *_args):
+            return self
+
+        def subtitle(self, *_args):
+            return self
+
+        def draw(self):
+            return self
+
+        def close(self):
+            return self
+
+    class DummyLogger:
+        def pb(self, _iterable):
+            return DummyPB()
+
+        def error(self, *_args, **_kwargs):
+            return None
+
+        def isEnabledFor(self, _level):
+            return False
+
+    class ImmediateFuture:
+        def __init__(self, value):
+            self.value = value
+
+        def result(self):
+            return self.value
+
+    class ImmediatePool:
+        def submit(self, _device, callback, *args):
+            events.append("submit")
+            return ImmediateFuture(callback(*args))
+
+    class RecoveryContext:
+        def __enter__(self):
+            events.append("recovery_enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+            events.append("recovery_exit")
+
+    projection = NamedModule(
+        torch.nn.Linear(4, 4, bias=False),
+        name="mlp.experts.65.gate_proj",
+        full_name="mtp.1.mlp.experts.65.gate_proj",
+        layer_index=1,
+    )
+
+    class DummyProcessor:
+        execution_config = ExecutionConfig(
+            require_fwd=True,
+            fwd_replay_after_process=True,
+        )
+        tasks = {projection.name: object()}
+
+        def pre_process_fwd_hook(self, _name):
+            return lambda *_args, **_kwargs: None
+
+        def plan_subset_zero_route_recovery(self, *, subset):
+            assert subset == {projection.name: projection}
+            events.append("census")
+            return (projection.name,)
+
+        def finish_subset_zero_route_recovery(self, *, subset, task_names):
+            assert subset == {projection.name: projection}
+            assert task_names == (projection.name,)
+            events.append("recovery_finish")
+
+        def validate_subset_capture_readiness(self, *, subset):
+            assert subset == {projection.name: projection}
+            events.append("readiness")
+
+        def commit_subset_capture_frontier(self, **_kwargs):
+            events.append("capture_commit")
+
+        def set_fwd_time(self, _value):
+            return None
+
+        def process(self, **_kwargs):
+            events.append("process")
+
+    class DummyQModel:
+        quantize_config = QuantizeConfig(bits=4, group_size=128)
+
+        def zero_route_recovery_context(self, **_kwargs):
+            return RecoveryContext()
+
+    class DummyLooper:
+        gptq_model = DummyQModel()
+
+        def _masked_hook_wrapper(self, _processor, hook, _source):
+            return hook
+
+        def _masked_pre_hook_wrapper(self, _processor, hook, _source):
+            return hook
+
+        def _prepare_layer_direct_state_for_forward(self, *_args, **_kwargs):
+            events.append("forward_prepare")
+
+        def _prepare_named_module_for_forward(self, **_kwargs):
+            return None
+
+        def _run_forward_batches(self, **kwargs):
+            events.append(kwargs["progress_stage"])
+            return None
+
+        def _prepare_named_module_for_quantization(self, **_kwargs):
+            events.append("quant_prepare")
+            return torch.device("cpu")
+
+    monkeypatch.setattr(stage_subset_module, "DEVICE_THREAD_POOL", ImmediatePool())
+    monkeypatch.setattr(stage_subset_module, "torch_sync", lambda: None)
+    monkeypatch.setattr(
+        stage_subset_module,
+        "_emit_moe_parallel_quant_subset_telemetry",
+        lambda **_kwargs: None,
+    )
+    plan = SubsetPlan(
+        modules={projection.name: projection},
+        subset_index=0,
+        subset_total=1,
+        execute_forward=True,
+        replay_after_process=True,
+        forward_mode="serial",
+        batch_count=1,
+        forward_row_counts=[1],
+        forward_total_rows=1,
+        moe_groups={},
+        forward_device_map={},
+        calibration_coverage_policy=CalibrationCoveragePolicy(
+            validate_input_coverage=False,
+            fallback_enabled=False,
+            prune_uncovered_modules=False,
+            record_dynamic_exclusions=False,
+        ),
+        module_chunks=[{projection.name: projection}],
+    )
+
+    processed, outputs, _ = stage_subset_module._run_single_subset_pass(
+        looper=DummyLooper(),
+        processor=DummyProcessor(),
+        module=torch.nn.Identity(),
+        plan=plan,
+        layer_inputs=[[torch.zeros(1, 1, 4)]],
+        layer_input_kwargs=[{}],
+        position_ids=[],
+        attention_masks=[],
+        cur_layer_device=torch.device("cpu"),
+        is_lm_head_module=False,
+        layer_descriptor="mtp.1",
+        layer_title="MTP 1",
+        layer_index=1,
+        full={projection.name: projection},
+        fallback=None,
+        shared_kv_cache_dict={},
+        pb=None,
+        logger=DummyLogger(),
+        is_awq_processor=False,
+    )
+
+    assert outputs is None
+    assert processed == {projection.name: projection}
+    assert events == [
+        "forward_prepare",
+        "Forward",
+        "census",
+        "recovery_enter",
+        "Zero-route recovery",
+        "recovery_exit",
+        "recovery_finish",
+        "capture_commit",
+        "readiness",
+        "quant_prepare",
+        "submit",
+        "process",
+    ]
+
+
+def test_subset_pass_restored_recovery_frontier_is_validated_before_fanout(
+    monkeypatch,
+):
+    events = []
+    projection = NamedModule(
+        torch.nn.Linear(4, 4, bias=False),
+        name="mlp.experts.65.gate_proj",
+        full_name="mtp.1.mlp.experts.65.gate_proj",
+        layer_index=1,
+    )
+
+    class ImmediateFuture:
+        def __init__(self, value):
+            self.value = value
+
+        def result(self):
+            return self.value
+
+    class ImmediatePool:
+        def submit(self, _device, callback, *args):
+            events.append("submit")
+            return ImmediateFuture(callback(*args))
+
+    class DummyProcessor:
+        execution_config = ExecutionConfig(
+            require_fwd=True,
+            fwd_replay_after_process=True,
+        )
+        tasks = {projection.name: object()}
+
+        def restore_subset_capture_frontier(self, **_kwargs):
+            events.append("restore")
+            return True
+
+        def validate_subset_capture_readiness(self, *, subset):
+            assert subset == {projection.name: projection}
+            events.append("readiness")
+
+        def set_fwd_time(self, _value):
+            return None
+
+        def process(self, **_kwargs):
+            events.append("process")
+
+    class DummyLooper:
+        gptq_model = types.SimpleNamespace(
+            quantize_config=QuantizeConfig(bits=4, group_size=128),
+        )
+
+        def _prepare_layer_direct_state_for_forward(self, *_args, **_kwargs):
+            raise AssertionError("a restored frontier must not replay forward")
+
+        def _prepare_named_module_for_quantization(self, **_kwargs):
+            events.append("quant_prepare")
+            return torch.device("cpu")
+
+    monkeypatch.setattr(stage_subset_module, "DEVICE_THREAD_POOL", ImmediatePool())
+    monkeypatch.setattr(stage_subset_module, "torch_sync", lambda: None)
+    monkeypatch.setattr(
+        stage_subset_module,
+        "_emit_moe_parallel_quant_subset_telemetry",
+        lambda **_kwargs: None,
+    )
+    plan = SubsetPlan(
+        modules={projection.name: projection},
+        subset_index=0,
+        subset_total=1,
+        execute_forward=True,
+        replay_after_process=True,
+        forward_mode="serial",
+        batch_count=1,
+        forward_row_counts=[1],
+        forward_total_rows=1,
+        moe_groups={},
+        forward_device_map={},
+        calibration_coverage_policy=CalibrationCoveragePolicy(
+            validate_input_coverage=False,
+            fallback_enabled=False,
+            prune_uncovered_modules=False,
+            record_dynamic_exclusions=False,
+        ),
+        module_chunks=[{projection.name: projection}],
+    )
+
+    processed, outputs, _ = stage_subset_module._run_single_subset_pass(
+        looper=DummyLooper(),
+        processor=DummyProcessor(),
+        module=torch.nn.Identity(),
+        plan=plan,
+        layer_inputs=[],
+        layer_input_kwargs=[],
+        position_ids=[],
+        attention_masks=[],
+        cur_layer_device=torch.device("cpu"),
+        is_lm_head_module=False,
+        layer_descriptor="mtp.1",
+        layer_title="MTP 1",
+        layer_index=1,
+        full={projection.name: projection},
+        fallback=None,
+        shared_kv_cache_dict={},
+        pb=None,
+        logger=types.SimpleNamespace(),
+        is_awq_processor=False,
+    )
+
+    assert outputs is None
+    assert processed == {projection.name: projection}
+    assert events == ["restore", "readiness", "quant_prepare", "submit", "process"]
+
+
 def test_forward_device_override_materializes_meta_fallback_named_module():
     original = NamedModule(
         torch.nn.Linear(4, 4, bias=False, device="meta"),

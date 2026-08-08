@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 from gptqmodel.utils import exl3_error_ledger as ledger_module
@@ -10,12 +11,26 @@ from gptqmodel.utils.exl3_error_ledger import (
     LEDGER_FILENAME,
     LEDGER_MANIFEST_FILENAME,
     ROUTE_EVIDENCE_SCHEMA,
+    ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
+    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+    ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+    ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+    ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
+    ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA,
+    ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
+    ZERO_ROUTE_RECOVERY_SCHEMA,
+    ZERO_ROUTE_RECOVERY_SELECTION_CAP,
+    ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
+    ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
+    ZERO_ROUTE_RECOVERY_TRIGGER,
     append_exl3_error_journal,
     build_projection_record,
     derive_family_records,
     routed_expert_identity,
     write_exl3_error_ledger,
 )
+from gptqmodel.looper.exllamav3_processor import EXL3Processor
 
 
 def _metrics(scale: float) -> dict:
@@ -92,11 +107,90 @@ def _route_evidence(scale: float = 1.0) -> dict:
     }
 
 
+def _zero_route_evidence() -> dict:
+    evidence = _route_evidence()
+    evidence.update(
+        {
+            "expert_route_count": 0,
+            "expert_gate_weight_sum": 0.0,
+            "expert_gate_squared_mass": 0.0,
+            "expert_route_fraction": 0.0,
+            "expert_gate_weight_mass_fraction": 0.0,
+            "expert_gate_squared_mass_fraction": 0.0,
+            "expert_gate_weight_mean": 0.0,
+            "expert_gate_weight_rms": 0.0,
+        }
+    )
+    return evidence
+
+
+def _zero_route_recovery(
+    family_join: dict,
+    sample_count: int = 1024,
+) -> dict:
+    family_digest = hashlib.sha256(
+        json.dumps(
+            family_join,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return {
+        "schema": ZERO_ROUTE_RECOVERY_SCHEMA,
+        "schema_version": 1,
+        "trigger": ZERO_ROUTE_RECOVERY_TRIGGER,
+        "sample_source": ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
+        "capture_method": ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
+        "selection_policy": ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
+        "candidate_rank_min": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+        "candidate_rank_max": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+        "selection_cap": ZERO_ROUTE_RECOVERY_SELECTION_CAP,
+        "target_sample_count": ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
+        "identity_calibration_policy": ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+        "block_namespace": "base",
+        "logical_layer": 7,
+        "expert": 31,
+        "natural_sample_count": 0,
+        "router_augmented_sample_count": 0,
+        "identity_calibration_count": sample_count,
+        "total_sample_count": sample_count,
+        "forced_pass_count": 1,
+        "recovery_mode": ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+        "candidate_rows_observed": 0,
+        "candidate_rows_selected": 0,
+        "candidate_rank_histogram": {
+            str(rank): 0
+            for rank in range(
+                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX + 1,
+            )
+        },
+        "candidate_score_gap": None,
+        "authorization": {
+            "schema": ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA,
+            "schema_version": 1,
+            "kind": "content-bound-execution-upgrade",
+            "recovery_contract": ZERO_ROUTE_RECOVERY_SCHEMA,
+            "trigger": ZERO_ROUTE_RECOVERY_TRIGGER,
+            "sample_source": ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
+            "capture_method": ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
+            "selection_policy": ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
+            "candidate_rank_min": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+            "candidate_rank_max": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+            "target_sample_count": ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
+            "identity_calibration_policy": ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+            "family_join_sha256": family_digest,
+            "authorization_sha256": "a" * 64,
+        },
+    }
+
+
 def _record(
     projection: str,
     scale: float = 1.0,
     provenance=None,
     route_evidence=None,
+    zero_route_recovery=None,
 ) -> dict:
     return build_projection_record(
         module_full_name=f"model.layers.7.mlp.experts.31.{projection}",
@@ -110,6 +204,7 @@ def _record(
         quantizer_metrics=_metrics(scale),
         provenance=provenance or {"source_revision": "abc", "hessian_sha256": "def"},
         route_evidence=route_evidence,
+        zero_route_recovery=zero_route_recovery,
     )
 
 
@@ -204,6 +299,129 @@ def test_natural_route_evidence_is_required_and_shared_by_one_expert_family():
     )
     with pytest.raises(ValueError, match="inconsistent route evidence"):
         derive_family_records(records)
+
+
+def test_zero_route_recovery_is_explicit_and_cannot_relabel_positive_routes():
+    provenance = {
+        "family_join": {
+            "source_revision": "abc",
+            "route_evidence_contract": ROUTE_EVIDENCE_SCHEMA,
+        }
+    }
+    recovery = _zero_route_recovery(provenance["family_join"])
+    records = [
+        _record(
+            projection,
+            provenance=provenance,
+            route_evidence=_zero_route_evidence(),
+            zero_route_recovery=recovery,
+        )
+        for projection in ("gate_proj", "down_proj", "up_proj")
+    ]
+    family = derive_family_records(records)[0]
+    assert family["route_evidence"]["expert_route_count"] == 0
+    assert family["zero_route_recovery"] == recovery
+    assert family["sample_counts"] == [1024, 1024, 1024]
+
+    with pytest.raises(ValueError, match="natural-route evidence has an invalid"):
+        _record(
+            "gate_proj",
+            provenance=provenance,
+            route_evidence=_zero_route_evidence(),
+        )
+    with pytest.raises(ValueError, match="natural-route evidence has an invalid"):
+        _record(
+            "gate_proj",
+            provenance=provenance,
+            route_evidence=_route_evidence(),
+            zero_route_recovery=recovery,
+        )
+    malformed = {**recovery, "natural_sample_count": 1}
+    with pytest.raises(ValueError, match="identity-Hessian recovery evidence"):
+        _record(
+            "gate_proj",
+            provenance=provenance,
+            route_evidence=_zero_route_evidence(),
+            zero_route_recovery=malformed,
+        )
+
+
+def test_exl3_census_tops_up_undercovered_mtp_before_projection_dispatch():
+    processor = object.__new__(EXL3Processor)
+    provenance = {
+        "family_join": {
+            "route_evidence_contract": ROUTE_EVIDENCE_SCHEMA,
+        }
+    }
+    processor.qcfg = SimpleNamespace(meta={"ds4rt_error_ledger": provenance})
+    subset = {}
+    processor.tasks = {}
+    natural_count = 100
+    mtp_evidence = _route_evidence()
+    mtp_evidence.update(
+        {
+            "block_namespace": "mtp",
+            "logical_layer": 1,
+            "expert_route_count": natural_count,
+            "expert_route_fraction": natural_count
+            / mtp_evidence["router_selected_route_count"],
+            "expert_gate_weight_mean": mtp_evidence["expert_gate_weight_sum"]
+            / natural_count,
+            "expert_gate_weight_rms": (
+                mtp_evidence["expert_gate_squared_mass"] / natural_count
+            )
+            ** 0.5,
+        }
+    )
+    for projection in ("gate_proj", "up_proj"):
+        task_name = f"mlp.experts.31.{projection}"
+        subset[task_name] = SimpleNamespace(
+            full_name=f"mtp.1.mlp.experts.31.{projection}"
+        )
+        processor.tasks[task_name] = {
+            "capture": SimpleNamespace(nsamples=natural_count),
+            "route_evidence": dict(mtp_evidence),
+        }
+
+    with pytest.raises(RuntimeError, match="before projection dispatch"):
+        processor.plan_subset_zero_route_recovery(subset=subset)
+
+    provenance["family_join"]["zero_route_recovery_contract"] = (
+        ZERO_ROUTE_RECOVERY_SCHEMA
+    )
+    targets = processor.plan_subset_zero_route_recovery(subset=subset)
+    assert targets == tuple(sorted(subset))
+    for task in processor.tasks.values():
+        task["capture"].nsamples = ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        task["zero_route_recovery_capture"] = {
+            "recovery_mode": ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
+            "router_augmented_sample_count": 924,
+            "identity_calibration_count": 0,
+            "candidate_rows_observed": 2000,
+            "candidate_rows_selected": 924,
+            "candidate_rank_histogram": {
+                "7": 924,
+                "8": 0,
+                "9": 0,
+                "10": 0,
+                "11": 0,
+                "12": 0,
+            },
+            "candidate_score_gap": {"min": 0.01, "mean": 0.02, "max": 0.03},
+        }
+    processor.finish_subset_zero_route_recovery(
+        subset=subset,
+        task_names=targets,
+    )
+    processor.validate_subset_capture_readiness(subset=subset)
+    assert {
+        task["zero_route_recovery"]["router_augmented_sample_count"]
+        for task in processor.tasks.values()
+    } == {924}
+
+    processor.tasks[targets[0]]["route_evidence"]["expert_route_count"] = 1024
+    with pytest.raises(RuntimeError, match="relabeled as recovery"):
+        processor.validate_subset_capture_readiness(subset=subset)
 
 
 def test_ledger_is_canonical_content_bound_and_contains_family_record(tmp_path):

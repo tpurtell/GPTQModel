@@ -46,12 +46,14 @@ def _mtp_subset():
 
 def _states(hessian: torch.Tensor):
     evidence = {"schema": "test-route", "expert": 7, "count": 32}
+    recovery = {"schema": "test-zero-route-recovery", "count": 32}
     return [
         EXL3CaptureState(
             module=named.full_name,
             hessian=hessian.clone(),
             sample_count=32,
             route_evidence=evidence,
+            zero_route_recovery=recovery,
         )
         for named in _subset().values()
     ]
@@ -83,6 +85,10 @@ def test_capture_frontier_round_trip_deduplicates_gate_up(tmp_path) -> None:
     assert torch.equal(gate.hessian, hessian)
     assert gate.hessian.data_ptr() == up.hessian.data_ptr()
     assert gate.sample_count == up.sample_count == 32
+    assert gate.zero_route_recovery == up.zero_route_recovery == {
+        "schema": "test-zero-route-recovery",
+        "count": 32,
+    }
 
     store.discard_through(2)
     assert list(store.root.iterdir())
@@ -264,6 +270,11 @@ def _processor(subset, *, captured: bool) -> EXL3Processor:
                 32 if captured else 0,
             ),
             "route_evidence": {"expert": 7} if captured else None,
+            "zero_route_recovery": (
+                {"schema": "test-zero-route-recovery", "count": 32}
+                if captured
+                else None
+            ),
         }
     return processor
 
@@ -315,4 +326,8 @@ def test_processor_commits_and_restores_before_replay(tmp_path, monkeypatch) -> 
         assert capture._hessian_dirty is False
         assert "capture_frontier_record" not in task
         assert task["route_evidence"] == {"expert": 7}
+        assert task["zero_route_recovery"] == {
+            "schema": "test-zero-route-recovery",
+            "count": 32,
+        }
     assert load_devices == ["cpu", "cpu"]

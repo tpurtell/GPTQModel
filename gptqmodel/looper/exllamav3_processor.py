@@ -56,10 +56,29 @@ from ..utils.exl3_error_ledger import (
     JOURNAL_ENV,
     ROUTE_EVIDENCE_SCHEMA,
     ROUTE_EVIDENCE_SCHEMA_VERSION,
+    ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
+    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+    ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+    ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+    ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
+    ZERO_ROUTE_RECOVERY_SELECTION_CAP,
+    ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
+    ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
+    ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA,
+    ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION,
+    ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
+    ZERO_ROUTE_RECOVERY_SCHEMA,
+    ZERO_ROUTE_RECOVERY_SCHEMA_VERSION,
+    ZERO_ROUTE_RECOVERY_TRIGGER,
     append_exl3_error_journal,
     build_projection_record,
     route_evidence_required,
     routed_expert_identity,
+    validate_route_evidence,
+    validate_zero_route_recovery,
+    validate_zero_route_recovery_authorization,
+    zero_route_recovery_enabled,
 )
 from ..utils.exl3_capture_frontier import (
     CAPTURE_FRONTIER_ENV,
@@ -570,6 +589,10 @@ class EXL3Processor(LoopProcessor):
             capture._final_hessian_device_hint = None
             task["capture_frontier_record"] = record
             task["route_evidence"] = copy.deepcopy(record.route_evidence)
+            if record.zero_route_recovery is not None:
+                task["zero_route_recovery"] = copy.deepcopy(
+                    record.zero_route_recovery
+                )
 
             identity = routed_expert_identity(full_name)
             if identity is not None and record.route_evidence is not None:
@@ -628,6 +651,9 @@ class EXL3Processor(LoopProcessor):
                     module=full_name,
                     sample_count=int(capture.nsamples),
                     route_evidence=copy.deepcopy(route_evidence),
+                    zero_route_recovery=copy.deepcopy(
+                        task.get("zero_route_recovery")
+                    ),
                 )
             )
         before = self.capture_memory_summary()
@@ -1055,6 +1081,338 @@ class EXL3Processor(LoopProcessor):
                 )
             task["route_evidence"] = evidence
 
+    def plan_subset_zero_route_recovery(
+        self,
+        *,
+        subset: Dict[str, NamedModule],
+    ) -> tuple[str, ...]:
+        """Census natural MTP routes and plan deterministic 1,024-row top-ups."""
+
+        provenance = self._ledger_provenance()
+        if not route_evidence_required(provenance):
+            return ()
+        recovery_tasks: list[str] = []
+        counts_by_expert: dict[int, int] = {}
+        family_ids: set[tuple[str, int]] = set()
+        for task_name in sorted(subset):
+            named_module = subset[task_name]
+            identity = routed_expert_identity(
+                getattr(named_module, "full_name", "")
+            )
+            task = self.tasks.get(task_name)
+            if identity is None or not isinstance(task, dict):
+                continue
+            capture = task.get("capture")
+            route_evidence = task.get("route_evidence")
+            if not isinstance(route_evidence, dict):
+                raise RuntimeError(
+                    f"EXL3 coverage census lacks natural-route evidence for "
+                    f"`{named_module.full_name}`"
+                )
+            natural_count = route_evidence.get("expert_route_count")
+            captured_count = getattr(capture, "nsamples", None)
+            if (
+                isinstance(natural_count, bool)
+                or not isinstance(natural_count, int)
+                or natural_count < 0
+                or isinstance(captured_count, bool)
+                or not isinstance(captured_count, int)
+                or captured_count != natural_count
+            ):
+                raise RuntimeError(
+                    "EXL3 natural capture and router census disagree for "
+                    f"`{named_module.full_name}`: capture={captured_count} "
+                    f"routes={natural_count}"
+                )
+            family_ids.add(
+                (identity["block_namespace"], identity["logical_layer"])
+            )
+            previous = counts_by_expert.setdefault(
+                identity["expert"], natural_count
+            )
+            if previous != natural_count:
+                raise RuntimeError(
+                    "EXL3 projection siblings have inconsistent natural counts "
+                    f"for expert {identity['expert']}"
+                )
+            if (
+                identity["block_namespace"] == "mtp"
+                and natural_count < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+            ):
+                recovery_tasks.append(task_name)
+        if len(family_ids) > 1:
+            raise RuntimeError("EXL3 coverage census crossed routed blocks")
+        if counts_by_expert:
+            values = list(counts_by_expert.values())
+            log.info(
+                "EXL3 natural-route census: family=%s experts=%s min=%s mean=%.3f "
+                "max=%s zero=%s",
+                next(iter(family_ids)),
+                len(values),
+                min(values),
+                sum(values) / len(values),
+                max(values),
+                sum(value == 0 for value in values),
+            )
+        authorization = self._zero_route_recovery_authorization(provenance)
+        if recovery_tasks and authorization is None:
+            missing = [
+                subset[name].full_name for name in recovery_tasks
+            ]
+            raise RuntimeError(
+                "EXL3 natural-route census found under-covered MTP modules before "
+                f"projection dispatch: {missing}"
+            )
+        return tuple(recovery_tasks)
+
+    def _zero_route_recovery_authorization(
+        self,
+        provenance: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Resolve either a plan-native or content-bound continuation authority."""
+
+        provenance = self._ledger_provenance() if provenance is None else provenance
+        family_join = (
+            provenance.get("family_join")
+            if isinstance(provenance, dict)
+            else None
+        )
+        if not isinstance(family_join, dict):
+            return None
+        if zero_route_recovery_enabled(provenance):
+            family_digest = sha256_bytes(canonical_json_bytes(family_join))
+            authorization = {
+                "schema": ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA,
+                "schema_version": ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION,
+                "kind": "immutable-family-join",
+                "recovery_contract": ZERO_ROUTE_RECOVERY_SCHEMA,
+                "trigger": ZERO_ROUTE_RECOVERY_TRIGGER,
+                "sample_source": ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
+                "capture_method": ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
+                "selection_policy": ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
+                "candidate_rank_min": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+                "candidate_rank_max": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+                "target_sample_count": ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
+                "identity_calibration_policy": ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+                "family_join_sha256": family_digest,
+                "authorization_sha256": family_digest,
+            }
+        else:
+            meta = getattr(self.qcfg, "meta", None)
+            authorization = (
+                meta.get("ds4rt_zero_route_recovery")
+                if isinstance(meta, dict)
+                else None
+            )
+            if authorization is None:
+                return None
+        return validate_zero_route_recovery_authorization(
+            authorization,
+            family_join=family_join,
+        )
+
+    def finish_subset_zero_route_recovery(
+        self,
+        *,
+        subset: Dict[str, NamedModule],
+        task_names: tuple[str, ...],
+    ) -> None:
+        """Bind one completed direct-expert top-up to each recovered capture."""
+
+        if not task_names:
+            return
+        provenance = self._ledger_provenance()
+        family_join = (
+            provenance.get("family_join")
+            if isinstance(provenance, dict)
+            else None
+        )
+        authorization = self._zero_route_recovery_authorization(provenance)
+        if not isinstance(family_join, dict) or authorization is None:
+            raise RuntimeError("EXL3 route-coverage top-up lost its authorization")
+        recovered_by_expert: dict[int, tuple[str, int, int]] = {}
+        for task_name in task_names:
+            named_module = subset.get(task_name)
+            task = self.tasks.get(task_name)
+            identity = routed_expert_identity(
+                getattr(named_module, "full_name", "")
+            )
+            if identity is None or not isinstance(task, dict):
+                raise RuntimeError("EXL3 route-coverage top-up lost a target task")
+            route_evidence = task.get("route_evidence")
+            capture = task.get("capture")
+            recovery_capture = task.get("zero_route_recovery_capture")
+            total_count = getattr(capture, "nsamples", None)
+            natural_count = (
+                route_evidence.get("expert_route_count")
+                if isinstance(route_evidence, dict)
+                else None
+            )
+            if (
+                not isinstance(route_evidence, dict)
+                or isinstance(natural_count, bool)
+                or not isinstance(natural_count, int)
+                or not 0
+                <= natural_count
+                < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                or not isinstance(recovery_capture, dict)
+                or isinstance(total_count, bool)
+                or not isinstance(total_count, int)
+                or total_count != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+            ):
+                raise RuntimeError(
+                    "EXL3 under-coverage recovery did not produce a valid "
+                    f"capture for `{named_module.full_name}`"
+                )
+            recovery_mode = recovery_capture.get("recovery_mode")
+            router_augmented_count = recovery_capture.get(
+                "router_augmented_sample_count"
+            )
+            identity_count = recovery_capture.get("identity_calibration_count")
+            if (
+                recovery_mode
+                not in {
+                    ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
+                    ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+                }
+                or isinstance(router_augmented_count, bool)
+                or not isinstance(router_augmented_count, int)
+                or router_augmented_count < 0
+                or isinstance(identity_count, bool)
+                or not isinstance(identity_count, int)
+                or identity_count < 0
+                or natural_count + router_augmented_count + identity_count
+                != total_count
+            ):
+                raise RuntimeError(
+                    "EXL3 under-coverage recovery metadata disagrees with the "
+                    f"capture for `{named_module.full_name}`"
+                )
+            previous = recovered_by_expert.setdefault(
+                identity["expert"],
+                (recovery_mode, router_augmented_count, identity_count),
+            )
+            if previous != (
+                recovery_mode,
+                router_augmented_count,
+                identity_count,
+            ):
+                raise RuntimeError(
+                    "EXL3 route-coverage siblings captured different row counts"
+                )
+            task["zero_route_recovery"] = {
+                "schema": ZERO_ROUTE_RECOVERY_SCHEMA,
+                "schema_version": ZERO_ROUTE_RECOVERY_SCHEMA_VERSION,
+                "trigger": ZERO_ROUTE_RECOVERY_TRIGGER,
+                "sample_source": ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
+                "capture_method": ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
+                "selection_policy": ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
+                "candidate_rank_min": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+                "candidate_rank_max": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+                "selection_cap": ZERO_ROUTE_RECOVERY_SELECTION_CAP,
+                "target_sample_count": ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
+                "identity_calibration_policy": ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+                "block_namespace": identity["block_namespace"],
+                "logical_layer": identity["logical_layer"],
+                "expert": identity["expert"],
+                "natural_sample_count": natural_count,
+                "router_augmented_sample_count": router_augmented_count,
+                "identity_calibration_count": identity_count,
+                "total_sample_count": total_count,
+                "forced_pass_count": 1,
+                "recovery_mode": recovery_mode,
+                "candidate_rows_observed": recovery_capture[
+                    "candidate_rows_observed"
+                ],
+                "candidate_rows_selected": recovery_capture[
+                    "candidate_rows_selected"
+                ],
+                "candidate_rank_histogram": copy.deepcopy(
+                    recovery_capture["candidate_rank_histogram"]
+                ),
+                "candidate_score_gap": copy.deepcopy(
+                    recovery_capture["candidate_score_gap"]
+                ),
+                "authorization": copy.deepcopy(authorization),
+            }
+            task.pop("zero_route_recovery_capture", None)
+        log.info(
+            "EXL3 route-coverage top-up complete: experts=%s modules=%s rows=%s",
+            len(recovered_by_expert),
+            len(task_names),
+            sorted(set(recovered_by_expert.values())),
+        )
+
+    def validate_subset_capture_readiness(
+        self,
+        *,
+        subset: Dict[str, NamedModule],
+    ) -> None:
+        """Fail before fan-out unless every natural or recovered capture is exact."""
+
+        provenance = self._ledger_provenance()
+        if not route_evidence_required(provenance):
+            return
+        family_join = provenance.get("family_join")
+        authorization = self._zero_route_recovery_authorization(provenance)
+        for task_name in sorted(subset):
+            named_module = subset[task_name]
+            identity = routed_expert_identity(
+                getattr(named_module, "full_name", "")
+            )
+            task = self.tasks.get(task_name)
+            if identity is None or not isinstance(task, dict):
+                continue
+            capture = task.get("capture")
+            sample_count = getattr(capture, "nsamples", None)
+            route_evidence = task.get("route_evidence")
+            recovery = task.get("zero_route_recovery")
+            if (
+                isinstance(sample_count, bool)
+                or not isinstance(sample_count, int)
+                or sample_count <= 0
+                or not isinstance(route_evidence, dict)
+            ):
+                raise RuntimeError(
+                    "EXL3 capture readiness failed for "
+                    f"`{named_module.full_name}`"
+                )
+            natural_count = route_evidence.get("expert_route_count")
+            recovery_required = (
+                identity["block_namespace"] == "mtp"
+                and natural_count < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+            )
+            if recovery_required:
+                if not isinstance(recovery, dict):
+                    raise RuntimeError(
+                        "EXL3 under-covered MTP capture lacks recovery evidence for "
+                        f"`{named_module.full_name}`"
+                    )
+                validate_zero_route_recovery(
+                    recovery,
+                    identity=identity,
+                    sample_count=sample_count,
+                    family_join=family_join,
+                    expected_authorization=authorization,
+                )
+                validate_route_evidence(
+                    route_evidence,
+                    identity=identity,
+                    sample_count=natural_count,
+                    allow_zero=natural_count == 0,
+                )
+            else:
+                if recovery is not None:
+                    raise RuntimeError(
+                        "EXL3 sufficient natural capture was relabeled as recovery for "
+                        f"`{named_module.full_name}`"
+                    )
+                validate_route_evidence(
+                    route_evidence,
+                    identity=identity,
+                    sample_count=sample_count,
+                )
+
     def preprocess(self, module: NamedModule, fallback=None, **kwargs):
         """Builds the capture task and effective EXL3 config for one module."""
 
@@ -1347,6 +1705,7 @@ class EXL3Processor(LoopProcessor):
                 quantizer_contract=quantizer_contract,
                 family_join=family_join,
                 route_evidence=task_entry.get("route_evidence"),
+                zero_route_recovery=task_entry.get("zero_route_recovery"),
             )
             checkpoint_store.reserve_module_request(checkpoint_request)
             loaded_checkpoint = checkpoint_store.load(checkpoint_request)
@@ -1493,6 +1852,7 @@ class EXL3Processor(LoopProcessor):
                 quantizer_metrics=quantizer_metrics,
                 provenance=projection_provenance,
                 route_evidence=task_entry.get("route_evidence"),
+                zero_route_recovery=task_entry.get("zero_route_recovery"),
             )
             checkpoint_result = {
                 "duration_seconds": duration,
@@ -1546,6 +1906,7 @@ class EXL3Processor(LoopProcessor):
                 quantizer_metrics=quantizer_metrics,
                 provenance=projection_provenance,
                 route_evidence=task_entry.get("route_evidence"),
+                zero_route_recovery=task_entry.get("zero_route_recovery"),
             )
             if ledger_record != expected_ledger_record:
                 raise ValueError("EXL3 projection checkpoint ledger is inconsistent")

@@ -96,6 +96,7 @@ def build_projection_request(
     quantizer_contract: dict[str, Any],
     family_join: dict[str, Any] | None,
     route_evidence: dict[str, Any] | None,
+    zero_route_recovery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind every input capable of changing one packed projection result."""
 
@@ -111,6 +112,11 @@ def build_projection_request(
         "family_join": deepcopy(family_join),
         "route_evidence": deepcopy(route_evidence),
     }
+    # Preserve every existing natural-route request identity byte-for-byte.
+    # Recovery is additive and enters the request hash only for a projection
+    # whose natural route count was exactly zero.
+    if zero_route_recovery is not None:
+        request["zero_route_recovery"] = deepcopy(zero_route_recovery)
     clean = _finite_json_value(request, "request")
     clean["request_sha256"] = sha256_bytes(canonical_json_bytes(clean))
     return clean

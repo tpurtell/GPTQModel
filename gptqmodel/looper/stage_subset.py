@@ -1032,6 +1032,104 @@ def _run_single_subset_pass(
             if forward_pb is not None:
                 forward_pb.close()
 
+        plan_zero_recovery = getattr(
+            processor, "plan_subset_zero_route_recovery", None
+        )
+        zero_recovery_tasks = (
+            plan_zero_recovery(subset=subset)
+            if callable(plan_zero_recovery)
+            else ()
+        )
+        if zero_recovery_tasks:
+            recovery_context_factory = getattr(
+                looper.gptq_model, "zero_route_recovery_context", None
+            )
+            if not callable(recovery_context_factory):
+                raise RuntimeError(
+                    "EXL3 route-coverage top-up is enabled but the model has no "
+                    "direct-expert recovery implementation"
+                )
+            recovery_msg = (
+                "Zero-route recovery: "
+                f"Layer=`{layer_descriptor}`, subset={subset_index + 1}/{subset_total}, "
+                f"modules={len(zero_recovery_tasks)}, batches={batch_count}"
+            )
+            recovery_pb = (
+                logger.pb(range(plan.forward_total_rows))
+                .manual()
+                .set(show_left_steps=False)
+            )
+            recovery_pb.title(recovery_msg).subtitle(
+                f"Row 0/{plan.forward_total_rows}"
+            ).draw()
+            if subset_event_cb:
+                subset_event_cb(
+                    stage="zero_route_recovery_start",
+                    layer_idx=layer_index,
+                    subset_index=subset_index,
+                    subset_total=subset_total,
+                    module_names=list(zero_recovery_tasks),
+                    processor=getattr(
+                        processor, "name", type(processor).__name__
+                    ),
+                )
+            try:
+                with recovery_context_factory(
+                    looper=looper,
+                    processor=processor,
+                    layer_module=module,
+                    subset=subset,
+                    task_names=zero_recovery_tasks,
+                ):
+                    looper._run_forward_batches(
+                        module=module,
+                        processor=processor,
+                        current_subset=subset,
+                        ordered_module_names=subset_names,
+                        layer_inputs=layer_inputs,
+                        layer_input_kwargs=layer_input_kwargs,
+                        position_ids=position_ids,
+                        attention_masks=attention_masks,
+                        cur_layer_device=cur_layer_device,
+                        is_lm_head_module=is_lm_head_module,
+                        shared_kv_cache_dict=shared_kv_cache_dict,
+                        layer_index=layer_index,
+                        need_outputs=False,
+                        reuse_kv=reuse_kv,
+                        progress_pb=recovery_pb,
+                        progress_title=recovery_msg,
+                        progress_stage="Zero-route recovery",
+                        progress_rows_per_batch=forward_row_counts,
+                        progress_total_rows=plan.forward_total_rows,
+                        force_serial=True,
+                        preserve_module_devices=preserve_devices,
+                        apply_moe_config=False,
+                    )
+                finish_zero_recovery = getattr(
+                    processor, "finish_subset_zero_route_recovery", None
+                )
+                if not callable(finish_zero_recovery):
+                    raise RuntimeError(
+                        "EXL3 route-coverage top-up lost its completion validator"
+                    )
+                finish_zero_recovery(
+                    subset=subset,
+                    task_names=zero_recovery_tasks,
+                )
+            finally:
+                recovery_pb.close()
+            if subset_event_cb:
+                subset_event_cb(
+                    stage="zero_route_recovery_end",
+                    layer_idx=layer_index,
+                    subset_index=subset_index,
+                    subset_total=subset_total,
+                    module_names=list(zero_recovery_tasks),
+                    processor=getattr(
+                        processor, "name", type(processor).__name__
+                    ),
+                )
+
     returned_outputs = None
     if execute_forward and capture_layer_forward_context:
         processor.receive_layer_forward_context(
@@ -1093,6 +1191,12 @@ def _run_single_subset_pass(
                 subset_total=subset_total,
                 subset=subset,
             )
+
+    validate_capture_readiness = getattr(
+        processor, "validate_subset_capture_readiness", None
+    )
+    if callable(validate_capture_readiness):
+        validate_capture_readiness(subset=subset)
 
     forward_flush_device = _resolve_forward_flush_device(plan, cur_layer_device)
     if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:

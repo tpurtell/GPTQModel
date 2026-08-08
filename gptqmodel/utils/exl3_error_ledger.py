@@ -24,6 +24,31 @@ LEDGER_MANIFEST_FILENAME = "ds4rt-exl3-error-ledger.manifest.json"
 JOURNAL_ENV = "GPTQMODEL_EXL3_ERROR_JOURNAL"
 ROUTE_EVIDENCE_SCHEMA = "ds4rt.exl3-natural-route"
 ROUTE_EVIDENCE_SCHEMA_VERSION = 1
+ZERO_ROUTE_RECOVERY_SCHEMA = "ds4rt.exl3-zero-route-recovery"
+ZERO_ROUTE_RECOVERY_SCHEMA_VERSION = 1
+ZERO_ROUTE_RECOVERY_TRIGGER = "natural-route-count-below-1024"
+ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE = "same-fixed-calibration-selection"
+ZERO_ROUTE_RECOVERY_CAPTURE_METHOD = (
+    "direct-expert-router-ranks-7-12-or-identity-hessian"
+)
+ZERO_ROUTE_RECOVERY_SELECTION_POLICY = (
+    "rank-ascending-then-fixed-replay-order-v1"
+)
+ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN = 7
+ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX = 12
+ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT = 1024
+ZERO_ROUTE_RECOVERY_SELECTION_CAP = 1024
+ZERO_ROUTE_RECOVERY_IDENTITY_POLICY = "normalized-2i-effective-count-1024-v1"
+ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR = "router-near-rows"
+ZERO_ROUTE_RECOVERY_MODE_IDENTITY = "identity-hessian"
+ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA = (
+    "ds4rt.exl3-zero-route-recovery-authorization"
+)
+ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION = 1
+ZERO_ROUTE_RECOVERY_AUTHORIZATION_KINDS = {
+    "immutable-family-join",
+    "content-bound-execution-upgrade",
+}
 
 _BASE_EXPERT = re.compile(
     r"^(?:model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\."
@@ -102,11 +127,76 @@ def route_evidence_required(provenance: dict[str, Any] | None) -> bool:
     )
 
 
+def zero_route_recovery_enabled(provenance: dict[str, Any] | None) -> bool:
+    """Return whether this immutable family permits under-coverage top-up."""
+
+    if not isinstance(provenance, dict):
+        return False
+    family_join = provenance.get("family_join")
+    return (
+        isinstance(family_join, dict)
+        and family_join.get("zero_route_recovery_contract")
+        == ZERO_ROUTE_RECOVERY_SCHEMA
+    )
+
+
+def validate_zero_route_recovery_authorization(
+    authorization: dict[str, Any],
+    *,
+    family_join: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the immutable authority that permits under-coverage top-up."""
+
+    clean = _finite_json_value(
+        authorization,
+        "zero_route_recovery_authorization",
+    )
+    family_join_sha256 = hashlib.sha256(
+        _canonical_json_bytes(family_join)
+    ).hexdigest()
+    digest = clean.get("authorization_sha256")
+    if (
+        clean.get("schema") != ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA
+        or clean.get("schema_version")
+        != ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION
+        or clean.get("kind") not in ZERO_ROUTE_RECOVERY_AUTHORIZATION_KINDS
+        or clean.get("recovery_contract") != ZERO_ROUTE_RECOVERY_SCHEMA
+        or clean.get("trigger") != ZERO_ROUTE_RECOVERY_TRIGGER
+        or clean.get("sample_source") != ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE
+        or clean.get("capture_method") != ZERO_ROUTE_RECOVERY_CAPTURE_METHOD
+        or clean.get("selection_policy")
+        != ZERO_ROUTE_RECOVERY_SELECTION_POLICY
+        or clean.get("candidate_rank_min")
+        != ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN
+        or clean.get("candidate_rank_max")
+        != ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+        or clean.get("target_sample_count")
+        != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        or clean.get("identity_calibration_policy")
+        != ZERO_ROUTE_RECOVERY_IDENTITY_POLICY
+        or clean.get("family_join_sha256") != family_join_sha256
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        raise ValueError("EXL3 zero-route recovery authorization is invalid")
+    if (
+        clean["kind"] == "immutable-family-join"
+        and (
+            family_join.get("zero_route_recovery_contract")
+            != ZERO_ROUTE_RECOVERY_SCHEMA
+            or digest != family_join_sha256
+        )
+    ):
+        raise ValueError("EXL3 family-join recovery authorization is invalid")
+    return clean
+
+
 def validate_route_evidence(
     evidence: dict[str, Any],
     *,
     identity: dict[str, Any],
     sample_count: int,
+    allow_zero: bool = False,
 ) -> dict[str, Any]:
     """Validate one routed expert's exposure and gate-mass accounting."""
 
@@ -125,8 +215,11 @@ def validate_route_evidence(
             isinstance(clean.get(field), bool)
             or not isinstance(clean.get(field), int)
             or clean[field] <= 0
-            for field in integer_fields
+            for field in integer_fields[:-1]
         )
+        or isinstance(clean.get("expert_route_count"), bool)
+        or not isinstance(clean.get("expert_route_count"), int)
+        or clean["expert_route_count"] < (0 if allow_zero else 1)
         or clean.get("block_namespace") != identity["block_namespace"]
         or clean.get("logical_layer") != identity["logical_layer"]
         or clean.get("expert") != identity["expert"]
@@ -173,13 +266,13 @@ def validate_route_evidence(
         "expert_route_fraction": route_count / selected_count,
         "expert_gate_weight_mass_fraction": gate_sum / max(total_gate_sum, 1e-30),
         "expert_gate_squared_mass_fraction": gate_sq / max(total_gate_sq, 1e-30),
-        "expert_gate_weight_mean": gate_sum / route_count,
-        "expert_gate_weight_rms": math.sqrt(gate_sq / route_count),
+        "expert_gate_weight_mean": gate_sum / max(route_count, 1),
+        "expert_gate_weight_rms": math.sqrt(gate_sq / max(route_count, 1)),
     }
     if (
         route_count > selected_count
-        or gate_sum <= 0
-        or gate_sq <= 0
+        or (route_count == 0 and (gate_sum != 0 or gate_sq != 0))
+        or (route_count > 0 and (gate_sum <= 0 or gate_sq <= 0))
         or total_gate_sum < gate_sum
         or total_gate_sq < gate_sq
         or any(
@@ -188,6 +281,146 @@ def validate_route_evidence(
         )
     ):
         raise ValueError("EXL3 natural-route evidence has inconsistent gate metrics")
+    return clean
+
+
+def validate_zero_route_recovery(
+    evidence: dict[str, Any],
+    *,
+    identity: dict[str, Any],
+    sample_count: int,
+    family_join: dict[str, Any] | None = None,
+    expected_authorization: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate one deterministic same-selection under-coverage top-up."""
+
+    clean = _finite_json_value(evidence, "zero_route_recovery")
+    integer_fields = (
+        "natural_sample_count",
+        "router_augmented_sample_count",
+        "identity_calibration_count",
+        "total_sample_count",
+        "forced_pass_count",
+    )
+    authorization = clean.get("authorization")
+    candidate_histogram = clean.get("candidate_rank_histogram")
+    candidate_gap = clean.get("candidate_score_gap")
+    recovery_mode = clean.get("recovery_mode")
+    if not isinstance(family_join, dict):
+        raise ValueError("EXL3 zero-route recovery requires family identity")
+    validated_authorization = validate_zero_route_recovery_authorization(
+        authorization,
+        family_join=family_join,
+    ) if isinstance(authorization, dict) else None
+    if (
+        clean.get("schema") != ZERO_ROUTE_RECOVERY_SCHEMA
+        or clean.get("schema_version") != ZERO_ROUTE_RECOVERY_SCHEMA_VERSION
+        or clean.get("trigger") != ZERO_ROUTE_RECOVERY_TRIGGER
+        or clean.get("sample_source") != ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE
+        or clean.get("capture_method") != ZERO_ROUTE_RECOVERY_CAPTURE_METHOD
+        or clean.get("selection_policy")
+        != ZERO_ROUTE_RECOVERY_SELECTION_POLICY
+        or clean.get("candidate_rank_min")
+        != ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN
+        or clean.get("candidate_rank_max")
+        != ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+        or clean.get("selection_cap") != ZERO_ROUTE_RECOVERY_SELECTION_CAP
+        or clean.get("target_sample_count")
+        != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        or clean.get("identity_calibration_policy")
+        != ZERO_ROUTE_RECOVERY_IDENTITY_POLICY
+        or clean.get("block_namespace") != identity["block_namespace"]
+        or clean.get("logical_layer") != identity["logical_layer"]
+        or clean.get("expert") != identity["expert"]
+        or any(
+            isinstance(clean.get(field), bool)
+            or not isinstance(clean.get(field), int)
+            for field in integer_fields
+        )
+        or not 0
+        <= clean["natural_sample_count"]
+        < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        or clean["total_sample_count"]
+        != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        or clean["total_sample_count"] != int(sample_count)
+        or clean["forced_pass_count"] != 1
+        or isinstance(clean.get("candidate_rows_observed"), bool)
+        or not isinstance(clean.get("candidate_rows_observed"), int)
+        or clean["candidate_rows_observed"] < 0
+        or isinstance(clean.get("candidate_rows_selected"), bool)
+        or not isinstance(clean.get("candidate_rows_selected"), int)
+        or not 0
+        <= clean["candidate_rows_selected"]
+        <= min(
+            clean["candidate_rows_observed"],
+            ZERO_ROUTE_RECOVERY_SELECTION_CAP,
+        )
+        or not isinstance(candidate_histogram, dict)
+        or set(candidate_histogram)
+        != {
+            str(rank)
+            for rank in range(
+                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX + 1,
+            )
+        }
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in candidate_histogram.values()
+        )
+        or sum(candidate_histogram.values())
+        != clean["candidate_rows_selected"]
+        or recovery_mode
+        not in {
+            ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
+            ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+        }
+        or validated_authorization is None
+        or (
+            expected_authorization is not None
+            and validated_authorization != expected_authorization
+        )
+    ):
+        raise ValueError("EXL3 zero-route recovery evidence has an invalid contract")
+    selected = clean["candidate_rows_selected"]
+    observed = clean["candidate_rows_observed"]
+    if recovery_mode == ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR:
+        gap_fields = ("min", "mean", "max")
+        if (
+            clean["identity_calibration_count"] != 0
+            or clean["router_augmented_sample_count"]
+            != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+            - clean["natural_sample_count"]
+            or clean["router_augmented_sample_count"] <= 0
+            or clean["natural_sample_count"]
+            + clean["router_augmented_sample_count"]
+            != clean["total_sample_count"]
+            or observed <= 0
+            or selected <= 0
+            or clean["router_augmented_sample_count"] != selected
+            or not isinstance(candidate_gap, dict)
+            or any(
+                isinstance(candidate_gap.get(field), bool)
+                or not isinstance(candidate_gap.get(field), (int, float))
+                or not math.isfinite(float(candidate_gap[field]))
+                or candidate_gap[field] < 0
+                for field in gap_fields
+            )
+            or not candidate_gap["min"]
+            <= candidate_gap["mean"]
+            <= candidate_gap["max"]
+        ):
+            raise ValueError("EXL3 router-near recovery evidence is invalid")
+    elif (
+        clean["natural_sample_count"] != 0
+        or clean["router_augmented_sample_count"] != 0
+        or clean["identity_calibration_count"]
+        != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        or observed != 0
+        or selected != 0
+        or candidate_gap is not None
+    ):
+        raise ValueError("EXL3 identity-Hessian recovery evidence is invalid")
     return clean
 
 
@@ -204,6 +437,7 @@ def build_projection_record(
     quantizer_metrics: dict[str, Any],
     provenance: dict[str, Any] | None,
     route_evidence: dict[str, Any] | None = None,
+    zero_route_recovery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Construct one projection record without discarding raw error terms."""
 
@@ -225,18 +459,36 @@ def build_projection_record(
     identity = routed_expert_identity(module_full_name)
     if identity is not None:
         record.update(identity)
+        recovery = None
+        natural_sample_count = sample_count
+        if zero_route_recovery is not None:
+            recovery = validate_zero_route_recovery(
+                zero_route_recovery,
+                identity=identity,
+                sample_count=sample_count,
+                family_join=(
+                    provenance.get("family_join")
+                    if isinstance(provenance, dict)
+                    else None
+                ),
+            )
+            natural_sample_count = recovery["natural_sample_count"]
+            record["zero_route_recovery"] = recovery
         if route_evidence is not None:
             record["route_evidence"] = validate_route_evidence(
                 route_evidence,
                 identity=identity,
-                sample_count=sample_count,
+                sample_count=natural_sample_count,
+                allow_zero=recovery is not None,
             )
         elif route_evidence_required(provenance):
             raise ValueError(
                 f"EXL3 natural-route evidence is required for `{module_full_name}`"
             )
-    elif route_evidence is not None:
-        raise ValueError("EXL3 route evidence can only describe routed experts")
+    elif route_evidence is not None or zero_route_recovery is not None:
+        raise ValueError(
+            "EXL3 route/recovery evidence can only describe routed experts"
+        )
     return _finite_json_value(record)
 
 
@@ -271,6 +523,19 @@ def _family_record(records: list[dict[str, Any]]) -> dict[str, Any]:
         ):
             raise ValueError(
                 "EXL3 expert-family projections have inconsistent route evidence"
+            )
+
+    zero_route_recovery = [
+        record.get("zero_route_recovery") for record in records
+    ]
+    if any(value is not None for value in zero_route_recovery):
+        if any(value is None for value in zero_route_recovery) or any(
+            _canonical_json_bytes(value)
+            != _canonical_json_bytes(zero_route_recovery[0])
+            for value in zero_route_recovery[1:]
+        ):
+            raise ValueError(
+                "EXL3 expert-family projections have inconsistent zero-route recovery"
             )
 
     family = {
@@ -316,6 +581,8 @@ def _family_record(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if route_evidence[0] is not None:
         family["route_evidence"] = deepcopy(route_evidence[0])
+    if zero_route_recovery[0] is not None:
+        family["zero_route_recovery"] = deepcopy(zero_route_recovery[0])
     return _finite_json_value(family)
 
 
@@ -544,11 +811,30 @@ __all__ = [
     "LEDGER_SCHEMA_VERSION",
     "ROUTE_EVIDENCE_SCHEMA",
     "ROUTE_EVIDENCE_SCHEMA_VERSION",
+    "ZERO_ROUTE_RECOVERY_CAPTURE_METHOD",
+    "ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX",
+    "ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN",
+    "ZERO_ROUTE_RECOVERY_IDENTITY_POLICY",
+    "ZERO_ROUTE_RECOVERY_MODE_IDENTITY",
+    "ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR",
+    "ZERO_ROUTE_RECOVERY_SELECTION_CAP",
+    "ZERO_ROUTE_RECOVERY_SELECTION_POLICY",
+    "ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT",
+    "ZERO_ROUTE_RECOVERY_AUTHORIZATION_KINDS",
+    "ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA",
+    "ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION",
+    "ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE",
+    "ZERO_ROUTE_RECOVERY_SCHEMA",
+    "ZERO_ROUTE_RECOVERY_SCHEMA_VERSION",
+    "ZERO_ROUTE_RECOVERY_TRIGGER",
     "append_exl3_error_journal",
     "build_projection_record",
     "derive_family_records",
     "route_evidence_required",
     "routed_expert_identity",
     "validate_route_evidence",
+    "validate_zero_route_recovery",
+    "validate_zero_route_recovery_authorization",
     "write_exl3_error_ledger",
+    "zero_route_recovery_enabled",
 ]

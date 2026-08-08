@@ -7,6 +7,7 @@ import copy
 import os
 import threading
 from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import MethodType
 from typing import Any, Callable, Iterable, Sequence
@@ -16,6 +17,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from .deepseek_v3 import DeepSeekV3QModel
+from ...utils.exl3_error_ledger import (
+    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+    ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+    ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
+    ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
+)
 
 
 MTP_BLOCK_COUNT = 3
@@ -993,6 +1001,7 @@ class DeepSeekV4MTPReplay:
         main_position_embeddings: tuple[torch.Tensor, torch.Tensor],
         prepare_ffn: Callable[[int, nn.Module, torch.Tensor, torch.Tensor], None]
         | None = None,
+        mlp_capture_context: Callable[[], Any] | None = None,
         capture_route: bool = True,
     ) -> tuple[torch.Tensor, DeepSeekV4MTPReplayRoute | None]:
         """Shared official one-block body used by reference and quantization."""
@@ -1032,7 +1041,13 @@ class DeepSeekV4MTPReplay:
                 capture_router, with_kwargs=True
             )
         try:
-            mlp_output = block.mlp(ffn_input, input_ids=proposal_token_ids)
+            capture_context = (
+                mlp_capture_context()
+                if mlp_capture_context is not None
+                else nullcontext()
+            )
+            with capture_context:
+                mlp_output = block.mlp(ffn_input, input_ids=proposal_token_ids)
         finally:
             if handle is not None:
                 handle.remove()
@@ -1139,6 +1154,12 @@ def _deepseek_v4_mtp_quantization_block_forward(
             MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS
         ],
         main_position_embeddings=kwargs[MTP_REPLAY_MAIN_POSITION_EMBEDDINGS],
+        prepare_ffn=getattr(
+            self, "_gptqmodel_mtp_zero_route_force", None
+        ),
+        mlp_capture_context=getattr(
+            self, "_gptqmodel_mtp_normal_mlp_capture_context", None
+        ),
         capture_route=False,
     )
     return residual
@@ -2170,6 +2191,379 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             raise ValueError("MTP activation store requires provenance")
         self._mtp_activation_store_root = root
         self._mtp_activation_store_provenance = copy.deepcopy(provenance)
+
+    @contextmanager
+    def zero_route_recovery_context(
+        self,
+        *,
+        looper,
+        processor,
+        layer_module: nn.Module,
+        subset: dict[str, Any],
+        task_names: tuple[str, ...],
+    ):
+        """Top up under-covered experts from router-near same-selection rows."""
+
+        block_index = getattr(
+            layer_module, "_gptqmodel_mtp_block_index", None
+        )
+        if (
+            not isinstance(block_index, int)
+            or block_index < 0
+            or block_index >= len(self.model.mtp)
+            or layer_module is not self.model.mtp[block_index]
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 zero-route recovery requires one canonical MTP block"
+            )
+        targets: dict[int, set[str]] = {}
+        prefix = f"mtp.{block_index}.mlp.experts."
+        allowed = {"gate_proj", "up_proj", "down_proj"}
+        for task_name in task_names:
+            named_module = subset.get(task_name)
+            full_name = getattr(named_module, "full_name", None)
+            if not isinstance(full_name, str) or not full_name.startswith(prefix):
+                raise RuntimeError(
+                    "DeepSeek V4 zero-route recovery received an alien module"
+                )
+            remainder = full_name[len(prefix) :].split(".")
+            if (
+                len(remainder) != 2
+                or not remainder[0].isdigit()
+                or remainder[1] not in allowed
+            ):
+                raise RuntimeError(
+                    f"DeepSeek V4 zero-route module is malformed: `{full_name}`"
+                )
+            targets.setdefault(int(remainder[0]), set()).add(remainder[1])
+        if not targets:
+            raise RuntimeError("DeepSeek V4 zero-route recovery has no targets")
+
+        natural_counts: dict[int, int] = {}
+        task_names_by_expert: dict[int, list[str]] = {}
+        for task_name in task_names:
+            named_module = subset[task_name]
+            full_name = named_module.full_name
+            expert_index = int(full_name[len(prefix) :].split(".", 1)[0])
+            task = processor.tasks.get(task_name)
+            route_evidence = (
+                task.get("route_evidence") if isinstance(task, dict) else None
+            )
+            natural_count = (
+                route_evidence.get("expert_route_count")
+                if isinstance(route_evidence, dict)
+                else None
+            )
+            if (
+                isinstance(natural_count, bool)
+                or not isinstance(natural_count, int)
+                or not 0
+                <= natural_count
+                < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+            ):
+                raise RuntimeError(
+                    f"DeepSeek V4 recovery target has invalid natural count: `{full_name}`"
+                )
+            previous = natural_counts.setdefault(expert_index, natural_count)
+            if previous != natural_count:
+                raise RuntimeError(
+                    "DeepSeek V4 recovery projection siblings disagree on natural rows"
+                )
+            task_names_by_expert.setdefault(expert_index, []).append(task_name)
+
+        needed_by_expert = {
+            expert: ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT - natural_count
+            for expert, natural_count in natural_counts.items()
+        }
+        candidate_rows: dict[int, dict[int, list[torch.Tensor]]] = {
+            expert: {
+                rank: []
+                for rank in range(
+                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX + 1,
+                )
+            }
+            for expert in targets
+        }
+        candidate_gaps: dict[int, dict[int, list[torch.Tensor]]] = {
+            expert: {rank: [] for rank in ranks}
+            for expert, ranks in candidate_rows.items()
+        }
+        retained_by_rank: dict[int, dict[int, int]] = {
+            expert: {rank: 0 for rank in ranks}
+            for expert, ranks in candidate_rows.items()
+        }
+        observed_by_expert = {expert: 0 for expert in targets}
+        pending_ffn_input: torch.Tensor | None = None
+
+        def prepare_router_candidates(
+            replay_block_index: int,
+            block: nn.Module,
+            ffn_input: torch.Tensor,
+            proposal_token_ids: torch.Tensor,
+        ) -> None:
+            nonlocal pending_ffn_input
+            if replay_block_index != block_index or block is not layer_module:
+                raise RuntimeError(
+                    "DeepSeek V4 zero-route recovery replayed the wrong block"
+                )
+            if pending_ffn_input is not None:
+                raise RuntimeError("DeepSeek V4 recovery router input was not consumed")
+            expert_input = ffn_input.reshape(-1, ffn_input.shape[-1])
+            if expert_input.shape[0] != proposal_token_ids.numel():
+                raise RuntimeError(
+                    "DeepSeek V4 recovery FFN rows do not align with proposal rows"
+                )
+            pending_ffn_input = expert_input
+
+        def capture_router_candidates(_module, _inputs, output) -> None:
+            nonlocal pending_ffn_input
+            expert_input = pending_ffn_input
+            pending_ffn_input = None
+            if expert_input is None:
+                raise RuntimeError(
+                    "DeepSeek V4 recovery router ran without its FFN input"
+                )
+            if not isinstance(output, (tuple, list)) or len(output) != 3:
+                raise RuntimeError("DeepSeek V4 recovery requires router triplets")
+            logits = output[0]
+            router = layer_module.mlp.gate
+            if (
+                not isinstance(logits, torch.Tensor)
+                or logits.ndim != 2
+                or logits.shape[0] != expert_input.shape[0]
+                or int(getattr(router, "top_k", 0)) != 6
+                or logits.shape[1] < ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+            ):
+                raise RuntimeError("DeepSeek V4 recovery router geometry is invalid")
+            correction = getattr(router, "e_score_correction_bias", None)
+            if not isinstance(correction, torch.Tensor):
+                raise RuntimeError(
+                    "DeepSeek V4 recovery requires the learned-router correction bias"
+                )
+            scores = router.score_fn(logits.float())
+            choice_scores = scores + correction.float()
+            ranked_scores, ranked_indices = torch.topk(
+                choice_scores,
+                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            )
+            boundary = ranked_scores[:, 5]
+            for expert_index in sorted(targets):
+                needed = needed_by_expert[expert_index]
+                candidate_indices = torch.nonzero(
+                    ranked_indices[:, 6:ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX]
+                    == expert_index,
+                    as_tuple=False,
+                )
+                observed_by_expert[expert_index] += int(
+                    candidate_indices.shape[0]
+                )
+                for rank_offset in range(
+                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX - 6
+                ):
+                    rank = rank_offset + 7
+                    remaining = needed - retained_by_rank[expert_index][rank]
+                    if remaining <= 0:
+                        continue
+                    row_indices = candidate_indices[
+                        candidate_indices[:, 1] == rank_offset, 0
+                    ][:remaining]
+                    if row_indices.numel() == 0:
+                        continue
+                    candidate_rows[expert_index][rank].append(
+                        expert_input.index_select(0, row_indices).detach().clone()
+                    )
+                    candidate_gaps[expert_index][rank].append(
+                        (
+                            boundary.index_select(0, row_indices)
+                            - ranked_scores[row_indices, rank - 1]
+                        )
+                        .detach()
+                        .float()
+                        .cpu()
+                    )
+                    retained_by_rank[expert_index][rank] += int(
+                        row_indices.numel()
+                    )
+            del ranked_scores, ranked_indices, boundary, choice_scores, scores
+
+        def finish_router_candidates() -> None:
+            if pending_ffn_input is not None:
+                raise RuntimeError("DeepSeek V4 recovery ended with a pending router input")
+            experts = layer_module.mlp.experts
+            for expert_index in sorted(targets):
+                needed = needed_by_expert[expert_index]
+                selected_rows: list[torch.Tensor] = []
+                selected_gaps: list[torch.Tensor] = []
+                selected_histogram = {
+                    str(rank): 0
+                    for rank in range(
+                        ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+                        ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX + 1,
+                    )
+                }
+                remaining = needed
+                for rank in range(
+                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX + 1,
+                ):
+                    if remaining <= 0:
+                        break
+                    if not candidate_rows[expert_index][rank]:
+                        continue
+                    rank_rows = torch.cat(
+                        candidate_rows[expert_index][rank], dim=0
+                    )[:remaining]
+                    rank_gaps = torch.cat(
+                        candidate_gaps[expert_index][rank], dim=0
+                    )[:remaining]
+                    selected_rows.append(rank_rows)
+                    selected_gaps.append(rank_gaps)
+                    count = int(rank_rows.shape[0])
+                    selected_histogram[str(rank)] = count
+                    remaining -= count
+
+                identity_recovery = False
+                if remaining > 0:
+                    if (
+                        natural_counts[expert_index] == 0
+                        and observed_by_expert[expert_index] == 0
+                    ):
+                        identity_recovery = True
+                        remaining = 0
+                    else:
+                        raise RuntimeError(
+                            "DeepSeek V4 router-near recovery cannot reach 1,024 "
+                            f"rows for expert {expert_index}: natural="
+                            f"{natural_counts[expert_index]} observed_candidates="
+                            f"{observed_by_expert[expert_index]} selected="
+                            f"{needed - remaining}"
+                        )
+
+                if identity_recovery:
+                    for task_name in task_names_by_expert[expert_index]:
+                        task = processor.tasks.get(task_name)
+                        capture = task.get("capture") if isinstance(task, dict) else None
+                        columns = getattr(capture, "columns", None)
+                        partials = getattr(capture, "_device_hessian_partials", None)
+                        sample_counts = getattr(capture, "_device_sample_counts", None)
+                        if (
+                            isinstance(columns, bool)
+                            or not isinstance(columns, int)
+                            or columns <= 0
+                            or getattr(capture, "nsamples", None) != 0
+                            or not isinstance(partials, dict)
+                            or partials
+                            or not isinstance(sample_counts, dict)
+                            or sample_counts
+                        ):
+                            raise RuntimeError(
+                                "DeepSeek V4 identity recovery found a nonempty capture"
+                            )
+                        capture.H = torch.eye(
+                            columns,
+                            dtype=torch.float32,
+                            device="cpu",
+                        ).mul_(2.0)
+                        capture.nsamples = ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                        capture._hessian_dirty = False
+                        capture._final_hessian_device_hint = torch.device("cpu")
+                    gap_summary = None
+                    selected_candidate_count = 0
+                    router_augmented_count = 0
+                    identity_count = ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                    recovery_mode = ZERO_ROUTE_RECOVERY_MODE_IDENTITY
+                else:
+                    expert_input = torch.cat(selected_rows, dim=0)
+                    if expert_input.shape[0] != needed:
+                        raise RuntimeError(
+                            "DeepSeek V4 recovery selected the wrong row count"
+                        )
+                    expert = experts[expert_index]
+                    projections = targets[expert_index]
+                    if "down_proj" in projections:
+                        gate = expert.gate_proj(expert_input)
+                        up = expert.up_proj(expert_input)
+                        limit = getattr(
+                            expert, "limit", getattr(layer_module.mlp, "limit", None)
+                        )
+                        if limit is not None:
+                            gate = gate.clamp(max=float(limit))
+                            up = up.clamp(min=-float(limit), max=float(limit))
+                        act_fn = getattr(
+                            expert,
+                            "act_fn",
+                            getattr(layer_module.mlp, "act_fn", F.silu),
+                        )
+                        intermediate = act_fn(gate) * up
+                        expert.down_proj(intermediate)
+                        del gate, up, intermediate
+                    else:
+                        if "gate_proj" in projections:
+                            expert.gate_proj(expert_input)
+                        if "up_proj" in projections:
+                            expert.up_proj(expert_input)
+                    gap_values = torch.cat(selected_gaps, dim=0).double()
+                    gap_summary = {
+                        "min": float(gap_values.min().item()),
+                        "mean": float(gap_values.mean().item()),
+                        "max": float(gap_values.max().item()),
+                    }
+                    selected_candidate_count = needed
+                    router_augmented_count = needed
+                    identity_count = 0
+                    recovery_mode = ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR
+                summary = {
+                    "recovery_mode": recovery_mode,
+                    "router_augmented_sample_count": router_augmented_count,
+                    "identity_calibration_count": identity_count,
+                    "candidate_rows_observed": observed_by_expert[expert_index],
+                    "candidate_rows_selected": selected_candidate_count,
+                    "candidate_rank_histogram": selected_histogram,
+                    "candidate_score_gap": gap_summary,
+                }
+                for task_name in task_names_by_expert[expert_index]:
+                    task = processor.tasks.get(task_name)
+                    if not isinstance(task, dict):
+                        raise RuntimeError(
+                            "DeepSeek V4 recovery lost a processor task"
+                        )
+                    task["zero_route_recovery_capture"] = copy.deepcopy(summary)
+                if not identity_recovery:
+                    del expert_input
+
+        @contextmanager
+        def pause_normal_mlp_capture():
+            looper._set_processor_hooks_paused(processor, True)
+            try:
+                yield
+            finally:
+                looper._set_processor_hooks_paused(processor, False)
+
+        force_attr = "_gptqmodel_mtp_zero_route_force"
+        pause_attr = "_gptqmodel_mtp_normal_mlp_capture_context"
+        if hasattr(layer_module, force_attr) or hasattr(layer_module, pause_attr):
+            raise RuntimeError(
+                "DeepSeek V4 zero-route recovery context is already active"
+            )
+        setattr(layer_module, force_attr, prepare_router_candidates)
+        setattr(layer_module, pause_attr, pause_normal_mlp_capture)
+        router_handle = layer_module.mlp.gate.register_forward_hook(
+            capture_router_candidates
+        )
+        try:
+            yield
+            router_handle.remove()
+            router_handle = None
+            finish_router_candidates()
+        finally:
+            if router_handle is not None:
+                router_handle.remove()
+            delattr(layer_module, pause_attr)
+            delattr(layer_module, force_attr)
 
     def create_quantization_layer_output_writer(
         self,
