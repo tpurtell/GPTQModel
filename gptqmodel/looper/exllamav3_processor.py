@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import copy
+import ctypes
+import gc
 import math
 import os
 import threading
@@ -694,11 +696,118 @@ class EXL3Processor(LoopProcessor):
         capture._final_hessian_device_hint = target_device
         task_entry.pop("capture_frontier_record", None)
 
-    def capture_memory_summary(self) -> dict[str, int]:
-        """Report live capture/source tensor bytes without retaining tensors."""
+    @staticmethod
+    def _tensor_storage_summary(value: Any) -> dict[str, int]:
+        """Count unique tensor storage reachable from a bounded object tree."""
+
+        summary = {
+            "tensor_count": 0,
+            "storage_count": 0,
+            "meta_tensor_count": 0,
+            "host_bytes": 0,
+            "device_bytes": 0,
+        }
+        seen_containers: set[int] = set()
+        seen_storages: set[tuple[str, int, int]] = set()
+        pending = [value]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, torch.Tensor):
+                summary["tensor_count"] += 1
+                if current.device.type == "meta":
+                    summary["meta_tensor_count"] += 1
+                    continue
+                try:
+                    storage = current.untyped_storage()
+                    storage_bytes = int(storage.nbytes())
+                    data_ptr = int(storage.data_ptr())
+                except (RuntimeError, TypeError):
+                    storage_bytes = current.numel() * current.element_size()
+                    data_ptr = id(current)
+                storage_key = (str(current.device), data_ptr, storage_bytes)
+                if storage_key in seen_storages:
+                    continue
+                seen_storages.add(storage_key)
+                summary["storage_count"] += 1
+                byte_key = (
+                    "host_bytes"
+                    if current.device.type == "cpu"
+                    else "device_bytes"
+                )
+                summary[byte_key] += storage_bytes
+                continue
+            if isinstance(current, dict):
+                identity = id(current)
+                if identity not in seen_containers:
+                    seen_containers.add(identity)
+                    pending.extend(current.values())
+                continue
+            if isinstance(current, (list, tuple, set)):
+                identity = id(current)
+                if identity not in seen_containers:
+                    seen_containers.add(identity)
+                    pending.extend(current)
+        return summary
+
+    @staticmethod
+    def _process_memory_summary() -> dict[str, int]:
+        """Read resident-memory ownership classes from Linux procfs."""
 
         summary = {
             "process_rss_bytes": 0,
+            "process_pss_bytes": 0,
+            "process_private_dirty_bytes": 0,
+            "process_anon_bytes": 0,
+            "process_file_bytes": 0,
+            "process_shmem_bytes": 0,
+            "process_swap_bytes": 0,
+        }
+        proc_fields = {
+            "Rss": "process_rss_bytes",
+            "Pss": "process_pss_bytes",
+            "Private_Dirty": "process_private_dirty_bytes",
+            "Anonymous": "process_anon_bytes",
+            "Pss_File": "process_file_bytes",
+            "Pss_Shmem": "process_shmem_bytes",
+            "Swap": "process_swap_bytes",
+        }
+        try:
+            with open("/proc/self/smaps_rollup", "r", encoding="ascii") as source:
+                for line in source:
+                    name, separator, remainder = line.partition(":")
+                    target = proc_fields.get(name)
+                    if target is None or not separator:
+                        continue
+                    fields = remainder.split()
+                    if fields:
+                        summary[target] = int(fields[0]) * 1024
+        except (OSError, ValueError):
+            try:
+                with open("/proc/self/statm", "r", encoding="ascii") as source:
+                    resident_pages = int(source.read().split()[1])
+                summary["process_rss_bytes"] = (
+                    resident_pages * os.sysconf("SC_PAGE_SIZE")
+                )
+            except (OSError, IndexError, ValueError):
+                pass
+        return summary
+
+    @staticmethod
+    def _model_tensor_summary(model: Any | None) -> dict[str, int]:
+        """Inventory materialized model storage without touching tensor data."""
+
+        candidate = model
+        if not isinstance(candidate, torch.nn.Module):
+            candidate = getattr(model, "model", None)
+        if not isinstance(candidate, torch.nn.Module):
+            return EXL3Processor._tensor_storage_summary(None)
+        tensors = list(candidate.parameters()) + list(candidate.buffers())
+        return EXL3Processor._tensor_storage_summary(tensors)
+
+    def capture_memory_summary(self, model: Any | None = None) -> dict[str, Any]:
+        """Report process, cache, model, and capture tensor ownership."""
+
+        summary = {
             "task_count": 0,
             "lazy_frontier_records": 0,
             "host_hessian_bytes": 0,
@@ -708,12 +817,39 @@ class EXL3Processor(LoopProcessor):
             "host_dense_quant_source_bytes": 0,
             "device_dense_quant_source_bytes": 0,
         }
+        summary.update(self._process_memory_summary())
+
+        cache = getattr(self, "inputs_cache", None)
+        cache_payload = (
+            getattr(cache, "layer_inputs", []),
+            getattr(cache, "layer_input_kwargs", []),
+            getattr(cache, "position_ids", []),
+            getattr(cache, "attention_masks", []),
+        )
+        cache_summary = self._tensor_storage_summary(cache_payload)
+        for key, value in cache_summary.items():
+            summary[f"input_cache_{key}"] = value
+
+        model_summary = self._model_tensor_summary(model)
+        for key, value in model_summary.items():
+            summary[f"model_{key}"] = value
+
+        summary["cuda_allocated_bytes"] = 0
+        summary["cuda_reserved_bytes"] = 0
+        summary["cuda_devices"] = {}
         try:
-            with open("/proc/self/statm", "r", encoding="ascii") as source:
-                resident_pages = int(source.read().split()[1])
-            summary["process_rss_bytes"] = resident_pages * os.sysconf("SC_PAGE_SIZE")
-        except (OSError, IndexError, ValueError):
+            for device_index in range(torch.cuda.device_count()):
+                allocated = int(torch.cuda.memory_allocated(device_index))
+                reserved = int(torch.cuda.memory_reserved(device_index))
+                summary["cuda_allocated_bytes"] += allocated
+                summary["cuda_reserved_bytes"] += reserved
+                summary["cuda_devices"][f"cuda:{device_index}"] = {
+                    "allocated_bytes": allocated,
+                    "reserved_bytes": reserved,
+                }
+        except (RuntimeError, TypeError):
             pass
+
         seen_sources: set[int] = set()
         for task in self.tasks.values():
             if not isinstance(task, dict):
@@ -751,10 +887,47 @@ class EXL3Processor(LoopProcessor):
                     summary[key] += tensor.numel() * tensor.element_size()
         return summary
 
-    def log_capture_memory_summary(self, context: str) -> dict[str, int]:
-        summary = self.capture_memory_summary()
+    def log_capture_memory_summary(
+        self, context: str, model: Any | None = None
+    ) -> dict[str, Any]:
+        summary = self.capture_memory_summary(model=model)
         log.info("EXL3 capture memory: context=%s summary=%s", context, summary)
         return summary
+
+    @staticmethod
+    def _malloc_trim() -> int | None:
+        """Return unused glibc arenas when the platform exposes malloc_trim."""
+
+        try:
+            trim = getattr(ctypes.CDLL(None), "malloc_trim")
+        except (AttributeError, OSError):
+            return None
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        return int(trim(0))
+
+    def release_host_memory(
+        self, context: str, model: Any | None = None
+    ) -> dict[str, Any]:
+        """Collect unreachable objects, trim glibc, and report the exact delta."""
+
+        before = self.capture_memory_summary(model=model)
+        collected = gc.collect()
+        trim_result = self._malloc_trim()
+        after = self.capture_memory_summary(model=model)
+        result = {
+            "gc_collected": int(collected),
+            "malloc_trim_result": trim_result,
+            "rss_released_bytes": max(
+                0,
+                int(before["process_rss_bytes"])
+                - int(after["process_rss_bytes"]),
+            ),
+            "before": before,
+            "after": after,
+        }
+        log.info("EXL3 host memory release: context=%s result=%s", context, result)
+        return result
 
     def discard_capture_frontiers_through(self, layer_index: int) -> None:
         """Drop captures covered by a durable layer-output boundary."""

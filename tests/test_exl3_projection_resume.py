@@ -166,6 +166,55 @@ def test_process_resumes_from_packed_checkpoint_without_requantizing(
     )
 
 
+def test_capture_memory_summary_attributes_cache_model_and_heap_release(
+    monkeypatch,
+) -> None:
+    processor = EXL3Processor.__new__(EXL3Processor)
+    shared = torch.zeros(8, dtype=torch.float32)
+    position_ids = torch.zeros(3, dtype=torch.int64)
+    processor.inputs_cache = SimpleNamespace(
+        layer_inputs=[[shared]],
+        layer_input_kwargs=[{"alias": shared[:4]}],
+        position_ids=[position_ids],
+        attention_masks=[],
+    )
+    processor.tasks = {}
+
+    model_root = nn.Module()
+    model_root.register_parameter(
+        "weight", nn.Parameter(torch.zeros(5, dtype=torch.bfloat16))
+    )
+    model_root.register_buffer("deferred", torch.empty(7, device="meta"))
+    model = SimpleNamespace(model=model_root)
+
+    summary = processor.capture_memory_summary(model=model)
+    assert summary["process_rss_bytes"] > 0
+    assert summary["input_cache_tensor_count"] == 3
+    assert summary["input_cache_storage_count"] == 2
+    assert summary["input_cache_host_bytes"] == (
+        shared.untyped_storage().nbytes()
+        + position_ids.untyped_storage().nbytes()
+    )
+    assert summary["model_tensor_count"] == 2
+    assert summary["model_storage_count"] == 1
+    assert summary["model_meta_tensor_count"] == 1
+    assert summary["model_host_bytes"] == 5 * torch.bfloat16.itemsize
+
+    monkeypatch.setattr(processor_module.gc, "collect", lambda: 7)
+    monkeypatch.setattr(
+        EXL3Processor,
+        "_malloc_trim",
+        staticmethod(lambda: 1),
+    )
+    released = processor.release_host_memory("test", model=model)
+    assert released["gc_collected"] == 7
+    assert released["malloc_trim_result"] == 1
+    assert released["before"]["input_cache_host_bytes"] == summary[
+        "input_cache_host_bytes"
+    ]
+    assert released["after"]["model_host_bytes"] == summary["model_host_bytes"]
+
+
 def test_restore_completed_layer_installs_packed_modules_without_hessian(
     tmp_path,
 ) -> None:
