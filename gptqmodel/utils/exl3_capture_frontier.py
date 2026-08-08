@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 from safetensors.torch import load_file as load_safetensors_file
@@ -47,6 +47,26 @@ class EXL3CaptureFrontierError(RuntimeError):
 class EXL3CaptureState:
     module: str
     hessian: torch.Tensor
+    sample_count: int
+    route_evidence: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class EXL3CaptureDescriptor:
+    """Hessian-independent metadata used by the bounded streaming writer."""
+
+    module: str
+    sample_count: int
+    route_evidence: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class EXL3CaptureRecord:
+    """Validated on-disk capture that can be hydrated on demand."""
+
+    module: str
+    path: Path
+    payload: dict[str, Any]
     sample_count: int
     route_evidence: dict[str, Any] | None
 
@@ -227,14 +247,21 @@ class EXL3CaptureFrontierStore:
             raise EXL3CaptureFrontierError("capture manifest failed validation")
         return manifest
 
-    def restore(
+    def restore_index(
         self,
         *,
         layer_index: int,
         subset_index: int,
         subset_total: int,
         subset: dict[str, Any],
-    ) -> dict[str, EXL3CaptureState] | None:
+    ) -> dict[str, EXL3CaptureRecord] | None:
+        """Validate a frontier and return lightweight on-disk records.
+
+        Payload hashes and the complete file set are checked here, but Hessian
+        tensors are not materialized.  Callers can therefore recover a very
+        large MoE layer with memory bounded by active projection concurrency.
+        """
+
         module_names = self._module_names(subset)
         key_body, key_sha256, directory = self._key(
             layer_index=layer_index,
@@ -253,8 +280,8 @@ class EXL3CaptureFrontierStore:
             raise EXL3CaptureFrontierError("capture manifest has incomplete modules")
 
         expected_files = {MANIFEST_FILENAME}
-        states: dict[str, EXL3CaptureState] = {}
-        loaded_hessians: dict[str, torch.Tensor] = {}
+        records_by_module: dict[str, EXL3CaptureRecord] = {}
+        validated_files: set[str] = set()
         for record in records:
             module_name = record.get("module") if isinstance(record, dict) else None
             identity = (
@@ -266,7 +293,7 @@ class EXL3CaptureFrontierStore:
             sample_count = record.get("sample_count") if isinstance(record, dict) else None
             if (
                 module_name not in module_names
-                or module_name in states
+                or module_name in records_by_module
                 or identity is None
                 or record.get("expert_identity") != identity
                 or record.get("phase") != _projection_phase(identity)
@@ -286,7 +313,22 @@ class EXL3CaptureFrontierStore:
                 raise EXL3CaptureFrontierError("capture Hessian path is unsafe")
             path = directory / relative
             expected_files.add(relative)
-            if relative not in loaded_hessians:
+            tensor_spec = payload.get("tensor")
+            if (
+                not isinstance(tensor_spec, dict)
+                or tensor_spec.get("dtype") != str(torch.float32)
+                or not isinstance(tensor_spec.get("shape"), list)
+                or len(tensor_spec["shape"]) != 2
+                or tensor_spec["shape"][0] != tensor_spec["shape"][1]
+                or tensor_spec.get("bytes")
+                != tensor_spec["shape"][0] * tensor_spec["shape"][1] * 4
+                or not isinstance(payload.get("bytes"), int)
+                or payload["bytes"] < tensor_spec["bytes"]
+            ):
+                raise EXL3CaptureFrontierError(
+                    f"capture Hessian has invalid geometry: {relative}"
+                )
+            if relative not in validated_files:
                 if (
                     not path.is_file()
                     or path.is_symlink()
@@ -296,23 +338,11 @@ class EXL3CaptureFrontierStore:
                     raise EXL3CaptureFrontierError(
                         f"capture Hessian failed validation: {relative}"
                     )
-                tensors = load_safetensors_file(path, device="cpu")
-                hessian = tensors.get("H")
-                if (
-                    set(tensors) != {"H"}
-                    or not isinstance(hessian, torch.Tensor)
-                    or _tensor_spec(hessian) != payload.get("tensor")
-                    or hessian.dtype != torch.float32
-                    or hessian.ndim != 2
-                    or hessian.shape[0] != hessian.shape[1]
-                ):
-                    raise EXL3CaptureFrontierError(
-                        f"capture Hessian has invalid geometry: {relative}"
-                    )
-                loaded_hessians[relative] = hessian
-            states[module_name] = EXL3CaptureState(
+                validated_files.add(relative)
+            records_by_module[module_name] = EXL3CaptureRecord(
                 module=module_name,
-                hessian=loaded_hessians[relative],
+                path=path,
+                payload=deepcopy(payload),
                 sample_count=sample_count,
                 route_evidence=deepcopy(record.get("route_evidence")),
             )
@@ -331,8 +361,64 @@ class EXL3CaptureFrontierStore:
                 actual_files.add(relative)
             else:
                 raise EXL3CaptureFrontierError("capture frontier entry is unsupported")
-        if actual_files != expected_files or set(states) != set(module_names):
+        if actual_files != expected_files or set(records_by_module) != set(module_names):
             raise EXL3CaptureFrontierError("capture-frontier file set is inconsistent")
+        return records_by_module
+
+    @staticmethod
+    def load_record_hessian(
+        record: EXL3CaptureRecord,
+        *,
+        device: torch.device | str = "cpu",
+    ) -> torch.Tensor:
+        """Hydrate one already validated Hessian payload."""
+
+        tensors = load_safetensors_file(record.path, device=str(device))
+        hessian = tensors.get("H")
+        if (
+            set(tensors) != {"H"}
+            or not isinstance(hessian, torch.Tensor)
+            or _tensor_spec(hessian) != record.payload.get("tensor")
+            or hessian.dtype != torch.float32
+            or hessian.ndim != 2
+            or hessian.shape[0] != hessian.shape[1]
+        ):
+            raise EXL3CaptureFrontierError(
+                f"capture Hessian has invalid geometry: {record.path.name}"
+            )
+        return hessian
+
+    def restore(
+        self,
+        *,
+        layer_index: int,
+        subset_index: int,
+        subset_total: int,
+        subset: dict[str, Any],
+    ) -> dict[str, EXL3CaptureState] | None:
+        """Compatibility API that eagerly materializes a complete frontier."""
+
+        records = self.restore_index(
+            layer_index=layer_index,
+            subset_index=subset_index,
+            subset_total=subset_total,
+            subset=subset,
+        )
+        if records is None:
+            return None
+        loaded_hessians: dict[Path, torch.Tensor] = {}
+        states: dict[str, EXL3CaptureState] = {}
+        for module_name, record in records.items():
+            hessian = loaded_hessians.get(record.path)
+            if hessian is None:
+                hessian = self.load_record_hessian(record)
+                loaded_hessians[record.path] = hessian
+            states[module_name] = EXL3CaptureState(
+                module=module_name,
+                hessian=hessian,
+                sample_count=record.sample_count,
+                route_evidence=deepcopy(record.route_evidence),
+            )
         return states
 
     def commit(
@@ -344,8 +430,38 @@ class EXL3CaptureFrontierStore:
         subset: dict[str, Any],
         states: Iterable[EXL3CaptureState],
     ) -> dict[str, Any]:
-        module_names = self._module_names(subset)
         state_by_module = {state.module: state for state in states}
+        descriptors = {
+            module: EXL3CaptureDescriptor(
+                module=module,
+                sample_count=state.sample_count,
+                route_evidence=deepcopy(state.route_evidence),
+            )
+            for module, state in state_by_module.items()
+        }
+        return self.commit_streaming(
+            layer_index=layer_index,
+            subset_index=subset_index,
+            subset_total=subset_total,
+            subset=subset,
+            descriptors=descriptors.values(),
+            hessian_loader=lambda module: state_by_module[module].hessian,
+        )
+
+    def commit_streaming(
+        self,
+        *,
+        layer_index: int,
+        subset_index: int,
+        subset_total: int,
+        subset: dict[str, Any],
+        descriptors: Iterable[EXL3CaptureDescriptor],
+        hessian_loader: Callable[[str], torch.Tensor],
+    ) -> dict[str, Any]:
+        """Commit a frontier while holding only one expert family in memory."""
+
+        module_names = self._module_names(subset)
+        state_by_module = {state.module: state for state in descriptors}
         if set(state_by_module) != set(module_names):
             raise EXL3CaptureFrontierError("capture commit has incomplete modules")
         key_body, key_sha256, destination = self._key(
@@ -369,7 +485,9 @@ class EXL3CaptureFrontierStore:
         try:
             hessian_root = temporary / "hessians"
             hessian_root.mkdir()
-            grouped: dict[tuple[str, int, int, str], list[EXL3CaptureState]] = {}
+            grouped: dict[
+                tuple[str, int, int, str], list[EXL3CaptureDescriptor]
+            ] = {}
             identities: dict[str, dict[str, Any]] = {}
             for module_name in module_names:
                 state = state_by_module[module_name]
@@ -377,17 +495,9 @@ class EXL3CaptureFrontierStore:
                 if identity is None:
                     raise EXL3CaptureFrontierError("capture module is not routed")
                 phase = _projection_phase(identity)
-                hessian = state.hessian
-                if (
-                    state.sample_count <= 0
-                    or not isinstance(hessian, torch.Tensor)
-                    or hessian.device.type != "cpu"
-                    or hessian.dtype != torch.float32
-                    or hessian.ndim != 2
-                    or hessian.shape[0] != hessian.shape[1]
-                ):
+                if state.sample_count <= 0:
                     raise EXL3CaptureFrontierError(
-                        f"capture Hessian is not normalized CPU FP32: {module_name}"
+                        f"capture sample count is invalid: {module_name}"
                     )
                 identities[module_name] = identity
                 grouped.setdefault(
@@ -403,18 +513,37 @@ class EXL3CaptureFrontierStore:
             payload_by_module: dict[str, dict[str, Any]] = {}
             for payload_index, (_group, group_states) in enumerate(sorted(grouped.items())):
                 reference = group_states[0]
+                reference_hessian = hessian_loader(reference.module)
+                if (
+                    not isinstance(reference_hessian, torch.Tensor)
+                    or reference_hessian.device.type != "cpu"
+                    or reference_hessian.dtype != torch.float32
+                    or reference_hessian.ndim != 2
+                    or reference_hessian.shape[0] != reference_hessian.shape[1]
+                ):
+                    raise EXL3CaptureFrontierError(
+                        f"capture Hessian is not normalized CPU FP32: {reference.module}"
+                    )
                 for candidate in group_states[1:]:
-                    if (
-                        candidate.sample_count != reference.sample_count
-                        or candidate.route_evidence != reference.route_evidence
-                        or not torch.equal(candidate.hessian, reference.hessian)
-                    ):
+                    candidate_hessian = hessian_loader(candidate.module)
+                    matches = (
+                        isinstance(candidate_hessian, torch.Tensor)
+                        and candidate_hessian.device.type == "cpu"
+                        and candidate_hessian.dtype == torch.float32
+                        and candidate_hessian.ndim == 2
+                        and candidate_hessian.shape == reference_hessian.shape
+                        and candidate.sample_count == reference.sample_count
+                        and candidate.route_evidence == reference.route_evidence
+                        and torch.equal(candidate_hessian, reference_hessian)
+                    )
+                    del candidate_hessian
+                    if not matches:
                         raise EXL3CaptureFrontierError(
                             "gate/up captures for one expert are not identical"
                         )
                 relative = Path("hessians") / f"hessian-{payload_index:06d}.safetensors"
                 path = temporary / relative
-                save_safetensors_file({"H": reference.hessian.contiguous()}, path)
+                save_safetensors_file({"H": reference_hessian.contiguous()}, path)
                 descriptor = os.open(path, os.O_RDONLY)
                 try:
                     os.fsync(descriptor)
@@ -424,10 +553,11 @@ class EXL3CaptureFrontierStore:
                     "file": relative.as_posix(),
                     "bytes": path.stat().st_size,
                     "xxh3_128": _xxh3_128_file(path),
-                    "tensor": _tensor_spec(reference.hessian),
+                    "tensor": _tensor_spec(reference_hessian),
                 }
                 for state in group_states:
                     payload_by_module[state.module] = payload
+                del reference_hessian
             _fsync_directory(hessian_root)
 
             captures = []
@@ -487,7 +617,9 @@ class EXL3CaptureFrontierStore:
 __all__ = [
     "CAPTURE_FRONTIER_CONTRACT",
     "CAPTURE_FRONTIER_ENV",
+    "EXL3CaptureDescriptor",
     "EXL3CaptureFrontierError",
     "EXL3CaptureFrontierStore",
+    "EXL3CaptureRecord",
     "EXL3CaptureState",
 ]

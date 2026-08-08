@@ -61,8 +61,9 @@ from ..utils.exl3_error_ledger import (
 )
 from ..utils.exl3_capture_frontier import (
     CAPTURE_FRONTIER_ENV,
+    EXL3CaptureDescriptor,
     EXL3CaptureFrontierStore,
-    EXL3CaptureState,
+    EXL3CaptureRecord,
 )
 from ..utils.exl3_projection_checkpoint import (
     EXL3ProjectionCheckpointStore,
@@ -518,22 +519,22 @@ class EXL3Processor(LoopProcessor):
         subset_total: int,
         subset: Dict[str, NamedModule],
     ) -> bool:
-        """Restore normalized Hessians and route evidence before subset replay."""
+        """Index normalized Hessians and route evidence before subset replay."""
 
         provenance = self._ledger_provenance()
         store = self._capture_frontier_store_for_run(provenance)
         if store is None:
             return False
         task_names = self._subset_task_names_by_full_name(subset)
-        states = store.restore(
+        records = store.restore_index(
             layer_index=layer_index,
             subset_index=subset_index,
             subset_total=subset_total,
             subset=subset,
         )
-        if states is None:
+        if records is None:
             return False
-        if set(states) != set(task_names):
+        if set(records) != set(task_names):
             raise RuntimeError("EXL3 capture frontier restored incomplete tasks")
 
         route_cache = getattr(self, "_natural_route_evidence_cache", None)
@@ -541,7 +542,7 @@ class EXL3Processor(LoopProcessor):
             route_cache = {}
             self._natural_route_evidence_cache = route_cache
         requires_routes = route_evidence_required(provenance)
-        for full_name, state in states.items():
+        for full_name, record in records.items():
             task_name = task_names[full_name]
             task = self.tasks.get(task_name)
             if not isinstance(task, dict):
@@ -556,38 +557,38 @@ class EXL3Processor(LoopProcessor):
                 raise RuntimeError(
                     f"EXL3 refused to mix live and restored capture for `{full_name}`"
                 )
-            if requires_routes and state.route_evidence is None:
+            if requires_routes and record.route_evidence is None:
                 raise RuntimeError(
                     f"EXL3 restored no required route evidence for `{full_name}`"
                 )
-            capture.H = state.hessian
-            capture.nsamples = state.sample_count
+            capture.nsamples = record.sample_count
             capture._device_hessian_partials.clear()
             capture._device_sample_counts.clear()
             capture._hessian_dirty = False
-            capture._final_hessian_device_hint = torch.device("cpu")
-            task["route_evidence"] = copy.deepcopy(state.route_evidence)
+            capture._final_hessian_device_hint = None
+            task["capture_frontier_record"] = record
+            task["route_evidence"] = copy.deepcopy(record.route_evidence)
 
             identity = routed_expert_identity(full_name)
-            if identity is not None and state.route_evidence is not None:
+            if identity is not None and record.route_evidence is not None:
                 family_id = (
                     identity["block_namespace"],
                     identity["logical_layer"],
                 )
                 family = route_cache.setdefault(family_id, {})
                 previous = family.setdefault(
-                    identity["expert"], copy.deepcopy(state.route_evidence)
+                    identity["expert"], copy.deepcopy(record.route_evidence)
                 )
-                if previous != state.route_evidence:
+                if previous != record.route_evidence:
                     raise RuntimeError(
                         f"EXL3 restored conflicting route evidence for `{full_name}`"
                     )
         log.info(
-            "EXL3 capture frontier restored: layer=%s subset=%s/%s modules=%s",
+            "EXL3 capture frontier indexed lazily: layer=%s subset=%s/%s modules=%s",
             layer_index,
             subset_index + 1,
             subset_total,
-            len(states),
+            len(records),
         )
         return True
 
@@ -606,56 +607,140 @@ class EXL3Processor(LoopProcessor):
         if store is None:
             return
         requires_routes = route_evidence_required(provenance)
-        states = []
+        descriptors = []
+        captures_by_name: dict[str, GPTQ] = {}
         for task_name, named_module in subset.items():
             task = self.tasks.get(task_name)
             full_name = getattr(named_module, "full_name", None)
             if not isinstance(task, dict) or not isinstance(full_name, str):
                 raise RuntimeError("EXL3 cannot persist an incomplete capture task")
             capture: GPTQ = task["capture"]
-            hessian = capture.finalize_hessian(target_device=torch.device("cpu"))
             route_evidence = task.get("route_evidence")
             if requires_routes and route_evidence is None:
                 raise RuntimeError(
                     f"EXL3 captured no required route evidence for `{full_name}`"
                 )
-            states.append(
-                EXL3CaptureState(
+            captures_by_name[full_name] = capture
+            descriptors.append(
+                EXL3CaptureDescriptor(
                     module=full_name,
-                    hessian=hessian,
                     sample_count=int(capture.nsamples),
                     route_evidence=copy.deepcopy(route_evidence),
                 )
             )
-        manifest = store.commit(
+        before = self.capture_memory_summary()
+        manifest = store.commit_streaming(
             layer_index=layer_index,
             subset_index=subset_index,
             subset_total=subset_total,
             subset=subset,
-            states=states,
+            descriptors=descriptors,
+            hessian_loader=lambda full_name: captures_by_name[
+                full_name
+            ].snapshot_hessian(target_device=torch.device("cpu")),
         )
-        # Gate/up projections consume the same expert input. The durable
-        # manifest binds that equality by pointing both records at one payload;
-        # mirror the deduplication in RAM so a long-lived frontier retains one
-        # normalized Hessian rather than two.
-        task_names = self._subset_task_names_by_full_name(subset)
-        canonical_hessians: dict[str, torch.Tensor] = {}
-        for record in manifest["captures"]:
-            full_name = record["module"]
-            task_name = task_names[full_name]
-            capture: GPTQ = self.tasks[task_name]["capture"]
-            payload_file = record["hessian"]["file"]
-            canonical = canonical_hessians.setdefault(payload_file, capture.H)
-            capture.H = canonical
-        del states
+        after = self.capture_memory_summary()
         log.info(
-            "EXL3 capture frontier committed: layer=%s subset=%s/%s modules=%s manifest=%s",
+            "EXL3 capture frontier committed streaming: layer=%s subset=%s/%s "
+            "modules=%s manifest=%s memory_before=%s memory_after=%s",
             layer_index,
             subset_index + 1,
             subset_total,
             len(manifest["captures"]),
             manifest["manifest_sha256"],
+            before,
+            after,
         )
+
+    def _hydrate_capture_frontier(
+        self,
+        *,
+        task_entry: dict[str, Any],
+        capture: GPTQ,
+        target_device: torch.device,
+    ) -> None:
+        """Load only the restored Hessian needed by the current projection."""
+
+        record = task_entry.get("capture_frontier_record")
+        if record is None:
+            return
+        if not isinstance(record, EXL3CaptureRecord):
+            raise RuntimeError("EXL3 restored capture record is malformed")
+        store = self._capture_frontier_store_for_run(self._ledger_provenance())
+        if store is None:
+            raise RuntimeError("EXL3 restored capture store disappeared")
+        if getattr(capture, "H", None) is not None or getattr(
+            capture, "_device_hessian_partials", {}
+        ):
+            raise RuntimeError("EXL3 refused to mix lazy and live capture state")
+        hessian = store.load_record_hessian(record, device=target_device)
+        capture.H = hessian
+        capture.nsamples = record.sample_count
+        capture._hessian_dirty = False
+        capture._final_hessian_device_hint = target_device
+        task_entry.pop("capture_frontier_record", None)
+
+    def capture_memory_summary(self) -> dict[str, int]:
+        """Report live capture/source tensor bytes without retaining tensors."""
+
+        summary = {
+            "process_rss_bytes": 0,
+            "task_count": 0,
+            "lazy_frontier_records": 0,
+            "host_hessian_bytes": 0,
+            "device_hessian_bytes": 0,
+            "host_partial_bytes": 0,
+            "device_partial_bytes": 0,
+            "host_dense_quant_source_bytes": 0,
+            "device_dense_quant_source_bytes": 0,
+        }
+        try:
+            with open("/proc/self/statm", "r", encoding="ascii") as source:
+                resident_pages = int(source.read().split()[1])
+            summary["process_rss_bytes"] = resident_pages * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, IndexError, ValueError):
+            pass
+        seen_sources: set[int] = set()
+        for task in self.tasks.values():
+            if not isinstance(task, dict):
+                continue
+            summary["task_count"] += 1
+            if isinstance(task.get("capture_frontier_record"), EXL3CaptureRecord):
+                summary["lazy_frontier_records"] += 1
+            capture = task.get("capture")
+            hessian = getattr(capture, "H", None)
+            if isinstance(hessian, torch.Tensor):
+                key = (
+                    "host_hessian_bytes"
+                    if hessian.device.type == "cpu"
+                    else "device_hessian_bytes"
+                )
+                summary[key] += hessian.numel() * hessian.element_size()
+            for partial in getattr(capture, "_device_hessian_partials", {}).values():
+                key = (
+                    "host_partial_bytes"
+                    if partial.device.type == "cpu"
+                    else "device_partial_bytes"
+                )
+                summary[key] += partial.numel() * partial.element_size()
+            named_module = getattr(capture, "_named_module", None)
+            state = getattr(named_module, "state", None)
+            source = state.get("quant_source_module") if isinstance(state, dict) else None
+            if isinstance(source, torch.nn.Module) and id(source) not in seen_sources:
+                seen_sources.add(id(source))
+                for tensor in list(source.parameters()) + list(source.buffers()):
+                    key = (
+                        "host_dense_quant_source_bytes"
+                        if tensor.device.type == "cpu"
+                        else "device_dense_quant_source_bytes"
+                    )
+                    summary[key] += tensor.numel() * tensor.element_size()
+        return summary
+
+    def log_capture_memory_summary(self, context: str) -> dict[str, int]:
+        summary = self.capture_memory_summary()
+        log.info("EXL3 capture memory: context=%s summary=%s", context, summary)
+        return summary
 
     def discard_capture_frontiers_through(self, layer_index: int) -> None:
         """Drop captures covered by a durable layer-output boundary."""
@@ -829,6 +914,15 @@ class EXL3Processor(LoopProcessor):
 
         return self.tasks.get(module.name, False) is False
 
+    def has_captured_input_ids(self, name: str) -> bool:
+        """Report live or lazily restored calibration coverage."""
+
+        task = self.tasks.get(name)
+        if not isinstance(task, dict):
+            return False
+        capture = task.get("capture")
+        return bool(getattr(capture, "nsamples", 0) > 0)
+
     def pre_process_fwd_hook(
         self, name: str
     ) -> Callable[[Module, Tuple[torch.Tensor, ...], torch.Tensor], None]:
@@ -969,6 +1063,11 @@ class EXL3Processor(LoopProcessor):
         if target_device.type != "cuda":
             raise ValueError("EXL3 quantization requires CUDA/HIP execution.")
 
+        self._hydrate_capture_frontier(
+            task_entry=task_entry,
+            capture=capture,
+            target_device=target_device,
+        )
         hessian = prepare_exl3_hessian(
             capture,
             target_device=target_device,

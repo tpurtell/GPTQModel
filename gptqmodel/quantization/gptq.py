@@ -669,6 +669,40 @@ class GPTQ:
             self.H = self.create_H(target_device)
         return self.H
 
+    def snapshot_hessian(self, target_device: Optional[torch.device] = None) -> torch.Tensor:
+        """Return a normalized Hessian without changing the live capture.
+
+        Durable capture-frontier writers use this to stream one Hessian at a
+        time to host storage.  Unlike :meth:`finalize_hessian`, this method
+        deliberately leaves ``H`` and the per-device partials in place so the
+        subsequent quantization pass can consume the original device-local
+        capture without retaining every Hessian in host memory.
+        """
+
+        device = self._select_hessian_target_device(target_device)
+        with self.lock:
+            if not self._hessian_dirty and self.H is not None:
+                return self.H.detach().to(device=device, dtype=torch.float32)
+
+            total_samples = sum(self._device_sample_counts.values())
+            if total_samples != self.nsamples:
+                raise RuntimeError(
+                    f"Hessian snapshot sample-count drift: partials={total_samples}, "
+                    f"capture={self.nsamples}"
+                )
+            result = torch.zeros(
+                (self.columns, self.columns),
+                dtype=torch.float32,
+                device=device,
+            )
+            if total_samples == 0:
+                return result
+
+            for partial in self._device_hessian_partials.values():
+                result.add_(partial.to(device=device, dtype=torch.float32))
+            result.mul_(2.0 / float(total_samples))
+            return result
+
     def create_H(self, target_device):
         return torch.zeros((self.columns, self.columns), dtype=torch.float32,
                            device=self._select_hessian_target_device(target_device))

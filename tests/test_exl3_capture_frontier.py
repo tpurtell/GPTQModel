@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 from types import SimpleNamespace
 import threading
+import weakref
 
 import pytest
 import torch
 
 from gptqmodel.utils.exl3_capture_frontier import (
+    EXL3CaptureDescriptor,
     EXL3CaptureFrontierError,
     EXL3CaptureFrontierStore,
     EXL3CaptureState,
@@ -111,6 +114,57 @@ def test_capture_frontier_rejects_payload_tampering(tmp_path) -> None:
         )
 
 
+def test_streaming_commit_bounds_live_hessians_to_one_family(tmp_path) -> None:
+    store = EXL3CaptureFrontierStore(tmp_path / "frontier", family_join=FAMILY_JOIN)
+    subset = {}
+    descriptors = []
+    for expert in (7, 8, 9):
+        evidence = {"schema": "test-route", "expert": expert, "count": 32}
+        for projection in ("gate_proj", "up_proj"):
+            full_name = f"model.layers.3.mlp.experts.{expert}.{projection}"
+            subset[f"mlp.experts.{expert}.{projection}"] = SimpleNamespace(
+                full_name=full_name
+            )
+            descriptors.append(
+                EXL3CaptureDescriptor(
+                    module=full_name,
+                    sample_count=32,
+                    route_evidence=evidence,
+                )
+            )
+
+    live = 0
+    maximum_live = 0
+
+    def load_hessian(_module):
+        nonlocal live, maximum_live
+        tensor = torch.eye(4, dtype=torch.float32)
+        live += 1
+        maximum_live = max(maximum_live, live)
+
+        def release():
+            nonlocal live
+            live -= 1
+
+        weakref.finalize(tensor, release)
+        return tensor
+
+    manifest = store.commit_streaming(
+        layer_index=3,
+        subset_index=1,
+        subset_total=4,
+        subset=subset,
+        descriptors=descriptors,
+        hessian_loader=load_hessian,
+    )
+    gc.collect()
+
+    assert len(manifest["captures"]) == 6
+    assert len(list(store.root.rglob("*.safetensors"))) == 3
+    assert maximum_live <= 2
+    assert live == 0
+
+
 class _Capture:
     def __init__(self, hessian: torch.Tensor | None, sample_count: int) -> None:
         self.H = hessian
@@ -118,10 +172,14 @@ class _Capture:
         self._device_hessian_partials = {}
         self._device_sample_counts = {}
         self._hessian_dirty = False
+        self._final_hessian_device_hint = None
 
     def finalize_hessian(self, target_device=None):
         self.H = self.H.to(device=target_device)
         return self.H
+
+    def snapshot_hessian(self, target_device=None):
+        return self.H.to(device=target_device).clone()
 
 
 def _processor(subset, *, captured: bool) -> EXL3Processor:
@@ -155,10 +213,7 @@ def test_processor_commits_and_restores_before_replay(tmp_path, monkeypatch) -> 
         subset=subset,
     )
     captured_tasks = list(captured.tasks.values())
-    assert (
-        captured_tasks[0]["capture"].H.data_ptr()
-        == captured_tasks[1]["capture"].H.data_ptr()
-    )
+    assert all(task["capture"].H.device.type == "cpu" for task in captured_tasks)
 
     resumed = _processor(subset, captured=False)
     assert resumed.restore_subset_capture_frontier(
@@ -170,6 +225,14 @@ def test_processor_commits_and_restores_before_replay(tmp_path, monkeypatch) -> 
     for task in resumed.tasks.values():
         capture = task["capture"]
         assert capture.nsamples == 32
+        assert capture.H is None
+        assert task["capture_frontier_record"].sample_count == 32
+        resumed._hydrate_capture_frontier(
+            task_entry=task,
+            capture=capture,
+            target_device=torch.device("cpu"),
+        )
         assert torch.equal(capture.H, torch.eye(4, dtype=torch.float32))
         assert capture._hessian_dirty is False
+        assert "capture_frontier_record" not in task
         assert task["route_evidence"] == {"expert": 7}
