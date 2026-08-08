@@ -345,6 +345,73 @@ def test_deepseek_v4_mtp_replay_keeps_five_rows_joint_and_uses_target_lane_means
         assert torch.equal(projected_route.weights, tap_route.weights)
 
 
+def test_deepseek_v4_mtp_auxiliary_opens_without_target_shell(
+    monkeypatch, tmp_path
+) -> None:
+    config = _tiny_v4_config()
+    expected_keys = expected_deepseek_v4_mtp_checkpoint_keys(config)
+    fake_turtle = SimpleNamespace(
+        _weight_map={name: "model.safetensors" for name in expected_keys}
+    )
+    captured = {}
+
+    from gptqmodel.utils.structure import LazyTurtle
+
+    def maybe_create(**kwargs):
+        captured.update(kwargs)
+        return fake_turtle
+
+    monkeypatch.setattr(LazyTurtle, "maybe_create", maybe_create)
+    auxiliary = DeepSeekV4MTPAuxiliary.from_checkpoint(
+        config=config,
+        model_local_path=str(tmp_path),
+    )
+
+    assert isinstance(auxiliary.model, DeepSeekV4MTPAuxiliaryShell)
+    assert auxiliary.turtle_model is fake_turtle
+    assert auxiliary.checkpoint_contract == {
+        "block_count": 3,
+        "target_layer_ids": [0, 1, 2],
+        "routed_experts_per_block": 3,
+        "tensor_count": len(expected_keys),
+    }
+    assert captured["target_model"] is auxiliary.model
+    assert captured["model_local_path"] == str(tmp_path)
+    assert captured["module_tree"][0] == "mtp"
+
+
+def test_deepseek_v4_mtp_quantization_adapter_builds_without_target_model() -> None:
+    config = _tiny_v4_config()
+    shell = DeepSeekV4MTPAuxiliaryShell(config, device="cpu")
+    auxiliary = DeepSeekV4MTPAuxiliary(
+        model=shell,
+        turtle_model=SimpleNamespace(),
+        checkpoint_contract={"test": True},
+    )
+    embedding = torch.randn(
+        config.vocab_size, config.hidden_size, dtype=torch.bfloat16
+    )
+    qcfg = EXL3Config(bits=3.0, device="cpu")
+
+    adapter = DeepSeekV4MTPQuantizationModel.from_auxiliary(
+        auxiliary=auxiliary,
+        embedding_weight=embedding,
+        quantize_config=qcfg,
+        model_local_path="/tmp/deepseek-v4-test",
+    )
+
+    assert adapter.model is shell
+    assert adapter.model_local_path == "/tmp/deepseek-v4-test"
+    assert adapter.quantize_config.bits == 3.0
+    assert qcfg.module_include is None
+    assert adapter.quantize_config.module_is_included(
+        "mtp.1.mlp.experts.2.down_proj"
+    )
+    assert not adapter.quantize_config.module_is_included(
+        "mtp.1.mlp.shared_experts.down_proj"
+    )
+
+
 def test_deepseek_v4_mtp_quantization_adapter_replays_one_exact_block() -> None:
     torch.manual_seed(0xD55)
     config = _tiny_v4_config()

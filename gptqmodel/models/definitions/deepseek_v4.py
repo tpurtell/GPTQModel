@@ -335,6 +335,51 @@ class DeepSeekV4MTPAuxiliary:
     turtle_model: object
     checkpoint_contract: dict
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        *,
+        config,
+        model_local_path: str,
+        device: torch.device | str = "meta",
+    ) -> "DeepSeekV4MTPAuxiliary":
+        """Open only the integrated dSpark graph from a local checkpoint.
+
+        This factory deliberately does not require a target-model shell.  A
+        completed target-to-dSpark prefix can therefore fan out into independent
+        K2/K3/K4 auxiliary runs without constructing or traversing the target
+        layers again.
+        """
+
+        from ...utils.structure import LazyTurtle
+
+        if not isinstance(model_local_path, str) or not model_local_path:
+            raise ValueError(
+                "DeepSeek V4 MTP auxiliary loading requires a local checkpoint snapshot"
+            )
+        shell = DeepSeekV4MTPAuxiliaryShell(config, device=device)
+        turtle = LazyTurtle.maybe_create(
+            model_local_path=model_local_path,
+            config=shell.config,
+            model_init_kwargs={"device_map": {"": "cpu"}},
+            module_tree=deepseek_v4_mtp_module_tree(),
+            hf_conversion_map_reversed=deepseek_v4_mtp_checkpoint_mapping_reversed(),
+            target_model=shell,
+        )
+        if turtle is None:
+            raise RuntimeError(
+                f"DeepSeek V4 MTP cannot open checkpoint snapshot: {model_local_path}"
+            )
+        contract = validate_deepseek_v4_mtp_checkpoint_keys(
+            config,
+            turtle._weight_map.keys(),
+        )
+        return cls(
+            model=shell,
+            turtle_model=turtle,
+            checkpoint_contract=contract,
+        )
+
     def block(self, index: int) -> nn.Module:
         if index < 0 or index >= MTP_BLOCK_COUNT:
             raise IndexError(f"MTP block index {index} outside [0, {MTP_BLOCK_COUNT})")
@@ -1657,30 +1702,13 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
     ) -> DeepSeekV4MTPAuxiliary:
         """Build the checkpoint-backed MTP shell without attaching it to target layers."""
 
-        from ...utils.structure import LazyTurtle
-
         model_local_path = getattr(self, "model_local_path", None)
         if not model_local_path:
             raise RuntimeError("DeepSeek V4 MTP auxiliary loading requires a local checkpoint snapshot")
-        shell = DeepSeekV4MTPAuxiliaryShell(self.model.config, device=device)
-        turtle = LazyTurtle.maybe_create(
+        return DeepSeekV4MTPAuxiliary.from_checkpoint(
+            config=self.model.config,
             model_local_path=model_local_path,
-            config=shell.config,
-            model_init_kwargs={"device_map": {"": "cpu"}},
-            module_tree=copy.deepcopy(self.mtp_auxiliary_module_tree),
-            hf_conversion_map_reversed=deepseek_v4_mtp_checkpoint_mapping_reversed(),
-            target_model=shell,
-        )
-        if turtle is None:
-            raise RuntimeError(f"DeepSeek V4 MTP cannot open checkpoint snapshot: {model_local_path}")
-        contract = validate_deepseek_v4_mtp_checkpoint_keys(
-            self.model.config,
-            turtle._weight_map.keys(),
-        )
-        return DeepSeekV4MTPAuxiliary(
-            model=shell,
-            turtle_model=turtle,
-            checkpoint_contract=contract,
+            device=device,
         )
 
     def build_mtp_quant_source_module(
@@ -2046,10 +2074,10 @@ class _DeepSeekV4MTPInputView(Sequence):
 class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
     """Disjoint three-layer GPTQModel view over integrated dSpark/MTP.
 
-    This adapter is intentionally constructed only from an already loaded
-    target model and its prefix runtime.  It cannot be selected by AutoModel,
-    cannot append MTP blocks to target traversal, and exposes only routed
-    expert projections to EXL3 processing.
+    This adapter can be constructed from an integrated target run or directly
+    from a checkpoint-backed auxiliary shell and a completed target prefix. It
+    cannot be selected by AutoModel, cannot append MTP blocks to target
+    traversal, and exposes only routed expert projections to EXL3 processing.
     """
 
     module_tree = deepseek_v4_mtp_module_tree()
@@ -2064,30 +2092,33 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         return model
 
     @classmethod
-    def from_target_model(
+    def from_auxiliary(
         cls,
-        target_model: DeepSeekV4QModel,
         *,
         auxiliary: DeepSeekV4MTPAuxiliary,
         embedding_weight: torch.Tensor,
+        quantize_config,
+        model_local_path: str,
+        qlinear_kernel=None,
+        trust_remote_code: bool = False,
     ) -> "DeepSeekV4MTPQuantizationModel":
-        if not isinstance(target_model, DeepSeekV4QModel):
-            raise TypeError("target_model must be DeepSeekV4QModel")
         if not isinstance(auxiliary, DeepSeekV4MTPAuxiliary):
             raise TypeError("auxiliary must be DeepSeekV4MTPAuxiliary")
-        if target_model.quantize_config is None:
-            raise RuntimeError("MTP quantization requires the target quantize config")
-        mtp_quantize_config = copy.deepcopy(target_model.quantize_config)
+        if quantize_config is None:
+            raise RuntimeError("MTP quantization requires a quantize config")
+        if not isinstance(model_local_path, str) or not model_local_path:
+            raise ValueError("MTP quantization requires a local checkpoint snapshot")
+        mtp_quantize_config = copy.deepcopy(quantize_config)
         mtp_quantize_config.module_include = [MTP_ROUTED_EXPERT_MODULE_PATTERN]
         adapter = cls(
             model=auxiliary.model,
             quantized=False,
             quantize_config=mtp_quantize_config,
             tokenizer=None,
-            qlinear_kernel=target_model.qlinear_kernel,
+            qlinear_kernel=qlinear_kernel,
             load_quantized_model=False,
-            trust_remote_code=target_model.trust_remote_code,
-            model_local_path=target_model.model_local_path,
+            trust_remote_code=trust_remote_code,
+            model_local_path=model_local_path,
             turtle_model=auxiliary.turtle_model,
         )
         adapter._mtp_auxiliary = auxiliary
@@ -2102,6 +2133,27 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 block,
             )
         return adapter
+
+    @classmethod
+    def from_target_model(
+        cls,
+        target_model: DeepSeekV4QModel,
+        *,
+        auxiliary: DeepSeekV4MTPAuxiliary,
+        embedding_weight: torch.Tensor,
+    ) -> "DeepSeekV4MTPQuantizationModel":
+        """Compatibility factory for the integrated target-plus-MTP run."""
+
+        if not isinstance(target_model, DeepSeekV4QModel):
+            raise TypeError("target_model must be DeepSeekV4QModel")
+        return cls.from_auxiliary(
+            auxiliary=auxiliary,
+            embedding_weight=embedding_weight,
+            quantize_config=target_model.quantize_config,
+            qlinear_kernel=target_model.qlinear_kernel,
+            trust_remote_code=target_model.trust_remote_code,
+            model_local_path=target_model.model_local_path,
+        )
 
     def configure_mtp_activation_store(
         self,
