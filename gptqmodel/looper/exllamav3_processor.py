@@ -1185,6 +1185,33 @@ class EXL3Processor(LoopProcessor):
             f"Unsupported EXL3 module type: {target.__class__.__name__}"
         )
 
+    def _stage_runtime_weight(
+        self,
+        *,
+        module: NamedModule,
+        out_tensors: dict[str, torch.Tensor],
+        target_device: torch.device,
+    ) -> None:
+        """Reconstruct one packed result inside the device trellis critical section.
+
+        Distributed checkpoint catch-up can return many packed results much faster
+        than fresh trellis work.  Their EXL3 reconstruction kernels must not overlap
+        a local Hessian transform/trellis kernel (or another reconstruction) on the
+        same coordinator GPU.
+        """
+
+        target_device = torch.device(target_device)
+        with self._distributed_local_quant_lock(target_device):
+            runtime_weight = reconstruct_exl3_tensors(
+                out_tensors,
+                device=target_device,
+                dtype=module.weight.dtype,
+            )
+            restored_weight = self._restore_module_weight(module, runtime_weight)
+            module.weight.data = restored_weight.to(dtype=module.weight.dtype)
+            if target_device.type == "cuda":
+                torch.cuda.synchronize(target_device)
+
     def process(
         self,
         module: NamedModule,
@@ -1543,13 +1570,11 @@ class EXL3Processor(LoopProcessor):
             stream_payload["bias"] = module.bias.detach()
         module.stream_state_payload_to_cpu(stream_payload)
 
-        runtime_weight = reconstruct_exl3_tensors(
-            out_tensors,
-            device=target_device,
-            dtype=module.weight.dtype,
+        self._stage_runtime_weight(
+            module=module,
+            out_tensors=out_tensors,
+            target_device=target_device,
         )
-        restored_weight = self._restore_module_weight(module, runtime_weight)
-        module.weight.data = restored_weight.to(dtype=module.weight.dtype)
 
         workspace_summary = getattr(capture, "_borrow_workspace_last_summary", None)
         workspace_totals = getattr(capture, "_borrow_workspace_totals", None)
@@ -1624,7 +1649,7 @@ class EXL3Processor(LoopProcessor):
         self.log_new_row(stat)
 
         capture.free()
-        del input_weight, runtime_weight, restored_weight, out_tensors, stream_payload
+        del input_weight, out_tensors, stream_payload
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         """Builds and installs the ExLlamaV3 module from the staged tensors."""

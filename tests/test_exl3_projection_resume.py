@@ -215,6 +215,39 @@ def test_capture_memory_summary_attributes_cache_model_and_heap_release(
     assert released["after"]["model_host_bytes"] == summary["model_host_bytes"]
 
 
+def test_runtime_reconstruction_shares_the_device_trellis_lock(monkeypatch) -> None:
+    processor = EXL3Processor.__new__(EXL3Processor)
+    processor._stats_lock = threading.Lock()
+    processor._distributed_local_quant_locks = {}
+    linear = nn.Linear(2, 3, bias=False, dtype=torch.bfloat16)
+    module = NamedModule(
+        linear,
+        "mlp.experts.0.gate_proj",
+        "model.layers.0.mlp.experts.0.gate_proj",
+        0,
+    )
+    device = torch.device("cpu")
+    observed = []
+
+    def reconstruct(_out_tensors, *, device, dtype):
+        lock = processor._distributed_local_quant_lock(torch.device(device))
+        observed.append((lock.locked(), dtype))
+        return torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    monkeypatch.setattr(processor_module, "reconstruct_exl3_tensors", reconstruct)
+    processor._stage_runtime_weight(
+        module=module,
+        out_tensors={"trellis": torch.zeros(1)},
+        target_device=device,
+    )
+
+    assert observed == [(True, torch.bfloat16)]
+    assert torch.equal(
+        module.module.weight.detach(),
+        torch.arange(6, dtype=torch.float32).reshape(2, 3).T.to(torch.bfloat16),
+    )
+
+
 def test_restore_completed_layer_installs_packed_modules_without_hessian(
     tmp_path,
 ) -> None:
