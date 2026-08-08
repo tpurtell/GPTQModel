@@ -673,7 +673,20 @@ class EXL3Processor(LoopProcessor):
             capture, "_device_hessian_partials", {}
         ):
             raise RuntimeError("EXL3 refused to mix lazy and live capture state")
-        hessian = store.load_record_hessian(record, device=target_device)
+        # Load through an owned host tensor. Direct concurrent safetensors
+        # hydration onto CUDA exposed storage/lifetime corruption under the
+        # real six-slot resume workload even though the persisted CPU payload
+        # remained hash-valid and positive semidefinite.
+        host_hessian = store.load_record_hessian(record, device="cpu")
+        hessian = host_hessian.to(
+            device=target_device,
+            dtype=torch.float32,
+            non_blocking=False,
+            copy=True,
+        )
+        if target_device.type == "cuda":
+            torch.cuda.synchronize(target_device)
+        del host_hessian
         capture.H = hessian
         capture.nsamples = record.sample_count
         capture._hessian_dirty = False

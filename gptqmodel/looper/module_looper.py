@@ -1503,6 +1503,21 @@ class ModuleLooper():
         with tf32_high_precision_guard():
             return self._loop_impl(fallback=fallback, **kwargs)
 
+    def _materialize_deferred_boundary_prefix(self, checkpoint) -> None:
+        """Install a recovered packed prefix only when publication needs it."""
+
+        if checkpoint is None:
+            return
+        materialize_prefix = getattr(
+            checkpoint, "materialize_deferred_prefix", None
+        )
+        if callable(materialize_prefix):
+            materialize_prefix(
+                model=self.gptq_model,
+                processors=self.processors,
+            )
+            self._check_loop_stop()
+
     @torch.inference_mode()
     def _loop_impl(self, fallback=None, **kwargs):
         """Execute the full layer-by-layer quantization workflow."""
@@ -1676,6 +1691,8 @@ class ModuleLooper():
         from ..utils.stream import STREAM_DEVICE_POOL
         STREAM_DEVICE_POOL.wait()
         self._check_loop_stop()
+
+        self._materialize_deferred_boundary_prefix(layer_boundary_checkpoint)
 
         # paranoid safety check
         # torch_sync()

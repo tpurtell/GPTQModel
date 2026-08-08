@@ -222,6 +222,18 @@ def test_processor_commits_and_restores_before_replay(tmp_path, monkeypatch) -> 
         subset_total=4,
         subset=subset,
     )
+    load_devices = []
+    load_record_hessian = EXL3CaptureFrontierStore.load_record_hessian
+
+    def tracked_load(record, *, device="cpu"):
+        load_devices.append(str(device))
+        return load_record_hessian(record, device=device)
+
+    monkeypatch.setattr(
+        EXL3CaptureFrontierStore,
+        "load_record_hessian",
+        staticmethod(tracked_load),
+    )
     for task in resumed.tasks.values():
         capture = task["capture"]
         assert capture.nsamples == 32
@@ -236,3 +248,4 @@ def test_processor_commits_and_restores_before_replay(tmp_path, monkeypatch) -> 
         assert capture._hessian_dirty is False
         assert "capture_frontier_record" not in task
         assert task["route_evidence"] == {"expert": 7}
+    assert load_devices == ["cpu", "cpu"]

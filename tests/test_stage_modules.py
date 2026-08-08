@@ -75,6 +75,21 @@ def test_cache_inputs_delegates_to_stage_capture(monkeypatch):
     assert captured["kwargs"]["calibration_data"] is data
 
 
+def test_deferred_boundary_prefix_materializes_once_before_publication():
+    looper = _make_looper()
+    model = looper.gptq_model
+    processors = looper.processors
+    calls = []
+
+    class Boundary:
+        def materialize_deferred_prefix(self, **kwargs):
+            calls.append(kwargs)
+
+    looper._materialize_deferred_boundary_prefix(Boundary())
+
+    assert calls == [{"model": model, "processors": processors}]
+
+
 def test_assign_quant_device_prefers_balanced_hint():
     looper = _make_looper()
     looper._quant_devices = [torch.device("cuda:0"), torch.device("cuda:1")]
