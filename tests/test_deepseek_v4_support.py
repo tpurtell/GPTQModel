@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from types import SimpleNamespace
 
 import torch
@@ -431,8 +432,54 @@ def test_deepseek_v4_mtp_quantization_adapter_replays_one_exact_block() -> None:
     assert prepared[0]["input_ids"].shape == (2, 5)
     assert prepared[0]["attention_mask"].all()
 
+    class LazyReplay(Sequence):
+        row_counts = [2]
+        gptqmodel_calibration_summary = {
+            "batch_count": 1,
+            "input_ids_total_length": 10,
+            "input_ids_max_length": 5,
+            "total_calibration_tokens": 10,
+        }
+
+        def __init__(self):
+            self.reads = 0
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            if index != 0:
+                raise IndexError(index)
+            self.reads += 1
+            return batch
+
+    lazy = LazyReplay()
+    lazy_prepared = adapter.prepare_dataset(
+        lazy, calibration_dataset_sort=None, batch_size=1
+    )
+    assert lazy.reads == 0
+    lazy_cache = adapter.build_quantization_input_cache(
+        layers=list(adapter.model.mtp),
+        layer_names=[f"mtp.{index}" for index in range(3)],
+        calibration_data=lazy_prepared,
+        use_cache=False,
+    )
+    assert lazy.reads == 0
+    lazy_inputs = lazy_cache.layer_inputs[0]
+    lazy_kwargs = lazy_cache.layer_input_kwargs[0]
+    lazy_positions = lazy_cache.position_ids[0]
+    lazy_mask = lazy_cache.attention_masks[0]
+    assert lazy.reads == 1
+    assert lazy_cache.layer_inputs.row_counts == [2]
+
     reference = DeepSeekV4MTPReplay(shell, embedding_weight=embedding)
     state = reference.prepare_batch(batch)
+    torch.testing.assert_close(lazy_inputs[0], state.residual)
+    assert torch.equal(lazy_positions, state.proposal_position_ids)
+    assert torch.equal(lazy_mask, prepared[0]["attention_mask"])
+    assert torch.equal(
+        lazy_kwargs["_gptqmodel_mtp_projected_main"], state.projected_main
+    )
     expected, _ = reference.replay_block(0, state, capture_route=False)
     actual = adapter.run_input_capture(
         prepared[0], use_cache=False, data_device=torch.device("cpu")

@@ -884,6 +884,49 @@ def test_forward_executor_run_single_can_skip_moe_routing_override_for_replay():
     assert override_entries == ["enter"]
 
 
+def test_forward_executor_run_single_streams_outputs_through_model_writer():
+    calls = []
+
+    class Writer:
+        def __init__(self):
+            self.outputs = {}
+
+        def put(self, index, value):
+            self.outputs[index] = value
+
+        def finalize(self):
+            calls.append(("finalize", sorted(self.outputs)))
+            return ("disk-sequence", self.outputs)
+
+    writer = Writer()
+    looper = _make_forward_executor_looper()
+
+    def create_writer(**kwargs):
+        calls.append(("create", kwargs))
+        return writer
+
+    looper.gptq_model.create_quantization_layer_output_writer = create_writer
+    executor = ForwardExecutor(looper)
+    result = _run_executor_single(
+        executor,
+        _DummyForwardProcessor(),
+        apply_moe_config=False,
+    )
+
+    assert result == ("disk-sequence", writer.outputs)
+    assert calls[0] == (
+        "create",
+        {
+            "layer_index": 0,
+            "expected_batches": 1,
+            "progress_stage": None,
+            "apply_moe_config": False,
+        },
+    )
+    assert calls[1] == ("finalize", [0])
+    assert torch.equal(writer.outputs[0][0], torch.zeros(1, 1, 1))
+
+
 def test_forward_executor_run_single_can_skip_moe_lifecycle_for_replay():
     """Replay must also skip bypass/lifecycle hooks, not just routing override."""
 

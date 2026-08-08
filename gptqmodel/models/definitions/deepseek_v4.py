@@ -4,9 +4,11 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import copy
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from types import MethodType
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -1923,6 +1925,124 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         return target_submodule
 
 
+class _DeepSeekV4MTPPreparedDataset(Sequence[dict[str, torch.Tensor]]):
+    """Lazily normalize position-indexed MTP replay batches."""
+
+    def __init__(self, owner: "DeepSeekV4MTPQuantizationModel", source: Sequence):
+        self.owner = owner
+        self.source = source
+        summary = getattr(source, "gptqmodel_calibration_summary", None)
+        if not isinstance(summary, dict):
+            raise TypeError("lazy MTP replay source has no calibration summary")
+        self.gptqmodel_calibration_summary = dict(summary)
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    @property
+    def row_counts(self) -> list[int]:
+        counts = getattr(self.source, "row_counts", None)
+        if counts is None:
+            raise RuntimeError("lazy MTP replay source has no row counts")
+        return list(counts)
+
+    def __getitem__(self, index: int | slice):
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        item = self.source[index]
+        return self.owner._prepare_mtp_calibration_item(item, index=index)
+
+
+@dataclass(frozen=True)
+class _DeepSeekV4MTPInputBatch:
+    layer_inputs: list[torch.Tensor]
+    layer_input_kwargs: dict[str, Any]
+    position_ids: torch.Tensor
+    attention_mask: torch.Tensor
+
+
+class _DeepSeekV4MTPInputProvider:
+    """Generate one exact MTP layer-loop batch and retain only a tiny LRU."""
+
+    def __init__(
+        self,
+        owner: "DeepSeekV4MTPQuantizationModel",
+        dataset: _DeepSeekV4MTPPreparedDataset,
+        *,
+        cache_entries: int = 4,
+    ) -> None:
+        self.owner = owner
+        self.dataset = dataset
+        self.cache_entries = int(cache_entries)
+        self._cache: OrderedDict[int, _DeepSeekV4MTPInputBatch] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    @property
+    def row_counts(self) -> list[int]:
+        return self.dataset.row_counts
+
+    def get(self, index: int) -> _DeepSeekV4MTPInputBatch:
+        with self._lock:
+            cached = self._cache.pop(index, None)
+            if cached is not None:
+                self._cache[index] = cached
+                return cached
+
+            example = self.dataset[index]
+            replay_batch = DeepSeekV4MTPReplayBatch(
+                target_taps=None,
+                projected_main=example[MTP_REPLAY_PROJECTED_MAIN],
+                anchor_token_ids=example["input_ids"][:, 0],
+                main_position_ids=example[MTP_REPLAY_MAIN_POSITION_IDS],
+                main_attention_mask=example[MTP_REPLAY_MAIN_ATTENTION_MASK],
+            )
+            state = self.owner._mtp_replay.prepare_batch(replay_batch)
+            prepared = _DeepSeekV4MTPInputBatch(
+                layer_inputs=[state.residual],
+                layer_input_kwargs={
+                    MTP_REPLAY_PROJECTED_MAIN: state.projected_main,
+                    MTP_REPLAY_MAIN_POSITION_IDS: state.main_position_ids,
+                    MTP_REPLAY_PROPOSAL_TOKEN_IDS: state.proposal_token_ids,
+                    MTP_REPLAY_ATTENTION_MASK: state.joint_attention_mask,
+                    MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS: (
+                        state.proposal_position_embeddings
+                    ),
+                    MTP_REPLAY_MAIN_POSITION_EMBEDDINGS: (
+                        state.main_position_embeddings
+                    ),
+                },
+                position_ids=state.proposal_position_ids,
+                attention_mask=example["attention_mask"],
+            )
+            self._cache[index] = prepared
+            while len(self._cache) > self.cache_entries:
+                self._cache.popitem(last=False)
+            return prepared
+
+
+class _DeepSeekV4MTPInputView(Sequence):
+    def __init__(self, provider: _DeepSeekV4MTPInputProvider, field: str):
+        self.provider = provider
+        self.field = field
+
+    def __len__(self) -> int:
+        return len(self.provider)
+
+    @property
+    def row_counts(self) -> list[int]:
+        if self.field != "layer_inputs":
+            raise AttributeError("row_counts")
+        return self.provider.row_counts
+
+    def __getitem__(self, index: int | slice):
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        return getattr(self.provider.get(index), self.field)
+
+
 class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
     """Disjoint three-layer GPTQModel view over integrated dSpark/MTP.
 
@@ -1983,6 +2103,50 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             )
         return adapter
 
+    def configure_mtp_activation_store(
+        self,
+        root: str,
+        *,
+        provenance: dict[str, Any],
+    ) -> None:
+        """Bind the durable, bounded output frontier used between MTP blocks."""
+
+        if not isinstance(root, str) or not root:
+            raise ValueError("MTP activation store root must be a non-empty path")
+        if not isinstance(provenance, dict) or not provenance:
+            raise ValueError("MTP activation store requires provenance")
+        self._mtp_activation_store_root = root
+        self._mtp_activation_store_provenance = copy.deepcopy(provenance)
+
+    def create_quantization_layer_output_writer(
+        self,
+        *,
+        layer_index: int,
+        expected_batches: int,
+        progress_stage: str | None,
+        apply_moe_config: bool,
+    ):
+        """Persist only authoritative post-quantization block outputs."""
+
+        if apply_moe_config or progress_stage != "Forward replay":
+            return None
+        root = getattr(self, "_mtp_activation_store_root", None)
+        provenance = getattr(self, "_mtp_activation_store_provenance", None)
+        if not isinstance(root, str) or not isinstance(provenance, dict):
+            raise RuntimeError("MTP activation store was not configured")
+        from ...looper.input_cache import DiskBackedLayerOutputWriter
+
+        return DiskBackedLayerOutputWriter(
+            root,
+            layer_index=layer_index,
+            expected_batches=expected_batches,
+            provenance={
+                **copy.deepcopy(provenance),
+                "block_index": int(layer_index),
+                "replay_contract": "deepseek-v4-mtp-joint-five-row-v1",
+            },
+        )
+
     def prepare_input_capture_layer(
         self,
         layer: nn.Module,
@@ -2023,49 +2187,85 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             raise ValueError(
                 "MTP replay batches are already jointly batched; batch_size must be 1"
             )
+        if (
+            isinstance(calibration_dataset, Sequence)
+            and isinstance(
+                getattr(calibration_dataset, "gptqmodel_calibration_summary", None),
+                dict,
+            )
+        ):
+            return _DeepSeekV4MTPPreparedDataset(self, calibration_dataset)
         prepared = []
         for index, item in enumerate(calibration_dataset):
-            batch = getattr(item, "replay_batch", item)
-            if not isinstance(batch, DeepSeekV4MTPReplayBatch):
-                raise TypeError(
-                    f"MTP calibration item {index} is not DeepSeekV4MTPReplayBatch"
-                )
-            self._mtp_replay._validate_batch(batch)
-            first = (
-                batch.projected_main
-                if batch.projected_main is not None
-                else batch.target_taps[0]
-            )
-            if first.device != self._mtp_replay.embedding_weight.device:
-                raise ValueError(
-                    "MTP replay batch and calibration embedding must share a device"
-                )
-            proposal_ids, _, _ = self._mtp_replay._proposal_metadata(
-                batch, dtype=first.dtype
-            )
-            prepared.append(
-                {
-                    "input_ids": proposal_ids,
-                    "attention_mask": torch.ones_like(
-                        proposal_ids, dtype=torch.bool
-                    ),
-                    MTP_REPLAY_PROJECTED_MAIN: (
-                        batch.projected_main
-                        if batch.projected_main is not None
-                        else torch.cat(batch.target_taps, dim=-1)
-                    ),
-                    MTP_REPLAY_MAIN_POSITION_IDS: batch.main_position_ids,
-                    MTP_REPLAY_MAIN_ATTENTION_MASK: batch.main_attention_mask,
-                    "_gptqmodel_mtp_has_projected_main": torch.tensor(
-                        batch.projected_main is not None,
-                        dtype=torch.bool,
-                        device=first.device,
-                    ),
-                }
-            )
+            prepared.append(self._prepare_mtp_calibration_item(item, index=index))
         if not prepared:
             raise ValueError("MTP calibration dataset must not be empty")
         return prepared
+
+    def _prepare_mtp_calibration_item(self, item, *, index: int) -> dict:
+        batch = getattr(item, "replay_batch", item)
+        if not isinstance(batch, DeepSeekV4MTPReplayBatch):
+            raise TypeError(
+                f"MTP calibration item {index} is not DeepSeekV4MTPReplayBatch"
+            )
+        self._mtp_replay._validate_batch(batch)
+        first = (
+            batch.projected_main
+            if batch.projected_main is not None
+            else batch.target_taps[0]
+        )
+        if first.device != self._mtp_replay.embedding_weight.device:
+            raise ValueError(
+                "MTP replay batch and calibration embedding must share a device"
+            )
+        proposal_ids, _, _ = self._mtp_replay._proposal_metadata(
+            batch, dtype=first.dtype
+        )
+        return {
+            "input_ids": proposal_ids,
+            "attention_mask": torch.ones_like(proposal_ids, dtype=torch.bool),
+            MTP_REPLAY_PROJECTED_MAIN: (
+                batch.projected_main
+                if batch.projected_main is not None
+                else torch.cat(batch.target_taps, dim=-1)
+            ),
+            MTP_REPLAY_MAIN_POSITION_IDS: batch.main_position_ids,
+            MTP_REPLAY_MAIN_ATTENTION_MASK: batch.main_attention_mask,
+            "_gptqmodel_mtp_has_projected_main": torch.tensor(
+                batch.projected_main is not None,
+                dtype=torch.bool,
+                device=first.device,
+            ),
+        }
+
+    def build_quantization_input_cache(
+        self,
+        *,
+        layers,
+        calibration_data,
+        use_cache: bool,
+        layer_names=None,
+    ):
+        """Expose the complete MTP corpus without retaining expanded tensors."""
+
+        del layer_names
+        if not isinstance(calibration_data, _DeepSeekV4MTPPreparedDataset):
+            return None
+        if use_cache:
+            raise ValueError("MTP calibration input capture does not use a cache")
+        if not layers or layers[0] is not self.model.mtp[0]:
+            raise RuntimeError("lazy MTP input cache was not bound to block zero")
+        from ...looper.input_cache import InputCache
+
+        provider = _DeepSeekV4MTPInputProvider(self, calibration_data)
+        return InputCache(
+            layer_inputs=_DeepSeekV4MTPInputView(provider, "layer_inputs"),
+            layer_input_kwargs=_DeepSeekV4MTPInputView(
+                provider, "layer_input_kwargs"
+            ),
+            position_ids=_DeepSeekV4MTPInputView(provider, "position_ids"),
+            attention_masks=_DeepSeekV4MTPInputView(provider, "attention_mask"),
+        )
 
     def run_input_capture(self, example, use_cache: bool, data_device):
         """Construct the exact first-block input, then let its pre-hook stop."""

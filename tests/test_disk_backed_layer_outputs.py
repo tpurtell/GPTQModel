@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+import torch
+
+from gptqmodel.looper.input_cache import (
+    DiskBackedLayerOutputSequence,
+    DiskBackedLayerOutputWriter,
+)
+
+
+def test_disk_backed_layer_outputs_are_sharded_and_random_access(tmp_path):
+    root = tmp_path / "activations"
+    provenance = {"plan_sha256": "a" * 64, "replay_batch_size": 4}
+    writer = DiskBackedLayerOutputWriter(
+        root,
+        layer_index=1,
+        expected_batches=5,
+        provenance=provenance,
+        shard_batches=2,
+    )
+    expected = {
+        index: torch.full((1 if index == 4 else 4, 3, 2), index, dtype=torch.bfloat16)
+        for index in range(5)
+    }
+    # Exercise out-of-order writes as used by two-device forward replay.
+    for index in (0, 2, 1, 4, 3):
+        writer.put(index, [expected[index]])
+    sequence = writer.finalize()
+
+    assert len(sequence) == 5
+    assert sequence.row_counts == [4, 4, 4, 4, 1]
+    for index in range(5):
+        assert torch.equal(sequence[index][0], expected[index])
+
+    manifest = json.loads((root / "layer-000001" / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    assert manifest["hash_algorithm"] == "xxh3-128"
+    assert len(manifest["shards"]) == 3
+    reopened = DiskBackedLayerOutputSequence.open(root / "layer-000001")
+    assert torch.equal(reopened[3][0], expected[3])
+
+
+def test_disk_backed_layer_outputs_resume_complete_shards(tmp_path):
+    root = tmp_path / "activations"
+    provenance = {"plan_sha256": "b" * 64}
+    first = DiskBackedLayerOutputWriter(
+        root,
+        layer_index=0,
+        expected_batches=3,
+        provenance=provenance,
+        shard_batches=2,
+    )
+    first.put(0, [torch.zeros(2, 4)])
+    first.put(1, [torch.ones(2, 4)])
+    first.abort()
+
+    resumed = DiskBackedLayerOutputWriter(
+        root,
+        layer_index=0,
+        expected_batches=3,
+        provenance=provenance,
+        shard_batches=2,
+    )
+    # The complete first shard is content-validated and need not be rewritten.
+    resumed.put(0, [torch.full((2, 4), 99.0)])
+    resumed.put(1, [torch.full((2, 4), 99.0)])
+    resumed.put(2, [torch.full((1, 4), 2.0)])
+    sequence = resumed.finalize()
+    assert torch.equal(sequence[0][0], torch.zeros(2, 4))
+    assert torch.equal(sequence[1][0], torch.ones(2, 4))
+    assert torch.equal(sequence[2][0], torch.full((1, 4), 2.0))
+
+
+def test_disk_backed_layer_outputs_reject_provenance_drift(tmp_path):
+    root = tmp_path / "activations"
+    writer = DiskBackedLayerOutputWriter(
+        root,
+        layer_index=0,
+        expected_batches=1,
+        provenance={"plan": "one"},
+    )
+    writer.put(0, [torch.zeros(1, 2)])
+    writer.abort()
+
+    with pytest.raises(ValueError, match="identity differs"):
+        DiskBackedLayerOutputWriter(
+            root,
+            layer_index=0,
+            expected_batches=1,
+            provenance={"plan": "two"},
+        )

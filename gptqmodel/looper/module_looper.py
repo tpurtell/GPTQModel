@@ -795,6 +795,23 @@ class ModuleLooper():
         if not layer_inputs:
             return []
 
+        declared = getattr(layer_inputs, "row_counts", None)
+        if declared is not None:
+            counts = list(declared)
+            expected = self._safe_len(layer_inputs)
+            if expected is None or len(counts) != expected:
+                raise ValueError(
+                    "lazy layer-input row counts differ from the batch sequence"
+                )
+            if any(
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count <= 0
+                for count in counts
+            ):
+                raise ValueError("lazy layer-input row counts must be positive integers")
+            return counts
+
         counts: List[int] = []
         for batch_inputs in layer_inputs:
             count = self._batch_row_count(batch_inputs)
@@ -1488,6 +1505,19 @@ class ModuleLooper():
 
     def cache_inputs(self, layers, calibration_data, use_cache, layer_names=None):
         """Capture and cache per-layer calibration inputs for later replay."""
+
+        lazy_cache_builder = getattr(
+            self.gptq_model, "build_quantization_input_cache", None
+        )
+        if callable(lazy_cache_builder):
+            lazy_cache = lazy_cache_builder(
+                layers=layers,
+                calibration_data=calibration_data,
+                use_cache=use_cache,
+                layer_names=layer_names,
+            )
+            if lazy_cache is not None:
+                return lazy_cache
 
         capture_stage = StageInputsCapture(self, logger=log)
         return capture_stage.cache_inputs(

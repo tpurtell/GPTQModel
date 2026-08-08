@@ -41,6 +41,53 @@ class ForwardExecutor:
         self.looper = looper
         self.log = logger or setup_logger()
 
+    def _output_collection(
+        self,
+        *,
+        layer_index: int,
+        expected_batches: int,
+        need_outputs: bool,
+        progress_stage: Optional[str],
+        apply_moe_config: bool,
+    ):
+        if not need_outputs:
+            return []
+        factory = getattr(
+            self.looper.gptq_model,
+            "create_quantization_layer_output_writer",
+            None,
+        )
+        if callable(factory):
+            result = factory(
+                layer_index=layer_index,
+                expected_batches=expected_batches,
+                progress_stage=progress_stage,
+                apply_moe_config=apply_moe_config,
+            )
+            if result is not None:
+                if not callable(getattr(result, "put", None)) or not callable(
+                    getattr(result, "finalize", None)
+                ):
+                    raise TypeError(
+                        "quantization layer-output writer lacks put/finalize"
+                    )
+                return result
+        return []
+
+    @staticmethod
+    def _store_output(collection, index: int, tensor: torch.Tensor) -> None:
+        value = [tensor]
+        put = getattr(collection, "put", None)
+        if callable(put):
+            put(index, value)
+        else:
+            collection.append(value)
+
+    @staticmethod
+    def _finish_outputs(collection):
+        finalize = getattr(collection, "finalize", None)
+        return finalize() if callable(finalize) else collection
+
     def _resolve_batch_progress(
         self,
         processor: "LoopProcessor",
@@ -231,7 +278,15 @@ class ForwardExecutor:
     ) -> List[List[torch.Tensor]]:
         """Run the forward pass sequentially on the current device."""
 
-        outputs: List[List[torch.Tensor]] = []
+        outputs = self._output_collection(
+            layer_index=layer_index,
+            expected_batches=self.looper._resolve_batch_total(
+                processor.num_batches, layer_inputs
+            ),
+            need_outputs=need_outputs,
+            progress_stage=progress_stage,
+            apply_moe_config=apply_moe_config,
+        )
         write_shared_kv_cache = bool(getattr(self.looper.gptq_model, "write_shared_kv_cache", False))
         prev_kv = shared_kv_cache_dict.get(layer_index - 1) if reuse_kv else None
         total_batches, batch_row_counts, total_rows = self._resolve_batch_progress(
@@ -253,9 +308,11 @@ class ForwardExecutor:
                         exec_device = module_target
 
                 # Capture input device before moving - used for output placement
-                input_device = layer_inputs[batch_idx][0].device if layer_inputs[batch_idx] else cur_layer_device
+                cached_layer_inputs = layer_inputs[batch_idx]
+                cached_layer_kwargs = layer_input_kwargs[batch_idx]
+                input_device = cached_layer_inputs[0].device if cached_layer_inputs else cur_layer_device
 
-                layer_input = [nested_move_to(inp, device=exec_device) for inp in layer_inputs[batch_idx]]
+                layer_input = [nested_move_to(inp, device=exec_device) for inp in cached_layer_inputs]
 
                 raw_mask = attention_masks[batch_idx]
                 attn_tensor = raw_mask if raw_mask is None else move_to(raw_mask, device=exec_device)
@@ -277,7 +334,7 @@ class ForwardExecutor:
                     if pos is not None:
                         additional_inputs["position_ids"] = move_to(pos, device=exec_device)
 
-                for key, value in layer_input_kwargs[batch_idx].items():
+                for key, value in cached_layer_kwargs.items():
                     if key in ["past_key_values", "past_key_value"]:
                         continue
                     additional_inputs[key] = nested_move_to(value, device=exec_device)
@@ -341,7 +398,7 @@ class ForwardExecutor:
                         update_replay_kwargs(
                             layer=module,
                             layer_output=module_output,
-                            layer_input_kwargs=layer_input_kwargs[batch_idx],
+                            layer_input_kwargs=cached_layer_kwargs,
                             target_device=target_device,
                         )
 
@@ -352,14 +409,14 @@ class ForwardExecutor:
                     calib_device_cfg = self.looper.gptq_model.quantize_config.calibration_data_device
                     target_device = input_device if calib_device_cfg is not None else cur_layer_device
                     primary = move_to(primary, device=target_device)
-                    outputs.append([primary])
+                    self._store_output(outputs, batch_idx, primary)
 
                 if module_output is not None:
                     del module_output
 
                 rows_for_batch = batch_row_counts[batch_idx] if batch_idx < len(batch_row_counts) else 0
                 if rows_for_batch <= 0:
-                    rows_for_batch = self.looper._batch_row_count(layer_inputs[batch_idx]) if layer_inputs and batch_idx < len(layer_inputs) else 1
+                    rows_for_batch = self.looper._batch_row_count(cached_layer_inputs) if layer_inputs and batch_idx < len(layer_inputs) else 1
                     rows_for_batch = max(rows_for_batch, 1)
 
                 processed_rows = min(processed_rows + rows_for_batch, total_rows)
@@ -371,7 +428,7 @@ class ForwardExecutor:
             finally:
                 processor._set_current_batch_index(None)
 
-        return outputs
+        return self._finish_outputs(outputs)
 
     def run_parallel(
         self,
@@ -411,6 +468,13 @@ class ForwardExecutor:
             progress_total_rows=progress_total_rows,
         )
         stage_label = progress_stage or "Forward"
+        output_collection = self._output_collection(
+            layer_index=layer_index,
+            expected_batches=total_batches,
+            need_outputs=need_outputs,
+            progress_stage=progress_stage,
+            apply_moe_config=apply_moe_config,
+        )
 
         replica_pb: "ProgressBar" | None = None
         replica_title = ""
@@ -482,6 +546,7 @@ class ForwardExecutor:
             write_shared_kv_cache = bool(getattr(self.looper.gptq_model, "write_shared_kv_cache", False))
             prev_kv = shared_kv_cache_dict.get(layer_index - 1) if reuse_kv else None
             results: Dict[int, torch.Tensor | None] = {}
+            input_devices: Dict[int, torch.device] = {}
             processed_rows = 0
 
             if self.looper.gptq_model.quantize_config.compute_device_filter is not None:
@@ -548,6 +613,17 @@ class ForwardExecutor:
                         continue
                     batch_idx = segment_indices[position]
                     replica = module_replicas[device]
+                    cached_layer_inputs = layer_inputs[batch_idx]
+                    cached_layer_kwargs = layer_input_kwargs[batch_idx]
+                    cached_attention_mask = attention_masks[batch_idx]
+                    cached_position_ids = (
+                        position_ids[batch_idx] if position_ids else None
+                    )
+                    input_devices[batch_idx] = (
+                        cached_layer_inputs[0].device
+                        if cached_layer_inputs
+                        else cur_layer_device
+                    )
                     submitter = (
                         device_thread_pool.submit_serial
                         if device.type in ("cuda", "xpu", "npu", "mps")
@@ -561,10 +637,10 @@ class ForwardExecutor:
                             replica,
                             processor,
                             batch_idx,
-                            layer_inputs[batch_idx],
-                            layer_input_kwargs[batch_idx],
-                            attention_masks[batch_idx],
-                            position_ids[batch_idx] if position_ids else None,
+                            cached_layer_inputs,
+                            cached_layer_kwargs,
+                            cached_attention_mask,
+                            cached_position_ids,
                             gptq_model=self.looper.gptq_model,
                             support_batch_quantize=self.looper.support_batch_quantize,
                             is_lm_head_module=is_lm_head_module,
@@ -578,12 +654,16 @@ class ForwardExecutor:
                 for fut in futures:
                     batch_idx, module_output, kv_next = fut.result()
                     if need_outputs and module_output is not None:
-                        input_device = layer_inputs[batch_idx][0].device if layer_inputs[batch_idx] else cur_layer_device
+                        input_device = input_devices.pop(batch_idx, cur_layer_device)
                         target_device = input_device if calib_device_cfg is not None else cur_layer_device
                         # Move each batch result to its final target device as
                         # soon as the worker finishes.
                         primary = module_output[0] if isinstance(module_output, tuple) else module_output
-                        results[batch_idx] = move_to(primary, device=target_device)
+                        primary = move_to(primary, device=target_device)
+                        if callable(getattr(output_collection, "put", None)):
+                            self._store_output(output_collection, batch_idx, primary)
+                        else:
+                            results[batch_idx] = primary
                         del module_output
                     if (reuse_kv or write_shared_kv_cache) and kv_next is not None and shared_kv_cache_dict.get(layer_index) is None:
                         shared_kv_cache_dict[layer_index] = nested_move_to(kv_next, device=cur_layer_device)
@@ -612,6 +692,9 @@ class ForwardExecutor:
 
         if not need_outputs:
             return []
+
+        if callable(getattr(output_collection, "put", None)):
+            return self._finish_outputs(output_collection)
 
         ordered_outputs: List[List[torch.Tensor]] = []
         for idx in range(total_batches):
