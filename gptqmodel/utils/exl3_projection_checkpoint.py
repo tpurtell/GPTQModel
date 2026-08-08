@@ -12,7 +12,7 @@ import os
 import tempfile
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import torch
 from safetensors.torch import load as load_safetensors
@@ -181,6 +181,115 @@ class EXL3ProjectionCheckpointStore:
             prefix / f"{request_sha256}.json",
             prefix / f"{request_sha256}.safetensors",
         )
+
+    def inspect_committed_manifests(
+        self,
+    ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+        """Inspect every committed request/result without reading tensor payloads.
+
+        This is the inexpensive discovery half of layer-boundary catch-up.  It
+        authenticates the directory layout, manifest, request, and declared
+        tensor identity, but deliberately does not hash or decode the packed
+        tensor file.  A caller must use :meth:`load_committed` before trusting
+        or installing any discovered result.
+        """
+
+        if not self.root.exists():
+            return
+        if not self.root.is_dir() or self.root.is_symlink():
+            raise ValueError("EXL3 checkpoint root is not a regular directory")
+
+        hex_chars = frozenset("0123456789abcdef")
+        seen_manifests: dict[str, Path] = {}
+        seen_tensors: dict[str, Path] = {}
+        for first in self.root.iterdir():
+            if (
+                not first.is_dir()
+                or first.is_symlink()
+                or len(first.name) != 2
+                or any(char not in hex_chars for char in first.name)
+            ):
+                raise ValueError("EXL3 checkpoint root contains an unsafe entry")
+            for second in first.iterdir():
+                if (
+                    not second.is_dir()
+                    or second.is_symlink()
+                    or len(second.name) != 2
+                    or any(char not in hex_chars for char in second.name)
+                ):
+                    raise ValueError("EXL3 checkpoint root contains an unsafe prefix")
+                for path in second.iterdir():
+                    if not path.is_file() or path.is_symlink():
+                        raise ValueError("EXL3 checkpoint contains a non-regular file")
+                    if path.suffix not in {".json", ".safetensors"}:
+                        raise ValueError("EXL3 checkpoint contains an unexpected file")
+                    request_sha256 = path.name.removesuffix(path.suffix)
+                    self._paths(request_sha256)
+                    if (
+                        request_sha256[:2] != first.name
+                        or request_sha256[2:4] != second.name
+                    ):
+                        raise ValueError("EXL3 checkpoint file is under the wrong prefix")
+                    target = (
+                        seen_manifests
+                        if path.suffix == ".json"
+                        else seen_tensors
+                    )
+                    if request_sha256 in target:
+                        raise ValueError("EXL3 checkpoint contains a duplicate file")
+                    target[request_sha256] = path
+
+        if set(seen_manifests) != set(seen_tensors):
+            raise ValueError("EXL3 checkpoint contains an incomplete committed pair")
+
+        for request_sha256 in sorted(seen_manifests):
+            manifest_path = seen_manifests[request_sha256]
+            tensor_path = seen_tensors[request_sha256]
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ValueError("cannot inspect EXL3 projection checkpoint") from error
+            if not isinstance(manifest, dict):
+                raise ValueError("EXL3 projection checkpoint manifest is not an object")
+            manifest_digest = manifest.get("manifest_sha256")
+            manifest_body = {
+                key: value
+                for key, value in manifest.items()
+                if key != "manifest_sha256"
+            }
+            request = manifest.get("request")
+            request_body = (
+                {
+                    key: value
+                    for key, value in request.items()
+                    if key != "request_sha256"
+                }
+                if isinstance(request, dict)
+                else None
+            )
+            tensor_sha256 = manifest.get("tensor_sha256")
+            tensor_specs = manifest.get("tensors")
+            result = manifest.get("result")
+            if (
+                manifest.get("schema") != CHECKPOINT_SCHEMA
+                or manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
+                or manifest.get("request_sha256") != request_sha256
+                or not isinstance(request, dict)
+                or request.get("request_sha256") != request_sha256
+                or sha256_bytes(canonical_json_bytes(request_body))
+                != request_sha256
+                or manifest.get("tensor_file") != tensor_path.name
+                or not isinstance(tensor_sha256, str)
+                or len(tensor_sha256) != 64
+                or any(char not in hex_chars for char in tensor_sha256)
+                or not isinstance(tensor_specs, dict)
+                or not tensor_specs
+                or not isinstance(result, dict)
+                or manifest_digest
+                != sha256_bytes(canonical_json_bytes(manifest_body))
+            ):
+                raise ValueError("EXL3 projection checkpoint failed manifest validation")
+            yield deepcopy(request), deepcopy(result)
 
     def load_committed(
         self,

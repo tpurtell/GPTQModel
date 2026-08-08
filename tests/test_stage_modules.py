@@ -2290,6 +2290,144 @@ def test_capture_pristine_group_context_preserves_untouched_layer_io(monkeypatch
     assert observed["receive_kwargs"]["subset_total"] == 1
 
 
+def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
+    sentinel_inputs = [[torch.tensor([[[2.0]]])]]
+    sentinel_outputs = [[torch.tensor([[[7.0]]])]]
+    replay_calls = []
+    subset_calls = []
+
+    def fake_replay(*_args, **kwargs):
+        replay_calls.append(kwargs)
+        return sentinel_outputs
+
+    monkeypatch.setattr(
+        "gptqmodel.looper.stage_layer._replay_layer_outputs", fake_replay
+    )
+    monkeypatch.setattr(
+        "gptqmodel.looper.stage_layer.run_subset_stage",
+        lambda *args, **kwargs: subset_calls.append((args, kwargs)),
+    )
+
+    class DummyPB:
+        def __iter__(self):
+            return iter([0])
+
+        def __len__(self):
+            return 1
+
+        def title(self, *_args, **_kwargs):
+            return self
+
+        def subtitle(self, *_args, **_kwargs):
+            return self
+
+        def draw(self):
+            return self
+
+        def close(self):
+            return None
+
+    class DummyLogger:
+        def debug(self, *_args, **_kwargs):
+            return None
+
+        def info(self, *_args, **_kwargs):
+            return None
+
+        def isEnabledFor(self, *_args, **_kwargs):
+            return False
+
+    class DummyProcessor:
+        def __init__(self):
+            self.inputs_cache = types.SimpleNamespace(
+                layer_inputs=sentinel_inputs,
+                layer_input_kwargs=[{}],
+                position_ids=[],
+                attention_masks=[],
+            )
+            self.log_call_count = 0
+
+        def collect_memory_info(self, _layer_index):
+            return None
+
+        def clear_cache_data(self):
+            self.inputs_cache.layer_inputs = []
+
+        def receive_layer_inputs(self, layer_inputs):
+            self.inputs_cache.layer_inputs = layer_inputs
+
+    class Boundary:
+        def __init__(self, processor):
+            self.processor = processor
+            self.prepared = []
+            self.committed = []
+
+        def is_catchup_layer(self, layer_index):
+            return layer_index == 0
+
+        def prepare_catchup_layer(self, **kwargs):
+            self.prepared.append(kwargs)
+            return self.processor
+
+        def commit_layer(self, **kwargs):
+            self.committed.append(kwargs)
+
+    class DummyGptqModel:
+        def __init__(self, boundary):
+            self.model = torch.nn.Module()
+            self.model.config = types.SimpleNamespace(model_type="test")
+            self.quantize_config = QuantizeConfig(bits=4, group_size=128)
+            self.quantization_layer_boundary_checkpoint = boundary
+            self.lm_head = None
+
+        def should_quantize_layer(self, *_args):
+            return True
+
+        def pre_quantize(self, module):
+            return module
+
+        def post_quantize(self, module):
+            return module
+
+    class DummyLooper:
+        def __init__(self):
+            self.processors = [DummyProcessor()]
+            self.boundary = Boundary(self.processors[0])
+            self.gptq_model = DummyGptqModel(self.boundary)
+            self.events = []
+
+        def _check_loop_stop(self):
+            return False
+
+        def _emit_layer_complete(self, **kwargs):
+            self.events.append(kwargs)
+
+    looper = DummyLooper()
+    layers = [torch.nn.Linear(1, 1, bias=False)]
+    run_layer_stage(
+        looper,
+        layers=layers,
+        layer_modules=[["weight"]],
+        planning_layer_modules=[["weight"]],
+        layer_names=["model.layers.0"],
+        fallback=True,
+        shared_kv_cache_dict={},
+        pb=DummyPB(),
+        layer_count=1,
+        region_timer=None,
+        finalize_progress_cls=FinalizeProgressInfo,
+        logger=DummyLogger(),
+    )
+
+    assert len(looper.boundary.prepared) == 1
+    assert len(replay_calls) == 1
+    assert not subset_calls
+    assert looper.processors[0].inputs_cache.layer_inputs is sentinel_outputs
+    assert len(looper.boundary.committed) == 1
+    assert looper.boundary.committed[0]["layer_index"] == 0
+    assert [event["submodule_finalized"] for event in looper.events] == [False, True]
+
+
 def test_masked_hook_wrapper_trims_left_padded_inputs_before_add_batch():
     looper = ModuleLooper.__new__(ModuleLooper)
     looper.gptq_model = types.SimpleNamespace(quant_region_timer=None)

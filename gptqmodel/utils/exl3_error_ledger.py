@@ -387,37 +387,45 @@ def _journal_file_identity(path: Path) -> tuple[int, int, int, int]:
 
 
 def _load_journal_index(path: Path) -> set[str]:
+    digests: set[str] = set()
     try:
-        payload = path.read_bytes()
+        with path.open("rb") as source:
+            for line_number, line in enumerate(source, 1):
+                if not line.endswith(b"\n"):
+                    raise ValueError(
+                        "EXL3 error journal ends with a partial record"
+                    )
+                try:
+                    record = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ValueError(
+                        f"EXL3 error journal record {line_number} is invalid"
+                    ) from error
+                if (
+                    not isinstance(record, dict)
+                    or record.get("record_kind") != "projection"
+                ):
+                    raise ValueError(
+                        f"EXL3 error journal record {line_number} is not a projection"
+                    )
+                digest = record.get("record_sha256")
+                unbound = {
+                    key: value
+                    for key, value in record.items()
+                    if key != "record_sha256"
+                }
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or hashlib.sha256(_canonical_json_bytes(unbound)).hexdigest()
+                    != digest
+                ):
+                    raise ValueError(
+                        f"EXL3 error journal record {line_number} failed its digest"
+                    )
+                digests.add(digest)
     except OSError as error:
         raise ValueError(f"cannot read EXL3 error journal: {path}") from error
-    if payload and not payload.endswith(b"\n"):
-        raise ValueError("EXL3 error journal ends with a partial record")
-    digests: set[str] = set()
-    for line_number, line in enumerate(payload.splitlines(), 1):
-        try:
-            record = json.loads(line)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(
-                f"EXL3 error journal record {line_number} is invalid"
-            ) from error
-        if not isinstance(record, dict) or record.get("record_kind") != "projection":
-            raise ValueError(
-                f"EXL3 error journal record {line_number} is not a projection"
-            )
-        digest = record.get("record_sha256")
-        unbound = {
-            key: value for key, value in record.items() if key != "record_sha256"
-        }
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or hashlib.sha256(_canonical_json_bytes(unbound)).hexdigest() != digest
-        ):
-            raise ValueError(
-                f"EXL3 error journal record {line_number} failed its digest"
-            )
-        digests.add(digest)
     return digests
 
 

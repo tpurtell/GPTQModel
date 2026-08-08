@@ -390,6 +390,11 @@ def run_layer_stage(
         if looper._check_loop_stop():
             break
         is_lm_head_module = layer_index >= layer_count
+        layer_boundary_checkpoint = getattr(
+            looper.gptq_model,
+            "quantization_layer_boundary_checkpoint",
+            None,
+        )
 
         if not is_lm_head_module and layer_index < start_layer_index:
             if durable_progress_logs:
@@ -413,6 +418,30 @@ def run_layer_stage(
             )
             pb.close()
             break
+
+        catchup_processor = None
+        is_catchup_layer = False
+        if not is_lm_head_module and layer_boundary_checkpoint is not None:
+            catchup_query = getattr(
+                layer_boundary_checkpoint, "is_catchup_layer", None
+            )
+            is_catchup_layer = callable(catchup_query) and bool(
+                catchup_query(layer_index)
+            )
+            if is_catchup_layer:
+                prepare_catchup = getattr(
+                    layer_boundary_checkpoint, "prepare_catchup_layer", None
+                )
+                if not callable(prepare_catchup):
+                    raise TypeError(
+                        "quantization layer-boundary catch-up has no "
+                        "prepare_catchup_layer() method"
+                    )
+                catchup_processor = prepare_catchup(
+                    model=looper.gptq_model,
+                    processors=looper.processors,
+                    layer_index=layer_index,
+                )
 
         if is_lm_head_module:
             layer_title = "Quantizing lm_head"
@@ -484,6 +513,103 @@ def run_layer_stage(
             cur_layer_device = normalize_device_like(looper.gptq_model.quantize_config.device) or CPU
         full = find_modules(module, name=looper.gptq_model.lm_head if is_lm_head_module else "")
 
+        if is_catchup_layer:
+            # A legacy run can already have every projection in this layer
+            # durably packed even though it predates activation boundaries.
+            # Restore those exact checkpoint tensors, forward the packed layer
+            # once, and promote the resulting activation boundary.  Rebuilding
+            # Hessians here would be both wasteful and numerically unsafe.
+            processor = catchup_processor
+            processor.log_call_count = 0
+            processor.collect_memory_info(layer_index)
+            cache = processor.inputs_cache
+            layer_inputs = cache.layer_inputs
+            layer_input_kwargs = cache.layer_input_kwargs
+            position_ids = cache.position_ids
+            attention_masks = cache.attention_masks
+            layer_outputs = _replay_layer_outputs(
+                looper,
+                module=module,
+                processor=processor,
+                layer_inputs=layer_inputs,
+                layer_input_kwargs=layer_input_kwargs,
+                position_ids=position_ids,
+                attention_masks=attention_masks,
+                cur_layer_device=cur_layer_device,
+                is_lm_head_module=False,
+                shared_kv_cache_dict=shared_kv_cache_dict,
+                layer_index=layer_index,
+                layer_descriptor=layer_descriptor,
+                full=full,
+                log=log,
+                region_timer=region_timer,
+                replay_plan=None,
+            )
+            if not layer_outputs:
+                raise RuntimeError(
+                    f"packed catch-up produced no output for layer {layer_index}"
+                )
+
+            output_requirement = getattr(
+                looper.gptq_model, "quantization_layer_output_required", None
+            )
+            if callable(output_requirement) and output_requirement(
+                layer_index=layer_index,
+                layer_name=layer_name,
+                layer_count=layer_count,
+            ):
+                output_receiver = getattr(
+                    looper.gptq_model,
+                    "receive_quantization_layer_outputs",
+                    None,
+                )
+                if not callable(output_receiver):
+                    raise RuntimeError(
+                        "model requested quantization layer outputs without a receiver"
+                    )
+                output_receiver(
+                    layer_index=layer_index,
+                    layer_name=layer_name,
+                    layer_outputs=layer_outputs,
+                    layer_input_kwargs=layer_input_kwargs,
+                    position_ids=position_ids,
+                    attention_masks=attention_masks,
+                )
+
+            layers[layer_index] = looper.gptq_model.post_quantize(module)
+            processor.clear_cache_data()
+            processor.receive_layer_inputs(layer_outputs)
+            torch_sync()
+            looper._emit_layer_complete(
+                layer_idx=layer_index,
+                submodule_finalized=False,
+                raise_in_place=True,
+            )
+            looper._emit_layer_complete(
+                layer_idx=layer_index,
+                submodule_finalized=True,
+                raise_in_place=True,
+            )
+            commit_boundary = getattr(
+                layer_boundary_checkpoint, "commit_layer", None
+            )
+            if not callable(commit_boundary):
+                raise TypeError(
+                    "quantization layer-boundary checkpoint has no commit_layer() method"
+                )
+            commit_boundary(
+                model=looper.gptq_model,
+                processor=processor,
+                layer_index=layer_index,
+                layer_name=layer_descriptor,
+            )
+            if durable_progress_logs:
+                log.info(
+                    "StageLayer: packed catch-up boundary committed for layer=%s",
+                    layer_index,
+                )
+            continue
+
         for p_index, processor in enumerate(looper.processors):
             # Each processor contributes a quantization phase; walk them in
             # order so their caches and side effects line up with the pipeline.
@@ -511,11 +637,6 @@ def run_layer_stage(
                     layer_name=layer_name,
                     layer_count=layer_count,
                 )
-            )
-            layer_boundary_checkpoint = getattr(
-                looper.gptq_model,
-                "quantization_layer_boundary_checkpoint",
-                None,
             )
             boundary_output_required = (
                 not is_lm_head_module

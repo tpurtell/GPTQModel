@@ -62,7 +62,9 @@ from ..utils.exl3_error_ledger import (
 from ..utils.exl3_projection_checkpoint import (
     EXL3ProjectionCheckpointStore,
     build_projection_request,
+    canonical_json_bytes,
     checkpoint_root_from_provenance,
+    sha256_bytes,
 )
 from ..utils.exl3_remote import (
     CoordinatorSlot,
@@ -1217,8 +1219,8 @@ class EXL3Processor(LoopProcessor):
                 )
             request, tensors, result = loaded
             ledger_record = result.get("ledger_record")
-            actual_record_sha256 = (
-                append_exl3_error_journal(self.error_journal_path, ledger_record)
+            calculated_record_sha256 = (
+                sha256_bytes(canonical_json_bytes(ledger_record))
                 if isinstance(ledger_record, dict)
                 else None
             )
@@ -1226,13 +1228,17 @@ class EXL3Processor(LoopProcessor):
                 request.get("module") != module_name
                 or request.get("processor_layer_index") != layer_index
                 or request.get("family_join") != family_join
-                or actual_record_sha256 != expected_record_sha256
+                or calculated_record_sha256 != expected_record_sha256
+                or not isinstance(ledger_record, dict)
                 or ledger_record.get("module") != module_name
                 or ledger_record.get("processor_layer_index") != layer_index
             ):
                 raise RuntimeError(
                     f"EXL3 packed checkpoint identity differs for `{module_name}`"
                 )
+            actual_record_sha256 = append_exl3_error_journal(
+                self.error_journal_path, ledger_record
+            )
             try:
                 source_module = model.model.get_submodule(module_name)
             except AttributeError as error:
