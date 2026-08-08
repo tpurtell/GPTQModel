@@ -1180,6 +1180,7 @@ class EXL3Processor(LoopProcessor):
         model: BaseQModel,
         layer_index: int,
         projection_entries: list[dict[str, str]],
+        materialize_device: torch.device | str | None = None,
     ) -> None:
         """Install packed modules directly, without Hessian/corpus reconstruction."""
 
@@ -1269,11 +1270,20 @@ class EXL3Processor(LoopProcessor):
                 submodule=named,
                 tensors=tensors,
             )
-            offload_to_disk(
-                model=model.model,
-                module=packed,
-                disk_path=offload_path,
-            )
+            if materialize_device is None:
+                offload_to_disk(
+                    model=model.model,
+                    module=packed,
+                    disk_path=offload_path,
+                )
+            else:
+                target_device = torch.device(materialize_device)
+                if target_device.type == "cpu":
+                    raise RuntimeError(
+                        "EXL3 catch-up replay requires an accelerator device"
+                    )
+                packed.to(device=target_device)
+                setattr(packed, "target_device", target_device)
 
             duration = result.get("duration_seconds")
             proxy_error = result.get("proxy_error")
@@ -1330,6 +1340,35 @@ class EXL3Processor(LoopProcessor):
                 except (TypeError, ValueError):
                     pass
                 self.durations.append(float(stat[PROCESS_LOG_TIME]))
+
+    def offload_restored_layer_checkpoints(
+        self,
+        *,
+        model: BaseQModel,
+        layer_index: int,
+    ) -> None:
+        """Offload a replayed packed layer before its boundary is promoted."""
+
+        offload_path = getattr(self.qcfg, "offload_to_disk_path", None)
+        if not getattr(self.qcfg, "offload_to_disk", False) or not offload_path:
+            raise RuntimeError("EXL3 layer restore requires durable disk offload")
+        entries = self.completed_layer_checkpoint_entries(layer_index)
+        if not entries:
+            raise RuntimeError(
+                f"EXL3 restored layer {layer_index} contains no projections"
+            )
+        for entry in entries:
+            module_name = entry["module"]
+            packed = model.model.get_submodule(module_name)
+            if not isinstance(packed, ExllamaV3Linear):
+                raise RuntimeError(
+                    f"EXL3 restored layer target is not packed: `{module_name}`"
+                )
+            offload_to_disk(
+                model=model.model,
+                module=packed,
+                disk_path=offload_path,
+            )
 
     def finalize(self, model: BaseQModel, **kwargs):
         """Marks the model as EXL3-quantized and runs shared finalization logic."""

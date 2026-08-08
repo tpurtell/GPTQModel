@@ -646,11 +646,19 @@ def test_forward_device_override_materializes_meta_fallback_named_module():
 
 
 def test_lazy_forward_materializes_direct_state_but_not_projection_weights():
+    class PackedProjection(torch.nn.Module):
+        QUANT_TYPE = "test-packed"
+
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("trellis", torch.empty(2, device="meta"))
+
     class LazyLayer(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.scale = torch.nn.Parameter(torch.empty(2, device="meta"))
             self.proj = torch.nn.Linear(2, 2, bias=False, device="meta")
+            self.packed = PackedProjection()
 
     layer = LazyLayer()
     projection = NamedModule(
@@ -679,6 +687,7 @@ def test_lazy_forward_materializes_direct_state_but_not_projection_weights():
     assert calls == [(layer, torch.device("cpu"))]
     assert layer.scale.device.type == "cpu"
     assert layer.proj.weight.device.type == "meta"
+    assert layer.packed.trellis.device.type == "meta"
 
 
 def test_rehome_processor_task_rebinds_dict_capture_to_quant_source():
@@ -2360,6 +2369,7 @@ def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
         def __init__(self, processor):
             self.processor = processor
             self.prepared = []
+            self.finalized = []
             self.committed = []
 
         def is_catchup_layer(self, layer_index):
@@ -2368,6 +2378,9 @@ def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
         def prepare_catchup_layer(self, **kwargs):
             self.prepared.append(kwargs)
             return self.processor
+
+        def finalize_catchup_layer(self, **kwargs):
+            self.finalized.append(kwargs)
 
         def commit_layer(self, **kwargs):
             self.committed.append(kwargs)
@@ -2395,12 +2408,16 @@ def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
             self.boundary = Boundary(self.processors[0])
             self.gptq_model = DummyGptqModel(self.boundary)
             self.events = []
+            self.direct_state_calls = []
 
         def _check_loop_stop(self):
             return False
 
         def _emit_layer_complete(self, **kwargs):
             self.events.append(kwargs)
+
+        def _prepare_layer_direct_state_for_forward(self, *args, **kwargs):
+            self.direct_state_calls.append((args, kwargs))
 
     looper = DummyLooper()
     layers = [torch.nn.Linear(1, 1, bias=False)]
@@ -2421,8 +2438,11 @@ def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
 
     assert len(looper.boundary.prepared) == 1
     assert len(replay_calls) == 1
+    assert replay_calls[0]["force_serial"] is True
     assert not subset_calls
+    assert len(looper.direct_state_calls) == 1
     assert looper.processors[0].inputs_cache.layer_inputs is sentinel_outputs
+    assert len(looper.boundary.finalized) == 1
     assert len(looper.boundary.committed) == 1
     assert looper.boundary.committed[0]["layer_index"] == 0
     assert [event["submodule_finalized"] for event in looper.events] == [False, True]

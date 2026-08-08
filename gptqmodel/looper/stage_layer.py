@@ -182,6 +182,7 @@ def _replay_layer_outputs(
     log,
     region_timer,
     replay_plan: Optional[SubsetPlan] = None,
+    force_serial: Optional[bool] = None,
 ) -> List[List[torch.Tensor]]:
     """Replay one layer forward to materialize outputs for the next layer."""
 
@@ -208,6 +209,9 @@ def _replay_layer_outputs(
         replay_forward_device_map = replay_plan.forward_device_map
         replay_force_serial = replay_plan.subset_forward_serial
         replay_preserve_module_devices = replay_plan.preserve_module_devices
+
+    if force_serial is not None:
+        replay_force_serial = bool(force_serial)
 
     replay_msg = (
         "Forward replay "
@@ -527,6 +531,11 @@ def run_layer_stage(
             layer_input_kwargs = cache.layer_input_kwargs
             position_ids = cache.position_ids
             attention_masks = cache.attention_masks
+            looper._prepare_layer_direct_state_for_forward(
+                module,
+                cur_layer_device,
+                projection_modules=full,
+            )
             layer_outputs = _replay_layer_outputs(
                 looper,
                 module=module,
@@ -544,6 +553,7 @@ def run_layer_stage(
                 log=log,
                 region_timer=region_timer,
                 replay_plan=None,
+                force_serial=True,
             )
             if not layer_outputs:
                 raise RuntimeError(
@@ -576,6 +586,19 @@ def run_layer_stage(
                     attention_masks=attention_masks,
                 )
 
+            finalize_catchup = getattr(
+                layer_boundary_checkpoint, "finalize_catchup_layer", None
+            )
+            if not callable(finalize_catchup):
+                raise TypeError(
+                    "quantization layer-boundary catch-up has no "
+                    "finalize_catchup_layer() method"
+                )
+            finalize_catchup(
+                model=looper.gptq_model,
+                processor=processor,
+                layer_index=layer_index,
+            )
             layers[layer_index] = looper.gptq_model.post_quantize(module)
             processor.clear_cache_data()
             processor.receive_layer_inputs(layer_outputs)

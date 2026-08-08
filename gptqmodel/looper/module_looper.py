@@ -1143,7 +1143,7 @@ class ModuleLooper():
         module_names = {id(child): name for name, child in module.named_modules()}
         materialized = 0
         for child in module.modules():
-            if id(child) in excluded_ids:
+            if id(child) in excluded_ids or getattr(child, "QUANT_TYPE", None):
                 continue
             direct_tensors = list(child.parameters(recurse=False)) + list(
                 child.buffers(recurse=False)
