@@ -251,16 +251,28 @@ def test_projection_journal_fsyncs_individually_bound_records(tmp_path):
     assert [row["projection"] for row in rows] == ["w1", "w2"]
 
 
-def test_projection_journal_is_idempotent_across_process_index_rebuild(tmp_path):
+def test_projection_journal_is_idempotent_across_process_index_rebuild(
+    tmp_path, monkeypatch
+):
     journal = tmp_path / "in-progress.jsonl"
     record = _record("gate_proj", 1.0)
 
     first = append_exl3_error_journal(journal, record)
     second = append_exl3_error_journal(journal, record)
     ledger_module._JOURNAL_INDEX.clear()
-    third = append_exl3_error_journal(journal, record)
+    original_load = ledger_module._load_journal_index
+    load_calls = []
 
-    assert first == second == third
+    def counted_load(path):
+        load_calls.append(path)
+        return original_load(path)
+
+    monkeypatch.setattr(ledger_module, "_load_journal_index", counted_load)
+    third = append_exl3_error_journal(journal, record)
+    fourth = append_exl3_error_journal(journal, record)
+
+    assert first == second == third == fourth
+    assert load_calls == [journal.resolve()]
     rows = [json.loads(line) for line in journal.read_bytes().splitlines()]
     assert len(rows) == 1
     assert rows[0]["record_sha256"] == first

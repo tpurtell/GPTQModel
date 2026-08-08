@@ -447,6 +447,7 @@ def append_exl3_error_journal(
         cached = _JOURNAL_INDEX.get(path)
         if cached is None or cached[0] != identity:
             digests = _load_journal_index(path) if existed else set()
+            _JOURNAL_INDEX[path] = (identity, digests)
         else:
             digests = cached[1]
         if bound["record_sha256"] in digests:
