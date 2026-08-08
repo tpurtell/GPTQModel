@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import json
 from types import SimpleNamespace
 import threading
 import weakref
@@ -28,6 +29,17 @@ def _subset():
         ),
         "mlp.experts.7.up_proj": SimpleNamespace(
             full_name="model.layers.3.mlp.experts.7.up_proj"
+        ),
+    }
+
+
+def _mtp_subset():
+    return {
+        "mlp.experts.7.gate_proj": SimpleNamespace(
+            full_name="mtp.0.mlp.experts.7.gate_proj"
+        ),
+        "mlp.experts.7.up_proj": SimpleNamespace(
+            full_name="mtp.0.mlp.experts.7.up_proj"
         ),
     }
 
@@ -76,6 +88,61 @@ def test_capture_frontier_round_trip_deduplicates_gate_up(tmp_path) -> None:
     assert list(store.root.iterdir())
     store.discard_through(3)
     assert list(store.root.iterdir()) == []
+
+
+def test_scoped_discard_keeps_other_block_namespace(tmp_path) -> None:
+    store = EXL3CaptureFrontierStore(tmp_path / "frontier", family_join=FAMILY_JOIN)
+    hessian = torch.eye(4, dtype=torch.float32)
+    store.commit(
+        layer_index=3,
+        subset_index=0,
+        subset_total=1,
+        subset=_subset(),
+        states=_states(hessian),
+    )
+    mtp_subset = _mtp_subset()
+    mtp_states = [
+        EXL3CaptureState(
+            module=named.full_name,
+            hessian=hessian.clone(),
+            sample_count=32,
+            route_evidence={"schema": "test-route", "expert": 7, "count": 32},
+        )
+        for named in mtp_subset.values()
+    ]
+    store.commit(
+        layer_index=0,
+        subset_index=0,
+        subset_total=1,
+        subset=mtp_subset,
+        states=mtp_states,
+    )
+    assert len(list(store.root.iterdir())) == 2
+
+    store.discard_through(42, block_namespace="base")
+
+    remaining = list(store.root.iterdir())
+    assert len(remaining) == 1
+    manifest = json.loads((remaining[0] / "manifest.json").read_text())
+    assert all(
+        capture["expert_identity"]["block_namespace"] == "mtp"
+        for capture in manifest["captures"]
+    )
+    assert store.restore(
+        layer_index=0,
+        subset_index=0,
+        subset_total=1,
+        subset=mtp_subset,
+    )
+
+    store.discard_through(0, block_namespace="mtp")
+    assert list(store.root.iterdir()) == []
+
+
+def test_scoped_discard_rejects_unknown_namespace(tmp_path) -> None:
+    store = EXL3CaptureFrontierStore(tmp_path / "frontier", family_join=FAMILY_JOIN)
+    with pytest.raises(EXL3CaptureFrontierError, match="namespace is invalid"):
+        store.discard_through(0, block_namespace="other")
 
 
 def test_capture_frontier_rejects_gate_up_drift(tmp_path) -> None:

@@ -2204,7 +2204,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             EXL3CaptureFrontierStore(
                 capture_root,
                 family_join=family_join,
-            ).discard_through(layer_index)
+            ).discard_through(layer_index, block_namespace="mtp")
 
         return DiskBackedLayerOutputWriter(
             root,

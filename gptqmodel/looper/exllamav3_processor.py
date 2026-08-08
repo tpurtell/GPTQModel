@@ -934,7 +934,7 @@ class EXL3Processor(LoopProcessor):
 
         store = self._capture_frontier_store_for_run(self._ledger_provenance())
         if store is not None:
-            store.discard_through(layer_index)
+            store.discard_through(layer_index, block_namespace="base")
 
     def _distributed_local_quant_lock(self, device: torch.device) -> threading.Lock:
         """Serialize trellis search independently on each coordinator GPU."""

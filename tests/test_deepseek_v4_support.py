@@ -32,6 +32,10 @@ from gptqmodel.models.definitions.deepseek_v4 import (
 )
 from gptqmodel.quantization.config import AutoModuleDecoderConfig, EXL3Config
 from gptqmodel.looper.stage_inputs_capture import StageInputsCapture
+from gptqmodel.utils.exl3_capture_frontier import (
+    EXL3CaptureFrontierStore,
+    EXL3CaptureState,
+)
 
 
 def _tiny_v4_config() -> DeepseekV4Config:
@@ -693,11 +697,32 @@ def test_deepseek_v4_mtp_output_boundary_prunes_superseded_capture(
     monkeypatch,
 ) -> None:
     capture_root = tmp_path / "capture"
-    capture_root.mkdir()
-    layer_zero = capture_root / "layer-000000-subset-0000-of-0002-0123456789abcdef"
-    layer_one = capture_root / "layer-000001-subset-0000-of-0002-fedcba9876543210"
-    layer_zero.mkdir()
-    layer_one.mkdir()
+    family_join = {"recipe": "test"}
+    capture_store = EXL3CaptureFrontierStore(
+        capture_root,
+        family_join=family_join,
+    )
+    for layer_index in (0, 1):
+        module = f"mtp.{layer_index}.mlp.experts.0.gate_proj"
+        subset = {
+            "mlp.experts.0.gate_proj": SimpleNamespace(full_name=module),
+        }
+        capture_store.commit(
+            layer_index=layer_index,
+            subset_index=0,
+            subset_total=1,
+            subset=subset,
+            states=[
+                EXL3CaptureState(
+                    module=module,
+                    hessian=torch.eye(2, dtype=torch.float32),
+                    sample_count=1,
+                    route_evidence=None,
+                )
+            ],
+        )
+    layer_zero = next(capture_root.glob("layer-000000-*"))
+    layer_one = next(capture_root.glob("layer-000001-*"))
     monkeypatch.setenv("GPTQMODEL_EXL3_CAPTURE_FRONTIER", str(capture_root))
 
     harness = object.__new__(DeepSeekV4MTPQuantizationModel)
@@ -705,7 +730,7 @@ def test_deepseek_v4_mtp_output_boundary_prunes_superseded_capture(
         str(tmp_path / "activations"),
         provenance={
             "plan_sha256": "a" * 64,
-            "family_join": {"recipe": "test"},
+            "family_join": family_join,
         },
     )
     writer = harness.create_quantization_layer_output_writer(

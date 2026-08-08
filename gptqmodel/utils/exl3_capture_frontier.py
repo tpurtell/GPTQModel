@@ -598,8 +598,18 @@ class EXL3CaptureFrontierStore:
                 shutil.rmtree(temporary)
             raise
 
-    def discard_through(self, layer_index: int) -> None:
-        """Remove only frontiers made obsolete by a durable output boundary."""
+    def discard_through(
+        self,
+        layer_index: int,
+        *,
+        block_namespace: str | None = None,
+    ) -> None:
+        """Remove frontiers made obsolete by one namespace's output boundary."""
+
+        if block_namespace not in {None, "base", "mtp"}:
+            raise EXL3CaptureFrontierError(
+                "capture-frontier discard namespace is invalid"
+            )
 
         self._prune_incomplete()
         if not self.root.exists():
@@ -607,9 +617,82 @@ class EXL3CaptureFrontierStore:
         changed = False
         for path in self.root.iterdir():
             match = _COMMITTED_DIRECTORY.fullmatch(path.name)
-            if match is not None and int(match.group("layer")) <= layer_index:
-                shutil.rmtree(path)
-                changed = True
+            if match is None or int(match.group("layer")) > layer_index:
+                continue
+            if block_namespace is not None:
+                try:
+                    manifest = json.loads(
+                        (path / MANIFEST_FILENAME).read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                    raise EXL3CaptureFrontierError(
+                        "cannot read capture manifest during scoped discard"
+                    ) from error
+                key_body = (
+                    manifest.get("capture_key")
+                    if isinstance(manifest, dict)
+                    else None
+                )
+                key_sha256 = (
+                    manifest.get("capture_key_sha256")
+                    if isinstance(manifest, dict)
+                    else None
+                )
+                if (
+                    not isinstance(key_body, dict)
+                    or not isinstance(key_sha256, str)
+                    or _sha256_bytes(canonical_json_bytes(key_body))
+                    != key_sha256
+                ):
+                    raise EXL3CaptureFrontierError(
+                        "capture key failed validation during scoped discard"
+                    )
+                manifest = self._read_manifest(
+                    path,
+                    key_body=key_body,
+                    key_sha256=key_sha256,
+                )
+                module_names = key_body.get("module_names")
+                identities = (
+                    [routed_expert_identity(name) for name in module_names]
+                    if isinstance(module_names, list)
+                    and module_names
+                    and all(isinstance(name, str) for name in module_names)
+                    else []
+                )
+                captures = manifest.get("captures")
+                capture_modules = (
+                    [record.get("module") for record in captures]
+                    if isinstance(captures, list)
+                    and all(isinstance(record, dict) for record in captures)
+                    else []
+                )
+                namespaces = {
+                    identity["block_namespace"]
+                    for identity in identities
+                    if isinstance(identity, dict)
+                }
+                logical_layers = {
+                    identity["logical_layer"]
+                    for identity in identities
+                    if isinstance(identity, dict)
+                }
+                if (
+                    len(identities) != len(module_names)
+                    or any(identity is None for identity in identities)
+                    or len(namespaces) != 1
+                    or logical_layers != {key_body.get("layer_index")}
+                    or len(capture_modules) != len(module_names)
+                    or set(capture_modules) != set(module_names)
+                    or len(set(capture_modules)) != len(capture_modules)
+                ):
+                    raise EXL3CaptureFrontierError(
+                        "capture identity failed validation during scoped discard"
+                    )
+                if namespaces != {block_namespace}:
+                    continue
+            shutil.rmtree(path)
+            changed = True
         if changed:
             _fsync_directory(self.root)
 
