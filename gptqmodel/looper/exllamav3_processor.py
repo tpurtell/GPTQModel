@@ -59,6 +59,11 @@ from ..utils.exl3_error_ledger import (
     route_evidence_required,
     routed_expert_identity,
 )
+from ..utils.exl3_capture_frontier import (
+    CAPTURE_FRONTIER_ENV,
+    EXL3CaptureFrontierStore,
+    EXL3CaptureState,
+)
 from ..utils.exl3_projection_checkpoint import (
     EXL3ProjectionCheckpointStore,
     build_projection_request,
@@ -80,7 +85,7 @@ from ..utils.logger import setup_logger
 from ..utils.module_locks import parent_module_lock
 from ..utils.offload import offload_to_disk
 
-setup_logger()
+log = setup_logger()
 
 _EXL3_SIGMA_REG = 0.025
 _OUT_SCALES_TO_ARG = {
@@ -410,6 +415,8 @@ class EXL3Processor(LoopProcessor):
         self._remote_client = None
         self._projection_checkpoint_store_initialized = False
         self._projection_checkpoint_store = None
+        self._capture_frontier_store_initialized = False
+        self._capture_frontier_store = None
         self._distributed_local_quant_locks: dict[str, threading.Lock] = {}
         self.error_journal_path = os.getenv(JOURNAL_ENV) or str(
             Path(self.log_tmp_log_file_name).with_suffix(".exl3-error-ledger.jsonl")
@@ -465,6 +472,197 @@ class EXL3Processor(LoopProcessor):
         if store is not None and store.root != checkpoint_root:
             raise ValueError("EXL3 projection-checkpoint root changed during the run")
         return store
+
+    def _capture_frontier_store_for_run(
+        self, provenance: dict[str, Any] | None
+    ) -> EXL3CaptureFrontierStore | None:
+        """Construct the opt-in durable Hessian store at most once per run."""
+
+        configured_root = os.getenv(CAPTURE_FRONTIER_ENV)
+        root = Path(configured_root).expanduser().resolve() if configured_root else None
+        family_join = (
+            provenance.get("family_join")
+            if isinstance(provenance, dict)
+            else None
+        )
+        with self._stats_lock:
+            if not getattr(self, "_capture_frontier_store_initialized", False):
+                self._capture_frontier_store = (
+                    EXL3CaptureFrontierStore(root, family_join=family_join)
+                    if root is not None
+                    else None
+                )
+                self._capture_frontier_store_initialized = True
+            store = getattr(self, "_capture_frontier_store", None)
+        if store is not None and store.root != root:
+            raise ValueError("EXL3 capture-frontier root changed during the run")
+        return store
+
+    @staticmethod
+    def _subset_task_names_by_full_name(
+        subset: Dict[str, NamedModule],
+    ) -> dict[str, str]:
+        names: dict[str, str] = {}
+        for task_name, named_module in subset.items():
+            full_name = getattr(named_module, "full_name", None)
+            if not isinstance(full_name, str) or full_name in names:
+                raise RuntimeError("EXL3 capture subset has invalid module identities")
+            names[full_name] = task_name
+        return names
+
+    def restore_subset_capture_frontier(
+        self,
+        *,
+        layer_index: int,
+        subset_index: int,
+        subset_total: int,
+        subset: Dict[str, NamedModule],
+    ) -> bool:
+        """Restore normalized Hessians and route evidence before subset replay."""
+
+        provenance = self._ledger_provenance()
+        store = self._capture_frontier_store_for_run(provenance)
+        if store is None:
+            return False
+        task_names = self._subset_task_names_by_full_name(subset)
+        states = store.restore(
+            layer_index=layer_index,
+            subset_index=subset_index,
+            subset_total=subset_total,
+            subset=subset,
+        )
+        if states is None:
+            return False
+        if set(states) != set(task_names):
+            raise RuntimeError("EXL3 capture frontier restored incomplete tasks")
+
+        route_cache = getattr(self, "_natural_route_evidence_cache", None)
+        if route_cache is None:
+            route_cache = {}
+            self._natural_route_evidence_cache = route_cache
+        requires_routes = route_evidence_required(provenance)
+        for full_name, state in states.items():
+            task_name = task_names[full_name]
+            task = self.tasks.get(task_name)
+            if not isinstance(task, dict):
+                raise RuntimeError(f"EXL3 capture task disappeared: `{full_name}`")
+            capture: GPTQ = task["capture"]
+            if (
+                getattr(capture, "nsamples", 0) != 0
+                or getattr(capture, "H", None) is not None
+                or getattr(capture, "_device_hessian_partials", {})
+                or getattr(capture, "_device_sample_counts", {})
+            ):
+                raise RuntimeError(
+                    f"EXL3 refused to mix live and restored capture for `{full_name}`"
+                )
+            if requires_routes and state.route_evidence is None:
+                raise RuntimeError(
+                    f"EXL3 restored no required route evidence for `{full_name}`"
+                )
+            capture.H = state.hessian
+            capture.nsamples = state.sample_count
+            capture._device_hessian_partials.clear()
+            capture._device_sample_counts.clear()
+            capture._hessian_dirty = False
+            capture._final_hessian_device_hint = torch.device("cpu")
+            task["route_evidence"] = copy.deepcopy(state.route_evidence)
+
+            identity = routed_expert_identity(full_name)
+            if identity is not None and state.route_evidence is not None:
+                family_id = (
+                    identity["block_namespace"],
+                    identity["logical_layer"],
+                )
+                family = route_cache.setdefault(family_id, {})
+                previous = family.setdefault(
+                    identity["expert"], copy.deepcopy(state.route_evidence)
+                )
+                if previous != state.route_evidence:
+                    raise RuntimeError(
+                        f"EXL3 restored conflicting route evidence for `{full_name}`"
+                    )
+        log.info(
+            "EXL3 capture frontier restored: layer=%s subset=%s/%s modules=%s",
+            layer_index,
+            subset_index + 1,
+            subset_total,
+            len(states),
+        )
+        return True
+
+    def commit_subset_capture_frontier(
+        self,
+        *,
+        layer_index: int,
+        subset_index: int,
+        subset_total: int,
+        subset: Dict[str, NamedModule],
+    ) -> None:
+        """Durably commit captures before any projection quantization starts."""
+
+        provenance = self._ledger_provenance()
+        store = self._capture_frontier_store_for_run(provenance)
+        if store is None:
+            return
+        requires_routes = route_evidence_required(provenance)
+        states = []
+        for task_name, named_module in subset.items():
+            task = self.tasks.get(task_name)
+            full_name = getattr(named_module, "full_name", None)
+            if not isinstance(task, dict) or not isinstance(full_name, str):
+                raise RuntimeError("EXL3 cannot persist an incomplete capture task")
+            capture: GPTQ = task["capture"]
+            hessian = capture.finalize_hessian(target_device=torch.device("cpu"))
+            route_evidence = task.get("route_evidence")
+            if requires_routes and route_evidence is None:
+                raise RuntimeError(
+                    f"EXL3 captured no required route evidence for `{full_name}`"
+                )
+            states.append(
+                EXL3CaptureState(
+                    module=full_name,
+                    hessian=hessian,
+                    sample_count=int(capture.nsamples),
+                    route_evidence=copy.deepcopy(route_evidence),
+                )
+            )
+        manifest = store.commit(
+            layer_index=layer_index,
+            subset_index=subset_index,
+            subset_total=subset_total,
+            subset=subset,
+            states=states,
+        )
+        # Gate/up projections consume the same expert input. The durable
+        # manifest binds that equality by pointing both records at one payload;
+        # mirror the deduplication in RAM so a long-lived frontier retains one
+        # normalized Hessian rather than two.
+        task_names = self._subset_task_names_by_full_name(subset)
+        canonical_hessians: dict[str, torch.Tensor] = {}
+        for record in manifest["captures"]:
+            full_name = record["module"]
+            task_name = task_names[full_name]
+            capture: GPTQ = self.tasks[task_name]["capture"]
+            payload_file = record["hessian"]["file"]
+            canonical = canonical_hessians.setdefault(payload_file, capture.H)
+            capture.H = canonical
+        del states
+        log.info(
+            "EXL3 capture frontier committed: layer=%s subset=%s/%s modules=%s manifest=%s",
+            layer_index,
+            subset_index + 1,
+            subset_total,
+            len(manifest["captures"]),
+            manifest["manifest_sha256"],
+        )
+
+    def discard_capture_frontiers_through(self, layer_index: int) -> None:
+        """Drop captures covered by a durable layer-output boundary."""
+
+        store = self._capture_frontier_store_for_run(self._ledger_provenance())
+        if store is not None:
+            store.discard_through(layer_index)
 
     def _distributed_local_quant_lock(self, device: torch.device) -> threading.Lock:
         """Serialize trellis search independently on each coordinator GPU."""

@@ -807,6 +807,26 @@ def _run_single_subset_pass(
     execute_forward = (
         plan.execute_forward if execute_forward is None else execute_forward
     )
+    capture_restored = False
+    restore_capture = getattr(
+        processor, "restore_subset_capture_frontier", None
+    )
+    if (
+        execute_forward
+        and not plan.need_forward_outputs
+        and not execution_config.capture_layer_forward_context
+        and callable(restore_capture)
+    ):
+        capture_restored = bool(
+            restore_capture(
+                layer_index=layer_index,
+                subset_index=subset_index,
+                subset_total=subset_total,
+                subset=subset,
+            )
+        )
+        if capture_restored:
+            execute_forward = False
 
     handle = []
     subset_size = len(subset_names)
@@ -1061,6 +1081,18 @@ def _run_single_subset_pass(
             if hasattr(subset[name], "forward_hook"):
                 subset[name].forward_hook = None
                 subset[name].forward_hook_last = False
+
+    if execute_forward and not capture_restored:
+        commit_capture = getattr(
+            processor, "commit_subset_capture_frontier", None
+        )
+        if callable(commit_capture):
+            commit_capture(
+                layer_index=layer_index,
+                subset_index=subset_index,
+                subset_total=subset_total,
+                subset=subset,
+            )
 
     forward_flush_device = _resolve_forward_flush_device(plan, cur_layer_device)
     if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:

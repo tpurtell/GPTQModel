@@ -614,6 +614,78 @@ def test_subset_pass_without_forward_skips_forward_device_overrides(monkeypatch)
     assert used_data_parallel is False
 
 
+def test_subset_pass_restored_capture_skips_forward(monkeypatch):
+    class DummyProcessor:
+        execution_config = ExecutionConfig(
+            require_fwd=True,
+            fwd_replay_after_process=True,
+        )
+        tasks = {}
+
+        def restore_subset_capture_frontier(self, **kwargs):
+            self.restored = kwargs
+            return True
+
+        def set_fwd_time(self, *_):
+            return None
+
+    class DummyLooper:
+        gptq_model = types.SimpleNamespace(
+            quantize_config=QuantizeConfig(bits=4, group_size=128),
+        )
+
+        def _prepare_layer_direct_state_for_forward(self, *_, **__):
+            raise AssertionError("restored capture must skip the subset forward")
+
+    monkeypatch.setattr(stage_subset_module, "torch_sync", lambda: None)
+    processor = DummyProcessor()
+    plan = SubsetPlan(
+        modules={},
+        subset_index=2,
+        subset_total=5,
+        execute_forward=True,
+        replay_after_process=True,
+        forward_mode="parallel",
+        batch_count=1,
+        forward_row_counts=[1],
+        forward_total_rows=1,
+        moe_groups={},
+        forward_device_map={},
+        calibration_coverage_policy=CalibrationCoveragePolicy(
+            validate_input_coverage=False,
+            fallback_enabled=True,
+            prune_uncovered_modules=False,
+            record_dynamic_exclusions=False,
+        ),
+        module_chunks=[{}],
+    )
+    processed, outputs, _ = stage_subset_module._run_single_subset_pass(
+        looper=DummyLooper(),
+        processor=processor,
+        module=torch.nn.Identity(),
+        plan=plan,
+        layer_inputs=[],
+        layer_input_kwargs=[],
+        position_ids=[],
+        attention_masks=[],
+        cur_layer_device=torch.device("cpu"),
+        is_lm_head_module=False,
+        layer_descriptor="model.layers.3",
+        layer_title="Layer 3",
+        layer_index=3,
+        full={},
+        fallback=None,
+        shared_kv_cache_dict={},
+        pb=None,
+        logger=types.SimpleNamespace(),
+        is_awq_processor=False,
+    )
+    assert processed == {}
+    assert outputs is None
+    assert processor.restored["layer_index"] == 3
+    assert processor.restored["subset_index"] == 2
+
+
 def test_forward_device_override_materializes_meta_fallback_named_module():
     original = NamedModule(
         torch.nn.Linear(4, 4, bias=False, device="meta"),
