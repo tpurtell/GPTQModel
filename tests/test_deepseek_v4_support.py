@@ -733,6 +733,69 @@ def test_deepseek_v4_recovery_uses_rank_seven_for_declared_expert_only() -> None
     assert not hasattr(block, "_gptqmodel_mtp_normal_mlp_capture_context")
 
 
+def test_deepseek_v4_target_learned_router_uses_same_recovery_policy() -> None:
+    block = nn.Module()
+    block.mlp = _RecoveryMLP()
+    inner = nn.Module()
+    inner.layers = nn.ModuleList([block])
+    shell = nn.Module()
+    shell.model = inner
+    adapter = object.__new__(DeepSeekV4QModel)
+    nn.Module.__init__(adapter)
+    adapter.model = shell
+    subset = {
+        "mlp.experts.6.gate_proj": SimpleNamespace(
+            full_name="model.layers.0.mlp.experts.6.gate_proj"
+        ),
+        "mlp.experts.6.up_proj": SimpleNamespace(
+            full_name="model.layers.0.mlp.experts.6.up_proj"
+        ),
+    }
+    task_names = tuple(sorted(subset))
+    processor = _recovery_processor(task_names, natural_count=1014)
+    processor._mask_tls = SimpleNamespace(
+        value=torch.tensor([True] * 10 + [False] * 2)
+    )
+    calls = []
+    handles = []
+    expert = block.mlp.experts[6]
+    for projection in ("gate_proj", "up_proj"):
+        handles.append(
+            getattr(expert, projection).register_forward_hook(
+                lambda _module, _args, _output, key=projection: calls.append(key)
+            )
+        )
+    pause_events = []
+    looper = SimpleNamespace(
+        _set_processor_hooks_paused=lambda _processor, value: pause_events.append(
+            value
+        )
+    )
+    try:
+        with adapter.zero_route_recovery_context(
+            looper=looper,
+            processor=processor,
+            layer_module=block,
+            subset=subset,
+            task_names=task_names,
+        ):
+            block.mlp.gate(torch.randn(1, 12, 4))
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert calls == ["gate_proj", "up_proj"]
+    assert pause_events == [True, False]
+    assert {
+        task["zero_route_recovery_capture"]["candidate_rows_observed"]
+        for task in processor.tasks.values()
+    } == {10}
+    assert {
+        task["zero_route_recovery_capture"]["candidate_rows_selected"]
+        for task in processor.tasks.values()
+    } == {10}
+
+
 def test_deepseek_v4_zero_route_down_recovery_uses_native_swiglu_input() -> None:
     torch.manual_seed(0xD0A4)
     block = nn.Module()

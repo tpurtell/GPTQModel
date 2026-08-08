@@ -770,8 +770,9 @@ def test_subset_pass_finishes_zero_route_recovery_before_quant_fanout(monkeypatc
         def pre_process_fwd_hook(self, _name):
             return lambda *_args, **_kwargs: None
 
-        def plan_subset_zero_route_recovery(self, *, subset):
+        def plan_subset_zero_route_recovery(self, *, subset, layer_module):
             assert subset == {projection.name: projection}
+            assert isinstance(layer_module, torch.nn.Identity)
             events.append("census")
             return (projection.name,)
 
@@ -780,8 +781,9 @@ def test_subset_pass_finishes_zero_route_recovery_before_quant_fanout(monkeypatc
             assert task_names == (projection.name,)
             events.append("recovery_finish")
 
-        def validate_subset_capture_readiness(self, *, subset):
+        def validate_subset_capture_readiness(self, *, subset, layer_module):
             assert subset == {projection.name: projection}
+            assert isinstance(layer_module, torch.nn.Identity)
             events.append("readiness")
 
         def commit_subset_capture_frontier(self, **_kwargs):
@@ -924,8 +926,9 @@ def test_subset_pass_restored_recovery_frontier_is_validated_before_fanout(
             events.append("restore")
             return True
 
-        def validate_subset_capture_readiness(self, *, subset):
+        def validate_subset_capture_readiness(self, *, subset, layer_module):
             assert subset == {projection.name: projection}
+            assert isinstance(layer_module, torch.nn.Identity)
             events.append("readiness")
 
         def set_fwd_time(self, _value):

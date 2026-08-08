@@ -1378,6 +1378,26 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
             return module
         return super().pre_quantize(module)
 
+    def zero_route_recovery_context(
+        self,
+        *,
+        looper,
+        processor,
+        layer_module: nn.Module,
+        subset: dict[str, Any],
+        task_names: tuple[str, ...],
+    ):
+        """Use the shared V4 learned-router recovery for target layers."""
+
+        return DeepSeekV4MTPQuantizationModel.zero_route_recovery_context(
+            self,
+            looper=looper,
+            processor=processor,
+            layer_module=layer_module,
+            subset=subset,
+            task_names=task_names,
+        )
+
     def attach_mtp_quantization_model(
         self,
         adapter: "DeepSeekV4MTPQuantizationModel",
@@ -2204,20 +2224,34 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
     ):
         """Top up under-covered experts from router-near same-selection rows."""
 
-        block_index = getattr(
-            layer_module, "_gptqmodel_mtp_block_index", None
+        mtp_blocks = tuple(getattr(self.model, "mtp", ()) or ())
+        target_blocks = tuple(
+            getattr(getattr(self.model, "model", None), "layers", ()) or ()
         )
+        if layer_module in mtp_blocks:
+            block_namespace = "mtp"
+            block_index = mtp_blocks.index(layer_module)
+            prefix = f"mtp.{block_index}.mlp.experts."
+        elif layer_module in target_blocks:
+            block_namespace = "base"
+            block_index = target_blocks.index(layer_module)
+            prefix = f"model.layers.{block_index}.mlp.experts."
+        else:
+            raise RuntimeError(
+                "DeepSeek V4 route recovery requires one canonical target or MTP block"
+            )
+        router = getattr(getattr(layer_module, "mlp", None), "gate", None)
         if (
-            not isinstance(block_index, int)
-            or block_index < 0
-            or block_index >= len(self.model.mtp)
-            or layer_module is not self.model.mtp[block_index]
+            not isinstance(router, nn.Module)
+            or not isinstance(
+                getattr(router, "e_score_correction_bias", None), torch.Tensor
+            )
+            or hasattr(router, "tid2eid")
         ):
             raise RuntimeError(
-                "DeepSeek V4 zero-route recovery requires one canonical MTP block"
+                "DeepSeek V4 route recovery requires a learned top-k router"
             )
         targets: dict[int, set[str]] = {}
-        prefix = f"mtp.{block_index}.mlp.experts."
         allowed = {"gate_proj", "up_proj", "down_proj"}
         for task_name in task_names:
             named_module = subset.get(task_name)
@@ -2295,6 +2329,27 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         }
         observed_by_expert = {expert: 0 for expert in targets}
         pending_ffn_input: torch.Tensor | None = None
+        pending_keep_mask: torch.Tensor | None = None
+
+        def set_pending_router_input(ffn_input: torch.Tensor) -> None:
+            nonlocal pending_ffn_input, pending_keep_mask
+            if pending_ffn_input is not None:
+                raise RuntimeError("DeepSeek V4 recovery router input was not consumed")
+            expert_input = ffn_input.reshape(-1, ffn_input.shape[-1])
+            keep_mask = getattr(
+                getattr(processor, "_mask_tls", None), "value", None
+            )
+            if keep_mask is not None:
+                keep_mask = keep_mask.reshape(-1).to(
+                    device=expert_input.device,
+                    dtype=torch.bool,
+                )
+                if keep_mask.numel() != expert_input.shape[0]:
+                    raise RuntimeError(
+                        "DeepSeek V4 recovery mask does not align with router rows"
+                    )
+            pending_ffn_input = expert_input
+            pending_keep_mask = keep_mask
 
         def prepare_router_candidates(
             replay_block_index: int,
@@ -2302,24 +2357,30 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             ffn_input: torch.Tensor,
             proposal_token_ids: torch.Tensor,
         ) -> None:
-            nonlocal pending_ffn_input
             if replay_block_index != block_index or block is not layer_module:
                 raise RuntimeError(
                     "DeepSeek V4 zero-route recovery replayed the wrong block"
                 )
-            if pending_ffn_input is not None:
-                raise RuntimeError("DeepSeek V4 recovery router input was not consumed")
             expert_input = ffn_input.reshape(-1, ffn_input.shape[-1])
             if expert_input.shape[0] != proposal_token_ids.numel():
                 raise RuntimeError(
                     "DeepSeek V4 recovery FFN rows do not align with proposal rows"
                 )
-            pending_ffn_input = expert_input
+            set_pending_router_input(ffn_input)
+
+        def prepare_target_router_candidates(_module, inputs) -> None:
+            if not inputs or not isinstance(inputs[0], torch.Tensor):
+                raise RuntimeError(
+                    "DeepSeek V4 recovery learned router has no tensor input"
+                )
+            set_pending_router_input(inputs[0])
 
         def capture_router_candidates(_module, _inputs, output) -> None:
-            nonlocal pending_ffn_input
+            nonlocal pending_ffn_input, pending_keep_mask
             expert_input = pending_ffn_input
+            keep_mask = pending_keep_mask
             pending_ffn_input = None
+            pending_keep_mask = None
             if expert_input is None:
                 raise RuntimeError(
                     "DeepSeek V4 recovery router ran without its FFN input"
@@ -2336,6 +2397,9 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 or logits.shape[1] < ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
             ):
                 raise RuntimeError("DeepSeek V4 recovery router geometry is invalid")
+            if keep_mask is not None:
+                expert_input = expert_input[keep_mask]
+                logits = logits[keep_mask]
             correction = getattr(router, "e_score_correction_bias", None)
             if not isinstance(correction, torch.Tensor):
                 raise RuntimeError(
@@ -2391,7 +2455,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             del ranked_scores, ranked_indices, boundary, choice_scores, scores
 
         def finish_router_candidates() -> None:
-            if pending_ffn_input is not None:
+            if pending_ffn_input is not None or pending_keep_mask is not None:
                 raise RuntimeError("DeepSeek V4 recovery ended with a pending router input")
             experts = layer_module.mlp.experts
             for expert_index in sorted(targets):
@@ -2545,25 +2609,51 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
 
         force_attr = "_gptqmodel_mtp_zero_route_force"
         pause_attr = "_gptqmodel_mtp_normal_mlp_capture_context"
-        if hasattr(layer_module, force_attr) or hasattr(layer_module, pause_attr):
-            raise RuntimeError(
-                "DeepSeek V4 zero-route recovery context is already active"
+        force_installed = False
+        pause_installed = False
+        router_pre_handle = None
+        base_hooks_paused = False
+        if block_namespace == "mtp":
+            if hasattr(layer_module, force_attr) or hasattr(layer_module, pause_attr):
+                raise RuntimeError(
+                    "DeepSeek V4 zero-route recovery context is already active"
+                )
+            setattr(layer_module, force_attr, prepare_router_candidates)
+            setattr(layer_module, pause_attr, pause_normal_mlp_capture)
+            force_installed = True
+            pause_installed = True
+        else:
+            router_pre_handle = router.register_forward_pre_hook(
+                prepare_target_router_candidates
             )
-        setattr(layer_module, force_attr, prepare_router_candidates)
-        setattr(layer_module, pause_attr, pause_normal_mlp_capture)
         router_handle = layer_module.mlp.gate.register_forward_hook(
             capture_router_candidates
         )
         try:
+            if block_namespace == "base":
+                looper._set_processor_hooks_paused(processor, True)
+                base_hooks_paused = True
             yield
+            if base_hooks_paused:
+                looper._set_processor_hooks_paused(processor, False)
+                base_hooks_paused = False
             router_handle.remove()
             router_handle = None
+            if router_pre_handle is not None:
+                router_pre_handle.remove()
+                router_pre_handle = None
             finish_router_candidates()
         finally:
+            if base_hooks_paused:
+                looper._set_processor_hooks_paused(processor, False)
             if router_handle is not None:
                 router_handle.remove()
-            delattr(layer_module, pause_attr)
-            delattr(layer_module, force_attr)
+            if router_pre_handle is not None:
+                router_pre_handle.remove()
+            if pause_installed:
+                delattr(layer_module, pause_attr)
+            if force_installed:
+                delattr(layer_module, force_attr)
 
     def create_quantization_layer_output_writer(
         self,

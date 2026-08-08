@@ -1085,12 +1085,26 @@ class EXL3Processor(LoopProcessor):
         self,
         *,
         subset: Dict[str, NamedModule],
+        layer_module: Module,
     ) -> tuple[str, ...]:
-        """Census natural MTP routes and plan deterministic 1,024-row top-ups."""
+        """Plan deterministic top-ups for under-covered learned top-k routers."""
 
         provenance = self._ledger_provenance()
         if not route_evidence_required(provenance):
             return ()
+        authorization = self._zero_route_recovery_authorization(provenance)
+        mlp = getattr(layer_module, "mlp", None)
+        if mlp is None:
+            mlp = getattr(layer_module, "ffn", None)
+        router = getattr(mlp, "gate", None)
+        learned_topk_router = (
+            isinstance(router, Module)
+            and isinstance(
+                getattr(router, "e_score_correction_bias", None),
+                torch.Tensor,
+            )
+            and not hasattr(router, "tid2eid")
+        )
         recovery_tasks: list[str] = []
         counts_by_expert: dict[int, int] = {}
         family_ids: set[tuple[str, int]] = set()
@@ -1136,7 +1150,8 @@ class EXL3Processor(LoopProcessor):
                     f"for expert {identity['expert']}"
                 )
             if (
-                identity["block_namespace"] == "mtp"
+                authorization is not None
+                and learned_topk_router
                 and natural_count < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
             ):
                 recovery_tasks.append(task_name)
@@ -1153,15 +1168,6 @@ class EXL3Processor(LoopProcessor):
                 sum(values) / len(values),
                 max(values),
                 sum(value == 0 for value in values),
-            )
-        authorization = self._zero_route_recovery_authorization(provenance)
-        if recovery_tasks and authorization is None:
-            missing = [
-                subset[name].full_name for name in recovery_tasks
-            ]
-            raise RuntimeError(
-                "EXL3 natural-route census found under-covered MTP modules before "
-                f"projection dispatch: {missing}"
             )
         return tuple(recovery_tasks)
 
@@ -1347,6 +1353,7 @@ class EXL3Processor(LoopProcessor):
         self,
         *,
         subset: Dict[str, NamedModule],
+        layer_module: Module,
     ) -> None:
         """Fail before fan-out unless every natural or recovered capture is exact."""
 
@@ -1355,6 +1362,18 @@ class EXL3Processor(LoopProcessor):
             return
         family_join = provenance.get("family_join")
         authorization = self._zero_route_recovery_authorization(provenance)
+        mlp = getattr(layer_module, "mlp", None)
+        if mlp is None:
+            mlp = getattr(layer_module, "ffn", None)
+        router = getattr(mlp, "gate", None)
+        learned_topk_router = (
+            isinstance(router, Module)
+            and isinstance(
+                getattr(router, "e_score_correction_bias", None),
+                torch.Tensor,
+            )
+            and not hasattr(router, "tid2eid")
+        )
         for task_name in sorted(subset):
             named_module = subset[task_name]
             identity = routed_expert_identity(
@@ -1379,13 +1398,14 @@ class EXL3Processor(LoopProcessor):
                 )
             natural_count = route_evidence.get("expert_route_count")
             recovery_required = (
-                identity["block_namespace"] == "mtp"
+                authorization is not None
+                and learned_topk_router
                 and natural_count < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
             )
             if recovery_required:
                 if not isinstance(recovery, dict):
                     raise RuntimeError(
-                        "EXL3 under-covered MTP capture lacks recovery evidence for "
+                        "EXL3 under-covered learned-router capture lacks recovery evidence for "
                         f"`{named_module.full_name}`"
                     )
                 validate_zero_route_recovery(

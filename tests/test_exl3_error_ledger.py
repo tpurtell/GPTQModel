@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 from gptqmodel.utils import exl3_error_ledger as ledger_module
 from gptqmodel.utils.exl3_error_ledger import (
     LEDGER_FILENAME,
@@ -346,7 +347,18 @@ def test_zero_route_recovery_is_explicit_and_cannot_relabel_positive_routes():
         )
 
 
-def test_exl3_census_tops_up_undercovered_mtp_before_projection_dispatch():
+@pytest.mark.parametrize(
+    ("block_namespace", "logical_layer", "module_prefix"),
+    [
+        ("base", 7, "model.layers.7"),
+        ("mtp", 1, "mtp.1"),
+    ],
+)
+def test_exl3_census_tops_up_undercovered_learned_router_namespaces(
+    block_namespace,
+    logical_layer,
+    module_prefix,
+):
     processor = object.__new__(EXL3Processor)
     provenance = {
         "family_join": {
@@ -354,14 +366,18 @@ def test_exl3_census_tops_up_undercovered_mtp_before_projection_dispatch():
         }
     }
     processor.qcfg = SimpleNamespace(meta={"ds4rt_error_ledger": provenance})
+    layer_module = torch.nn.Module()
+    layer_module.mlp = torch.nn.Module()
+    layer_module.mlp.gate = torch.nn.Module()
+    layer_module.mlp.gate.e_score_correction_bias = torch.zeros(256)
     subset = {}
     processor.tasks = {}
     natural_count = 100
     mtp_evidence = _route_evidence()
     mtp_evidence.update(
         {
-            "block_namespace": "mtp",
-            "logical_layer": 1,
+            "block_namespace": block_namespace,
+            "logical_layer": logical_layer,
             "expert_route_count": natural_count,
             "expert_route_fraction": natural_count
             / mtp_evidence["router_selected_route_count"],
@@ -376,20 +392,25 @@ def test_exl3_census_tops_up_undercovered_mtp_before_projection_dispatch():
     for projection in ("gate_proj", "up_proj"):
         task_name = f"mlp.experts.31.{projection}"
         subset[task_name] = SimpleNamespace(
-            full_name=f"mtp.1.mlp.experts.31.{projection}"
+            full_name=f"{module_prefix}.mlp.experts.31.{projection}"
         )
         processor.tasks[task_name] = {
             "capture": SimpleNamespace(nsamples=natural_count),
             "route_evidence": dict(mtp_evidence),
         }
 
-    with pytest.raises(RuntimeError, match="before projection dispatch"):
-        processor.plan_subset_zero_route_recovery(subset=subset)
+    assert processor.plan_subset_zero_route_recovery(
+        subset=subset,
+        layer_module=layer_module,
+    ) == ()
 
     provenance["family_join"]["zero_route_recovery_contract"] = (
         ZERO_ROUTE_RECOVERY_SCHEMA
     )
-    targets = processor.plan_subset_zero_route_recovery(subset=subset)
+    targets = processor.plan_subset_zero_route_recovery(
+        subset=subset,
+        layer_module=layer_module,
+    )
     assert targets == tuple(sorted(subset))
     for task in processor.tasks.values():
         task["capture"].nsamples = ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
@@ -413,7 +434,10 @@ def test_exl3_census_tops_up_undercovered_mtp_before_projection_dispatch():
         subset=subset,
         task_names=targets,
     )
-    processor.validate_subset_capture_readiness(subset=subset)
+    processor.validate_subset_capture_readiness(
+        subset=subset,
+        layer_module=layer_module,
+    )
     assert {
         task["zero_route_recovery"]["router_augmented_sample_count"]
         for task in processor.tasks.values()
@@ -421,7 +445,70 @@ def test_exl3_census_tops_up_undercovered_mtp_before_projection_dispatch():
 
     processor.tasks[targets[0]]["route_evidence"]["expert_route_count"] = 1024
     with pytest.raises(RuntimeError, match="relabeled as recovery"):
-        processor.validate_subset_capture_readiness(subset=subset)
+        processor.validate_subset_capture_readiness(
+            subset=subset,
+            layer_module=layer_module,
+        )
+
+
+def test_exl3_census_excludes_deterministic_hash_router_from_topup():
+    processor = object.__new__(EXL3Processor)
+    processor.qcfg = SimpleNamespace(
+        meta={
+            "ds4rt_error_ledger": {
+                "family_join": {
+                    "route_evidence_contract": ROUTE_EVIDENCE_SCHEMA,
+                    "zero_route_recovery_contract": ZERO_ROUTE_RECOVERY_SCHEMA,
+                }
+            }
+        }
+    )
+    layer_module = torch.nn.Module()
+    layer_module.mlp = torch.nn.Module()
+    layer_module.mlp.gate = torch.nn.Module()
+    layer_module.mlp.gate.tid2eid = torch.arange(256)
+    task_name = "mlp.experts.31.gate_proj"
+    subset = {
+        task_name: SimpleNamespace(
+            full_name="model.layers.7.mlp.experts.31.gate_proj"
+        )
+    }
+    evidence = _route_evidence()
+    route_count = 100
+    gate_sum = 10.0
+    gate_sq = 2.0
+    evidence.update(
+        {
+            "block_namespace": "base",
+            "logical_layer": 7,
+            "expert_route_count": route_count,
+            "expert_gate_weight_sum": gate_sum,
+            "expert_gate_squared_mass": gate_sq,
+            "expert_route_fraction": route_count
+            / evidence["router_selected_route_count"],
+            "expert_gate_weight_mass_fraction": gate_sum
+            / evidence["total_gate_weight_sum"],
+            "expert_gate_squared_mass_fraction": gate_sq
+            / evidence["total_gate_squared_mass"],
+            "expert_gate_weight_mean": gate_sum / route_count,
+            "expert_gate_weight_rms": (gate_sq / route_count) ** 0.5,
+        }
+    )
+    processor.tasks = {
+        task_name: {
+            "capture": SimpleNamespace(nsamples=100),
+            "route_evidence": evidence,
+        }
+    }
+
+    assert processor.plan_subset_zero_route_recovery(
+        subset=subset,
+        layer_module=layer_module,
+    ) == ()
+    processor.validate_subset_capture_readiness(
+        subset=subset,
+        layer_module=layer_module,
+    )
 
 
 def test_ledger_is_canonical_content_bound_and_contains_family_record(tmp_path):

@@ -1036,7 +1036,7 @@ def _run_single_subset_pass(
             processor, "plan_subset_zero_route_recovery", None
         )
         zero_recovery_tasks = (
-            plan_zero_recovery(subset=subset)
+            plan_zero_recovery(subset=subset, layer_module=module)
             if callable(plan_zero_recovery)
             else ()
         )
@@ -1196,7 +1196,7 @@ def _run_single_subset_pass(
         processor, "validate_subset_capture_readiness", None
     )
     if callable(validate_capture_readiness):
-        validate_capture_readiness(subset=subset)
+        validate_capture_readiness(subset=subset, layer_module=module)
 
     forward_flush_device = _resolve_forward_flush_device(plan, cur_layer_device)
     if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:
