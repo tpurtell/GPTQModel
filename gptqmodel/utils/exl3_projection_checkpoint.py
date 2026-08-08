@@ -10,6 +10,7 @@ import json
 import math
 import os
 import tempfile
+import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -170,6 +171,69 @@ class EXL3ProjectionCheckpointStore:
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
         self.root = Path(root).expanduser().resolve()
+        self._module_request_lock = threading.Lock()
+        self._module_requests: dict[str, str] | None = None
+
+    def reserve_module_request(self, request: dict[str, Any]) -> None:
+        """Fail before work when one immutable module acquires a new identity.
+
+        Request hashes bind the weight, Hessian, route evidence, quantizer
+        contract, and run family.  A second hash for the same logical module is
+        therefore recovery drift, not another valid checkpoint.  Reservations
+        also close the race between concurrent projection workers before either
+        result is committed.
+
+        This check is explicit because remote-worker checkpoint stores are
+        bounded scratch caches and may legitimately recycle one module name
+        across independent coordinator runs.  The coordinator calls it on its
+        run-scoped, shared store.
+        """
+
+        module = request.get("module")
+        request_sha256 = request.get("request_sha256")
+        request_body = {
+            key: value for key, value in request.items() if key != "request_sha256"
+        }
+        if (
+            not isinstance(module, str)
+            or not module
+            or not isinstance(request_sha256, str)
+            or sha256_bytes(canonical_json_bytes(request_body)) != request_sha256
+        ):
+            raise ValueError("invalid EXL3 module checkpoint request")
+        self._paths(request_sha256)
+
+        with self._module_request_lock:
+            if self._module_requests is None:
+                module_requests: dict[str, str] = {}
+                for committed_request, _result in self.inspect_committed_manifests():
+                    committed_module = committed_request.get("module")
+                    committed_sha256 = committed_request.get("request_sha256")
+                    if (
+                        not isinstance(committed_module, str)
+                        or not committed_module
+                        or not isinstance(committed_sha256, str)
+                    ):
+                        raise ValueError(
+                            "EXL3 projection checkpoint has no module identity"
+                        )
+                    previous = module_requests.setdefault(
+                        committed_module, committed_sha256
+                    )
+                    if previous != committed_sha256:
+                        raise ValueError(
+                            "EXL3 projection checkpoint contains immutable module "
+                            f"request drift for `{committed_module}`: "
+                            f"{previous} != {committed_sha256}"
+                        )
+                self._module_requests = module_requests
+
+            previous = self._module_requests.setdefault(module, request_sha256)
+            if previous != request_sha256:
+                raise ValueError(
+                    "EXL3 immutable module request drift for "
+                    f"`{module}`: {previous} != {request_sha256}"
+                )
 
     def _paths(self, request_sha256: str) -> tuple[Path, Path]:
         if len(request_sha256) != 64 or any(

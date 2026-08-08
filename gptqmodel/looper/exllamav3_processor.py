@@ -408,6 +408,8 @@ class EXL3Processor(LoopProcessor):
         ] = {}
         self._remote_client_initialized = False
         self._remote_client = None
+        self._projection_checkpoint_store_initialized = False
+        self._projection_checkpoint_store = None
         self._distributed_local_quant_locks: dict[str, threading.Lock] = {}
         self.error_journal_path = os.getenv(JOURNAL_ENV) or str(
             Path(self.log_tmp_log_file_name).with_suffix(".exl3-error-ledger.jsonl")
@@ -442,6 +444,27 @@ class EXL3Processor(LoopProcessor):
                 self._remote_client = remote_client_from_provenance(provenance)
                 self._remote_client_initialized = True
             return getattr(self, "_remote_client", None)
+
+    def _projection_checkpoint_store_for_run(
+        self, provenance: dict[str, Any] | None
+    ) -> EXL3ProjectionCheckpointStore | None:
+        """Construct one shared coordinator store and request index per run."""
+
+        checkpoint_root = checkpoint_root_from_provenance(provenance)
+        with self._stats_lock:
+            if not getattr(
+                self, "_projection_checkpoint_store_initialized", False
+            ):
+                self._projection_checkpoint_store = (
+                    EXL3ProjectionCheckpointStore(checkpoint_root)
+                    if checkpoint_root is not None
+                    else None
+                )
+                self._projection_checkpoint_store_initialized = True
+            store = getattr(self, "_projection_checkpoint_store", None)
+        if store is not None and store.root != checkpoint_root:
+            raise ValueError("EXL3 projection-checkpoint root changed during the run")
+        return store
 
     def _distributed_local_quant_lock(self, device: torch.device) -> threading.Lock:
         """Serialize trellis search independently on each coordinator GPU."""
@@ -778,11 +801,8 @@ class EXL3Processor(LoopProcessor):
             projection_provenance["execution"] = copy.deepcopy(execution_contract)
         quant_args = self._build_quant_args(module, module_qcfg, target_device)
         input_weight = self._quant_input_weight(capture, target_device)
-        checkpoint_root = checkpoint_root_from_provenance(ledger_provenance)
-        checkpoint_store = (
-            EXL3ProjectionCheckpointStore(checkpoint_root)
-            if checkpoint_root is not None
-            else None
+        checkpoint_store = self._projection_checkpoint_store_for_run(
+            ledger_provenance
         )
         if remote_client is not None and checkpoint_store is None:
             raise ValueError(
@@ -819,6 +839,7 @@ class EXL3Processor(LoopProcessor):
                 family_join=family_join,
                 route_evidence=task_entry.get("route_evidence"),
             )
+            checkpoint_store.reserve_module_request(checkpoint_request)
             loaded_checkpoint = checkpoint_store.load(checkpoint_request)
         else:
             loaded_checkpoint = None

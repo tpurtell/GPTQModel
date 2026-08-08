@@ -565,6 +565,11 @@ def run_layer_stage(
                 cur_layer_device,
                 projection_modules=full,
             )
+            # Recovery must use the same forward topology as the original
+            # capture.  In particular, DeepSeek's router can make different
+            # low-bit decisions when a batch that was originally split over
+            # two GPUs is replayed serially on one GPU.  Let ForwardExecutor
+            # honor the run's immutable auto-forward-data-parallel policy.
             layer_outputs = _replay_layer_outputs(
                 looper,
                 module=module,
@@ -582,7 +587,7 @@ def run_layer_stage(
                 log=log,
                 region_timer=region_timer,
                 replay_plan=None,
-                force_serial=True,
+                force_serial=False,
             )
             if not layer_outputs:
                 raise RuntimeError(

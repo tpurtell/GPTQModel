@@ -92,6 +92,39 @@ def test_projection_checkpoint_round_trips_and_is_idempotent(tmp_path) -> None:
     assert store.load(_request(scale=2.0)) is None
 
 
+def test_projection_checkpoint_module_request_reservation_rejects_drift(
+    tmp_path,
+) -> None:
+    root = tmp_path / "checkpoints"
+    original = _request()
+    store = EXL3ProjectionCheckpointStore(root)
+    store.commit(original, _tensors(), _result())
+
+    resumed_store = EXL3ProjectionCheckpointStore(root)
+    resumed_store.reserve_module_request(original)
+    resumed_store.reserve_module_request(original)
+    with pytest.raises(ValueError, match="immutable module request drift"):
+        resumed_store.reserve_module_request(_request(scale=2.0))
+
+
+def test_projection_checkpoint_module_request_reservation_rejects_existing_drift(
+    tmp_path,
+) -> None:
+    root = tmp_path / "checkpoints"
+    original = _request()
+    drifted = _request(scale=2.0)
+    EXL3ProjectionCheckpointStore(root).commit(original, _tensors(), _result())
+    # Direct stores are also used as bounded remote scratch, so committing a
+    # second request remains possible there.  A coordinator reservation must
+    # reject that polluted state before any new quantization begins.
+    EXL3ProjectionCheckpointStore(root).commit(
+        drifted, _tensors(), {**_result(), "drifted": True}
+    )
+
+    with pytest.raises(ValueError, match="contains immutable module request drift"):
+        EXL3ProjectionCheckpointStore(root).reserve_module_request(original)
+
+
 def test_projection_checkpoint_load_committed_rejects_stored_request_tampering(
     tmp_path,
 ) -> None:

@@ -2299,7 +2299,9 @@ def test_capture_pristine_group_context_preserves_untouched_layer_io(monkeypatch
     assert observed["receive_kwargs"]["subset_total"] == 1
 
 
-def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
+def test_run_layer_stage_catches_up_packed_layer_with_original_forward_topology(
+    monkeypatch,
+):
     sentinel_inputs = [[torch.tensor([[[2.0]]])]]
     sentinel_outputs = [[torch.tensor([[[7.0]]])]]
     replay_calls = []
@@ -2443,7 +2445,7 @@ def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
 
     assert len(looper.boundary.prepared) == 1
     assert len(replay_calls) == 1
-    assert replay_calls[0]["force_serial"] is True
+    assert replay_calls[0]["force_serial"] is False
     assert not subset_calls
     assert len(looper.direct_state_calls) == 1
     assert len(looper.native_prepare_calls) == 1
