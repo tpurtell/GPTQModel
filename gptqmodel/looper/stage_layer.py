@@ -615,6 +615,12 @@ def run_layer_stage(
                     attention_masks=attention_masks,
                 )
 
+            # Native source state was materialized only to execute this one
+            # recovery forward.  Rehome the complete materialized layer before
+            # packed leaves become disk-backed META shells again.  The generic
+            # ``post_quantize`` path is intentionally skipped: it is for float
+            # layers and rejects valid disk-offloaded EXL3 buffers.
+            module.to(device=CPU)
             finalize_catchup = getattr(
                 layer_boundary_checkpoint, "finalize_catchup_layer", None
             )
@@ -628,7 +634,7 @@ def run_layer_stage(
                 processor=processor,
                 layer_index=layer_index,
             )
-            layers[layer_index] = looper.gptq_model.post_quantize(module)
+            layers[layer_index] = module
             processor.clear_cache_data()
             processor.receive_layer_inputs(layer_outputs)
             torch_sync()

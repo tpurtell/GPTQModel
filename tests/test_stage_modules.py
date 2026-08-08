@@ -2400,7 +2400,7 @@ def test_run_layer_stage_catches_up_packed_layer_with_one_replay(monkeypatch):
             return module
 
         def post_quantize(self, module):
-            return module
+            raise AssertionError("packed catch-up used generic post_quantize")
 
     class DummyLooper:
         def __init__(self):
