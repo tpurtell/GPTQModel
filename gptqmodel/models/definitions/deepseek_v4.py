@@ -569,10 +569,10 @@ class DeepSeekV4TargetAnchorResolver:
 class DeepSeekV4MTPPrefixRuntime:
     """Materialized target-head and MTP-prefix state for natural replay.
 
-    This object deliberately owns the modules whose tensors back its callables.
-    Keeping those references together prevents an external launcher from
-    accidentally offloading the target head or MTP main projector while the
-    synchronous target-tap sink is still consuming the calibration stream.
+    This object deliberately owns detached modules whose tensors back its
+    callables. The target shell's base-module offloader mutates its module
+    objects to ``meta`` in place, so retaining aliases into that shell is not
+    sufficient to preserve the prefix runtime across layerwise quantization.
     """
 
     auxiliary: DeepSeekV4MTPAuxiliary
@@ -1766,8 +1766,14 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
                 device=replay_device,
                 module_path=path,
             )
-            parameters = tuple(materialized.parameters())
-            buffers = tuple(materialized.buffers())
+            # The ordinary quantization looper disk-offloads every base module
+            # after input capture by replacing its parameters with meta
+            # tensors. A Python reference to the shell module observes that
+            # mutation too. Clone the small target-prefix leaf now so the MTP
+            # runtime owns storage that is disjoint from the offload lifecycle.
+            detached = copy.deepcopy(materialized)
+            parameters = tuple(detached.parameters())
+            buffers = tuple(detached.buffers())
             if any(tensor.is_meta for tensor in (*parameters, *buffers)):
                 raise RuntimeError(
                     f"DeepSeek V4 MTP prefix module {path} remained on the meta device"
@@ -1776,7 +1782,19 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
                 raise RuntimeError(
                     f"DeepSeek V4 MTP prefix module {path} was materialized on the wrong device"
                 )
-            return materialized
+            materialized_tensors = tuple(materialized.parameters()) + tuple(
+                materialized.buffers()
+            )
+            if len(materialized_tensors) != len((*parameters, *buffers)):
+                raise RuntimeError(
+                    f"DeepSeek V4 MTP prefix module {path} clone geometry changed"
+                )
+            for source, clone in zip(materialized_tensors, (*parameters, *buffers)):
+                if source.data_ptr() == clone.data_ptr():
+                    raise RuntimeError(
+                        f"DeepSeek V4 MTP prefix module {path} retained shell storage"
+                    )
+            return detached
 
         target_hc_head = target_leaf("model.hc_head")
         target_norm = target_leaf("model.norm")

@@ -825,7 +825,19 @@ def test_deepseek_v4_prefix_runtime_owns_exact_projector_anchor_and_embedding(
     )
     expected = shell.mtp[0].main_norm(shell.mtp[0].main_proj(torch.cat(taps, -1)))
     torch.testing.assert_close(runtime.project_target_taps(taps), expected)
-    assert runtime.build_replay().embedding_weight is model.model.embed_tokens.weight
+    assert runtime.build_replay().embedding_weight is runtime.target_embedding.weight
+    assert runtime.target_hc_head is not model.model.hc_head
+    assert runtime.target_norm is not model.model.norm
+    assert runtime.target_lm_head is not model.lm_head
+    assert runtime.target_embedding is not model.model.embed_tokens
+
+    for target in (
+        model.model.hc_head,
+        model.model.norm,
+        model.lm_head,
+        model.model.embed_tokens,
+    ):
+        target.to(device="meta")
 
     raw = torch.randn(
         2, 3, config.hc_mult, config.hidden_size, dtype=torch.bfloat16
