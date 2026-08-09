@@ -29,7 +29,7 @@ ZERO_ROUTE_RECOVERY_SCHEMA_VERSION = 1
 ZERO_ROUTE_RECOVERY_TRIGGER = "natural-route-count-below-1024"
 ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE = "same-fixed-calibration-selection"
 ZERO_ROUTE_RECOVERY_CAPTURE_METHOD = (
-    "direct-expert-router-ranks-7-12-or-identity-hessian"
+    "direct-expert-router-ranks-7-12-then-identity-residual"
 )
 ZERO_ROUTE_RECOVERY_SELECTION_POLICY = (
     "rank-ascending-then-fixed-replay-order-v1"
@@ -38,9 +38,12 @@ ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN = 7
 ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX = 12
 ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT = 1024
 ZERO_ROUTE_RECOVERY_SELECTION_CAP = 1024
-ZERO_ROUTE_RECOVERY_IDENTITY_POLICY = "normalized-2i-effective-count-1024-v1"
+ZERO_ROUTE_RECOVERY_IDENTITY_POLICY = (
+    "normalized-2i-residual-to-effective-count-1024-v2"
+)
 ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR = "router-near-rows"
 ZERO_ROUTE_RECOVERY_MODE_IDENTITY = "identity-hessian"
+ZERO_ROUTE_RECOVERY_MODE_MIXED = "empirical-plus-identity-hessian"
 ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA = (
     "ds4rt.exl3-zero-route-recovery-authorization"
 )
@@ -374,6 +377,7 @@ def validate_zero_route_recovery(
         not in {
             ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
             ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+            ZERO_ROUTE_RECOVERY_MODE_MIXED,
         }
         or validated_authorization is None
         or (
@@ -411,6 +415,35 @@ def validate_zero_route_recovery(
             <= candidate_gap["max"]
         ):
             raise ValueError("EXL3 router-near recovery evidence is invalid")
+    elif recovery_mode == ZERO_ROUTE_RECOVERY_MODE_MIXED:
+        if (
+            clean["identity_calibration_count"] <= 0
+            or clean["natural_sample_count"]
+            + clean["router_augmented_sample_count"]
+            + clean["identity_calibration_count"]
+            != clean["total_sample_count"]
+            or clean["router_augmented_sample_count"] != selected
+            or selected > observed
+            or clean["natural_sample_count"] + selected <= 0
+            or (
+                selected > 0
+                and (
+                    not isinstance(candidate_gap, dict)
+                    or any(
+                        isinstance(candidate_gap.get(field), bool)
+                        or not isinstance(candidate_gap.get(field), (int, float))
+                        or not math.isfinite(float(candidate_gap[field]))
+                        or candidate_gap[field] < 0
+                        for field in ("min", "mean", "max")
+                    )
+                    or not candidate_gap["min"]
+                    <= candidate_gap["mean"]
+                    <= candidate_gap["max"]
+                )
+            )
+            or (selected == 0 and candidate_gap is not None)
+        ):
+            raise ValueError("EXL3 mixed recovery evidence is invalid")
     elif (
         clean["natural_sample_count"] != 0
         or clean["router_augmented_sample_count"] != 0
@@ -816,6 +849,7 @@ __all__ = [
     "ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN",
     "ZERO_ROUTE_RECOVERY_IDENTITY_POLICY",
     "ZERO_ROUTE_RECOVERY_MODE_IDENTITY",
+    "ZERO_ROUTE_RECOVERY_MODE_MIXED",
     "ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR",
     "ZERO_ROUTE_RECOVERY_SELECTION_CAP",
     "ZERO_ROUTE_RECOVERY_SELECTION_POLICY",

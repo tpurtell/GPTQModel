@@ -21,6 +21,7 @@ from ...utils.exl3_error_ledger import (
     ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
     ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
     ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+    ZERO_ROUTE_RECOVERY_MODE_MIXED,
     ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
     ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
 )
@@ -2490,24 +2491,20 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     selected_histogram[str(rank)] = count
                     remaining -= count
 
-                identity_recovery = False
+                pure_identity_recovery = False
+                identity_residual_count = 0
                 if remaining > 0:
                     if (
                         natural_counts[expert_index] == 0
                         and observed_by_expert[expert_index] == 0
                     ):
-                        identity_recovery = True
-                        remaining = 0
+                        pure_identity_recovery = True
+                        identity_residual_count = remaining
                     else:
-                        raise RuntimeError(
-                            "DeepSeek V4 router-near recovery cannot reach 1,024 "
-                            f"rows for expert {expert_index}: natural="
-                            f"{natural_counts[expert_index]} observed_candidates="
-                            f"{observed_by_expert[expert_index]} selected="
-                            f"{needed - remaining}"
-                        )
+                        identity_residual_count = remaining
+                    remaining = 0
 
-                if identity_recovery:
+                if pure_identity_recovery:
                     for task_name in task_names_by_expert[expert_index]:
                         task = processor.tasks.get(task_name)
                         capture = task.get("capture") if isinstance(task, dict) else None
@@ -2541,45 +2538,122 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     identity_count = ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
                     recovery_mode = ZERO_ROUTE_RECOVERY_MODE_IDENTITY
                 else:
-                    expert_input = torch.cat(selected_rows, dim=0)
-                    if expert_input.shape[0] != needed:
+                    selected_candidate_count = needed - identity_residual_count
+                    expert_input = (
+                        torch.cat(selected_rows, dim=0)
+                        if selected_rows
+                        else None
+                    )
+                    if (
+                        expert_input is not None
+                        and expert_input.shape[0] != selected_candidate_count
+                    ):
                         raise RuntimeError(
                             "DeepSeek V4 recovery selected the wrong row count"
                         )
                     expert = experts[expert_index]
                     projections = targets[expert_index]
-                    if "down_proj" in projections:
-                        gate = expert.gate_proj(expert_input)
-                        up = expert.up_proj(expert_input)
-                        limit = getattr(
-                            expert, "limit", getattr(layer_module.mlp, "limit", None)
-                        )
-                        if limit is not None:
-                            gate = gate.clamp(max=float(limit))
-                            up = up.clamp(min=-float(limit), max=float(limit))
-                        act_fn = getattr(
-                            expert,
-                            "act_fn",
-                            getattr(layer_module.mlp, "act_fn", F.silu),
-                        )
-                        intermediate = act_fn(gate) * up
-                        expert.down_proj(intermediate)
-                        del gate, up, intermediate
+                    if expert_input is not None:
+                        if "down_proj" in projections:
+                            gate = expert.gate_proj(expert_input)
+                            up = expert.up_proj(expert_input)
+                            limit = getattr(
+                                expert,
+                                "limit",
+                                getattr(layer_module.mlp, "limit", None),
+                            )
+                            if limit is not None:
+                                gate = gate.clamp(max=float(limit))
+                                up = up.clamp(min=-float(limit), max=float(limit))
+                            act_fn = getattr(
+                                expert,
+                                "act_fn",
+                                getattr(layer_module.mlp, "act_fn", F.silu),
+                            )
+                            intermediate = act_fn(gate) * up
+                            expert.down_proj(intermediate)
+                            del gate, up, intermediate
+                        else:
+                            if "gate_proj" in projections:
+                                expert.gate_proj(expert_input)
+                            if "up_proj" in projections:
+                                expert.up_proj(expert_input)
+                    if identity_residual_count:
+                        for task_name in task_names_by_expert[expert_index]:
+                            task = processor.tasks.get(task_name)
+                            capture = (
+                                task.get("capture")
+                                if isinstance(task, dict)
+                                else None
+                            )
+                            columns = getattr(capture, "columns", None)
+                            partials = getattr(
+                                capture, "_device_hessian_partials", None
+                            )
+                            sample_counts = getattr(
+                                capture, "_device_sample_counts", None
+                            )
+                            nsamples = getattr(capture, "nsamples", None)
+                            if (
+                                isinstance(columns, bool)
+                                or not isinstance(columns, int)
+                                or columns <= 0
+                                or isinstance(nsamples, bool)
+                                or not isinstance(nsamples, int)
+                                or nsamples
+                                != natural_counts[expert_index]
+                                + selected_candidate_count
+                                or not isinstance(partials, dict)
+                                or not partials
+                                or not isinstance(sample_counts, dict)
+                                or set(sample_counts) != set(partials)
+                                or sum(sample_counts.values()) != nsamples
+                                or getattr(capture, "H", None) is not None
+                                or not getattr(capture, "_hessian_dirty", False)
+                            ):
+                                raise RuntimeError(
+                                    "DeepSeek V4 identity residual found an "
+                                    "invalid empirical capture"
+                                )
+                            partial_device = sorted(
+                                partials,
+                                key=lambda value: (
+                                    value.type,
+                                    -1 if value.index is None else value.index,
+                                ),
+                            )[0]
+                            partial = partials[partial_device]
+                            if (
+                                partial.dtype != torch.float32
+                                or tuple(partial.shape) != (columns, columns)
+                            ):
+                                raise RuntimeError(
+                                    "DeepSeek V4 identity residual found an "
+                                    "invalid raw Hessian"
+                                )
+                            partial.diagonal().add_(
+                                float(identity_residual_count)
+                            )
+                            sample_counts[partial_device] += (
+                                identity_residual_count
+                            )
+                            capture.nsamples += identity_residual_count
+                    if selected_gaps:
+                        gap_values = torch.cat(selected_gaps, dim=0).double()
+                        gap_summary = {
+                            "min": float(gap_values.min().item()),
+                            "mean": float(gap_values.mean().item()),
+                            "max": float(gap_values.max().item()),
+                        }
                     else:
-                        if "gate_proj" in projections:
-                            expert.gate_proj(expert_input)
-                        if "up_proj" in projections:
-                            expert.up_proj(expert_input)
-                    gap_values = torch.cat(selected_gaps, dim=0).double()
-                    gap_summary = {
-                        "min": float(gap_values.min().item()),
-                        "mean": float(gap_values.mean().item()),
-                        "max": float(gap_values.max().item()),
-                    }
-                    selected_candidate_count = needed
-                    router_augmented_count = needed
-                    identity_count = 0
-                    recovery_mode = ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR
+                        gap_summary = None
+                    router_augmented_count = selected_candidate_count
+                    identity_count = identity_residual_count
+                    recovery_mode = (
+                        ZERO_ROUTE_RECOVERY_MODE_MIXED
+                        if identity_residual_count
+                        else ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR
+                    )
                 summary = {
                     "recovery_mode": recovery_mode,
                     "router_augmented_sample_count": router_augmented_count,
@@ -2596,7 +2670,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                             "DeepSeek V4 recovery lost a processor task"
                         )
                     task["zero_route_recovery_capture"] = copy.deepcopy(summary)
-                if not identity_recovery:
+                if not pure_identity_recovery and expert_input is not None:
                     del expert_input
 
         @contextmanager

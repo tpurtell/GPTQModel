@@ -17,6 +17,7 @@ from gptqmodel.utils.exl3_error_ledger import (
     ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
     ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
     ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+    ZERO_ROUTE_RECOVERY_MODE_MIXED,
     ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
     ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA,
     ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
@@ -343,6 +344,73 @@ def test_zero_route_recovery_is_explicit_and_cannot_relabel_positive_routes():
             "gate_proj",
             provenance=provenance,
             route_evidence=_zero_route_evidence(),
+            zero_route_recovery=malformed,
+        )
+
+
+def test_mixed_recovery_binds_empirical_rows_and_identity_residual() -> None:
+    family_join = {
+        "source_revision": "abc",
+        "route_evidence_contract": ROUTE_EVIDENCE_SCHEMA,
+        "zero_route_recovery_contract": ZERO_ROUTE_RECOVERY_SCHEMA,
+    }
+    provenance = {"family_join": family_join}
+    natural_count = 300
+    router_count = 381
+    identity_count = 1024 - natural_count - router_count
+    evidence = _route_evidence()
+    evidence.update(
+        {
+            "expert_route_count": natural_count,
+            "expert_route_fraction": natural_count
+            / evidence["router_selected_route_count"],
+            "expert_gate_weight_mean": evidence["expert_gate_weight_sum"]
+            / natural_count,
+            "expert_gate_weight_rms": (
+                evidence["expert_gate_squared_mass"] / natural_count
+            )
+            ** 0.5,
+        }
+    )
+    recovery = _zero_route_recovery(family_join)
+    recovery.update(
+        {
+            "natural_sample_count": natural_count,
+            "router_augmented_sample_count": router_count,
+            "identity_calibration_count": identity_count,
+            "recovery_mode": ZERO_ROUTE_RECOVERY_MODE_MIXED,
+            "candidate_rows_observed": router_count,
+            "candidate_rows_selected": router_count,
+            "candidate_rank_histogram": {
+                "7": router_count,
+                "8": 0,
+                "9": 0,
+                "10": 0,
+                "11": 0,
+                "12": 0,
+            },
+            "candidate_score_gap": {
+                "min": 0.01,
+                "mean": 0.02,
+                "max": 0.03,
+            },
+        }
+    )
+    record = _record(
+        "gate_proj",
+        provenance=provenance,
+        route_evidence=evidence,
+        zero_route_recovery=recovery,
+    )
+    assert record["zero_route_recovery"]["identity_calibration_count"] == 343
+    assert record["zero_route_recovery"]["candidate_rows_selected"] == 381
+
+    malformed = {**recovery, "identity_calibration_count": 342}
+    with pytest.raises(ValueError, match="mixed recovery evidence"):
+        _record(
+            "gate_proj",
+            provenance=provenance,
+            route_evidence=evidence,
             zero_route_recovery=malformed,
         )
 

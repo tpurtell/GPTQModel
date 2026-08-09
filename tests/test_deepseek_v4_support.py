@@ -662,6 +662,33 @@ def _recovery_processor(task_names: tuple[str, ...], natural_count: int):
     )
 
 
+def _recovery_capture(columns: int, natural_count: int):
+    device = torch.device("cpu")
+    return SimpleNamespace(
+        columns=columns,
+        nsamples=natural_count,
+        H=None,
+        _device_hessian_partials={
+            device: torch.eye(columns, dtype=torch.float32).mul(natural_count)
+        },
+        _device_sample_counts={device: natural_count},
+        _hessian_dirty=True,
+        _final_hessian_device_hint=device,
+    )
+
+
+def _capture_linear_input(capture):
+    def hook(_module, inputs, _output):
+        values = inputs[0].reshape(-1, capture.columns).float()
+        device = next(iter(capture._device_hessian_partials))
+        capture._device_hessian_partials[device].add_(values.T @ values)
+        count = int(values.shape[0])
+        capture._device_sample_counts[device] += count
+        capture.nsamples += count
+
+    return hook
+
+
 def test_deepseek_v4_recovery_uses_rank_seven_for_declared_expert_only() -> None:
 
     block = nn.Module()
@@ -794,6 +821,138 @@ def test_deepseek_v4_target_learned_router_uses_same_recovery_policy() -> None:
         task["zero_route_recovery_capture"]["candidate_rows_selected"]
         for task in processor.tasks.values()
     } == {10}
+
+
+def test_deepseek_v4_recovery_uses_identity_only_for_rank_shortfall() -> None:
+    torch.manual_seed(0xD54)
+    block = nn.Module()
+    block.mlp = _RecoveryMLP()
+    block._gptqmodel_mtp_block_index = 0
+    shell = nn.Module()
+    shell.mtp = nn.ModuleList([block])
+    adapter = object.__new__(DeepSeekV4MTPQuantizationModel)
+    nn.Module.__init__(adapter)
+    adapter.model = shell
+    subset = {
+        f"mlp.experts.6.{projection}": SimpleNamespace(
+            full_name=f"mtp.0.mlp.experts.6.{projection}"
+        )
+        for projection in ("gate_proj", "up_proj")
+    }
+    task_names = tuple(sorted(subset))
+    natural_count = 300
+    processor = _recovery_processor(task_names, natural_count=natural_count)
+    captures = {}
+    handles = []
+    expert = block.mlp.experts[6]
+    for task_name in task_names:
+        projection = task_name.rsplit(".", 1)[-1]
+        capture = _recovery_capture(4, natural_count)
+        captures[projection] = capture
+        processor.tasks[task_name]["capture"] = capture
+        handles.append(
+            getattr(expert, projection).register_forward_hook(
+                _capture_linear_input(capture)
+            )
+        )
+    looper = SimpleNamespace(
+        _set_processor_hooks_paused=lambda _processor, _value: None
+    )
+    candidates = torch.randn(1, 381, 4)
+    try:
+        with adapter.zero_route_recovery_context(
+            looper=looper,
+            processor=processor,
+            layer_module=block,
+            subset=subset,
+            task_names=task_names,
+        ):
+            block._gptqmodel_mtp_zero_route_force(
+                0,
+                block,
+                candidates,
+                torch.zeros(1, 381, dtype=torch.long),
+            )
+            block.mlp.gate(candidates)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    identity_count = 1024 - natural_count - 381
+    expected = (
+        torch.eye(4, dtype=torch.float32).mul(natural_count + identity_count)
+        + candidates.reshape(-1, 4).float().T @ candidates.reshape(-1, 4).float()
+    )
+    for capture in captures.values():
+        assert capture.nsamples == 1024
+        assert sum(capture._device_sample_counts.values()) == 1024
+        torch.testing.assert_close(
+            next(iter(capture._device_hessian_partials.values())),
+            expected,
+        )
+    summaries = {
+        task["zero_route_recovery_capture"]["recovery_mode"]
+        for task in processor.tasks.values()
+    }
+    assert summaries == {"empirical-plus-identity-hessian"}
+    assert {
+        task["zero_route_recovery_capture"]["router_augmented_sample_count"]
+        for task in processor.tasks.values()
+    } == {381}
+    assert {
+        task["zero_route_recovery_capture"]["identity_calibration_count"]
+        for task in processor.tasks.values()
+    } == {identity_count}
+
+
+def test_deepseek_v4_positive_route_without_near_rows_uses_identity_residual() -> None:
+    block = nn.Module()
+    block.mlp = _RecoveryMLP()
+    block._gptqmodel_mtp_block_index = 0
+    shell = nn.Module()
+    shell.mtp = nn.ModuleList([block])
+    adapter = object.__new__(DeepSeekV4MTPQuantizationModel)
+    nn.Module.__init__(adapter)
+    adapter.model = shell
+    task_name = "mlp.experts.12.gate_proj"
+    subset = {
+        task_name: SimpleNamespace(
+            full_name="mtp.0.mlp.experts.12.gate_proj"
+        )
+    }
+    natural_count = 13
+    capture = _recovery_capture(4, natural_count)
+    processor = _recovery_processor((task_name,), natural_count=natural_count)
+    processor.tasks[task_name]["capture"] = capture
+    looper = SimpleNamespace(
+        _set_processor_hooks_paused=lambda _processor, _value: None
+    )
+    ffn_input = torch.randn(1, 32, 4)
+    with adapter.zero_route_recovery_context(
+        looper=looper,
+        processor=processor,
+        layer_module=block,
+        subset=subset,
+        task_names=(task_name,),
+    ):
+        block._gptqmodel_mtp_zero_route_force(
+            0,
+            block,
+            ffn_input,
+            torch.zeros(1, 32, dtype=torch.long),
+        )
+        block.mlp.gate(ffn_input)
+
+    assert capture.nsamples == 1024
+    torch.testing.assert_close(
+        next(iter(capture._device_hessian_partials.values())),
+        torch.eye(4, dtype=torch.float32).mul(1024),
+    )
+    summary = processor.tasks[task_name]["zero_route_recovery_capture"]
+    assert summary["recovery_mode"] == "empirical-plus-identity-hessian"
+    assert summary["router_augmented_sample_count"] == 0
+    assert summary["identity_calibration_count"] == 1011
+    assert summary["candidate_score_gap"] is None
 
 
 def test_deepseek_v4_zero_route_down_recovery_uses_native_swiglu_input() -> None:

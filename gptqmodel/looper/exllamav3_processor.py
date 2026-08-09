@@ -61,6 +61,7 @@ from ..utils.exl3_error_ledger import (
     ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
     ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
     ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+    ZERO_ROUTE_RECOVERY_MODE_MIXED,
     ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
     ZERO_ROUTE_RECOVERY_SELECTION_CAP,
     ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
@@ -1280,6 +1281,7 @@ class EXL3Processor(LoopProcessor):
                 not in {
                     ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
                     ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
+                    ZERO_ROUTE_RECOVERY_MODE_MIXED,
                 }
                 or isinstance(router_augmented_count, bool)
                 or not isinstance(router_augmented_count, int)
