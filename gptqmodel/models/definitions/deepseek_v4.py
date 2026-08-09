@@ -9,6 +9,7 @@ import threading
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from numbers import Integral
 from types import MethodType
 from typing import Any, Callable, Iterable, Sequence
 
@@ -2513,7 +2514,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                         sample_counts = getattr(capture, "_device_sample_counts", None)
                         if (
                             isinstance(columns, bool)
-                            or not isinstance(columns, int)
+                            or not isinstance(columns, Integral)
                             or columns <= 0
                             or getattr(capture, "nsamples", None) != 0
                             or not isinstance(partials, dict)
@@ -2524,6 +2525,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                             raise RuntimeError(
                                 "DeepSeek V4 identity recovery found a nonempty capture"
                             )
+                        columns = int(columns)
                         capture.H = torch.eye(
                             columns,
                             dtype=torch.float32,
@@ -2596,7 +2598,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                             nsamples = getattr(capture, "nsamples", None)
                             if (
                                 isinstance(columns, bool)
-                                or not isinstance(columns, int)
+                                or not isinstance(columns, Integral)
                                 or columns <= 0
                                 or isinstance(nsamples, bool)
                                 or not isinstance(nsamples, int)
@@ -2611,10 +2613,34 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                                 or getattr(capture, "H", None) is not None
                                 or not getattr(capture, "_hessian_dirty", False)
                             ):
+                                partial_sample_total = (
+                                    sum(sample_counts.values())
+                                    if isinstance(sample_counts, dict)
+                                    and all(
+                                        isinstance(value, int)
+                                        and not isinstance(value, bool)
+                                        for value in sample_counts.values()
+                                    )
+                                    else None
+                                )
                                 raise RuntimeError(
                                     "DeepSeek V4 identity residual found an "
-                                    "invalid empirical capture"
+                                    "invalid empirical capture: "
+                                    f"task={task_name!r} columns={columns!r} "
+                                    f"nsamples={nsamples!r} "
+                                    f"expected_nsamples="
+                                    f"{natural_counts[expert_index] + selected_candidate_count} "
+                                    f"partial_devices="
+                                    f"{[str(value) for value in partials] if isinstance(partials, dict) else None!r} "
+                                    f"sample_counts="
+                                    f"{sample_counts if isinstance(sample_counts, dict) else None!r} "
+                                    f"partial_sample_total={partial_sample_total!r} "
+                                    f"hessian_materialized="
+                                    f"{getattr(capture, 'H', None) is not None} "
+                                    f"hessian_dirty="
+                                    f"{getattr(capture, '_hessian_dirty', None)!r}"
                                 )
+                            columns = int(columns)
                             partial_device = sorted(
                                 partials,
                                 key=lambda value: (

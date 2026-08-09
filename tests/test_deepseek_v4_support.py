@@ -2,6 +2,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -848,6 +849,7 @@ def test_deepseek_v4_recovery_uses_identity_only_for_rank_shortfall() -> None:
     for task_name in task_names:
         projection = task_name.rsplit(".", 1)[-1]
         capture = _recovery_capture(4, natural_count)
+        capture.columns = np.int64(capture.columns)
         captures[projection] = capture
         processor.tasks[task_name]["capture"] = capture
         handles.append(
