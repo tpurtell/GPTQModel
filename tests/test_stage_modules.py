@@ -1,6 +1,7 @@
 import sys
 import threading
 import types
+import weakref
 from typing import Dict
 
 import torch
@@ -1283,14 +1284,20 @@ def test_forward_executor_run_parallel_can_skip_moe_config_for_replay():
 
 def test_run_layer_stage_invokes_subset_stage(monkeypatch):
     calls = []
+    previous_result = None
 
     def fake_run_subset_stage(looper, **kwargs):
-        calls.append(kwargs["plan"].subset_index)
-        return SubsetStageResult(
+        nonlocal previous_result
+        if previous_result is not None:
+            assert previous_result() is None
+        calls.append(kwargs["layer_index"])
+        result = SubsetStageResult(
             processed_subset={},
             layer_inputs=kwargs["layer_inputs"],
             plan=kwargs["plan"],
         )
+        previous_result = weakref.ref(result)
+        return result
 
     monkeypatch.setattr("gptqmodel.looper.stage_layer.run_subset_stage", fake_run_subset_stage)
     monkeypatch.setattr("gptqmodel.looper.stage_layer.find_modules", lambda *_, **__: {})
@@ -1465,11 +1472,14 @@ def test_run_layer_stage_invokes_subset_stage(monkeypatch):
 
     looper = DummyLooper()
     processor = looper.processors[0]
-    pb = DummyPB(range(1))
-    processor.layer_count = 1
+    pb = DummyPB(range(2))
+    processor.layer_count = 2
     processor.pb = pb
 
-    layers = [torch.nn.Linear(in_features=64, out_features=64)]
+    layers = [
+        torch.nn.Linear(in_features=64, out_features=64),
+        torch.nn.Linear(in_features=64, out_features=64),
+    ]
     layer_modules = [["foo"]]
     logger = DummyLogger()
 
@@ -1478,17 +1488,17 @@ def test_run_layer_stage_invokes_subset_stage(monkeypatch):
         layers=layers,
         layer_modules=layer_modules,
         planning_layer_modules=layer_modules,
-        layer_names=["model.layers.0"],
+        layer_names=["model.layers.0", "model.layers.1"],
         fallback=True,
         shared_kv_cache_dict={},
         pb=pb,
-        layer_count=1,
+        layer_count=2,
         region_timer=None,
         finalize_progress_cls=FinalizeProgressInfo,
         logger=logger,
     )
 
-    assert calls == [0]
+    assert calls == [0, 1]
 
 
 def test_run_layer_stage_stops_after_last_quantized_layer(monkeypatch):

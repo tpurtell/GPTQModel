@@ -814,6 +814,12 @@ def run_layer_stage(
                     # The most recent subset plan defines the replay contract
                     # for the outputs that flow into the next layer.
                     last_subset_plan = subset_result.plan
+                # Do not retain the result wrapper across decoder iterations.
+                # Its layer_inputs member otherwise keeps the previous
+                # activation generation alive until the next layer finishes
+                # its first complete subset. The extracted local owns the
+                # inputs for exactly as long as this layer still needs them.
+                del subset_result
                 if durable_progress_logs:
                     log.info(
                         "StageLayer: layer=%s processor=%s subset=%s/%s complete modules=%s",
