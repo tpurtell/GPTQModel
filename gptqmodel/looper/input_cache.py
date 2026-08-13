@@ -49,9 +49,7 @@ class TensorLifetimeDiagnostic:
                 identity = id(item)
                 if identity not in seen:
                     seen.add(identity)
-                    self._issued_tensor_refs.append(
-                        (weakref.ref(item), item.untyped_storage().nbytes())
-                    )
+                    self.observe(item)
                 return
             if isinstance(item, dict):
                 for nested in item.values():
@@ -62,6 +60,13 @@ class TensorLifetimeDiagnostic:
                     visit(nested)
 
         visit(value)
+
+    def observe(self, tensor: torch.Tensor) -> None:
+        """Add one tensor without taking a strong ownership reference."""
+
+        self._issued_tensor_refs.append(
+            (weakref.ref(tensor), tensor.untyped_storage().nbytes())
+        )
 
     @staticmethod
     def _referrer_summary(value: Any) -> dict[str, Any]:
