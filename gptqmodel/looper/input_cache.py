@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import threading
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Sequence
@@ -100,6 +101,9 @@ class DiskBackedLayerOutputSequence(Sequence[List[torch.Tensor]]):
                 self._row_counts[start + offset] = int(shape[0])
         if any(count <= 0 for count in self._row_counts):
             raise ValueError("disk-backed layer output manifest has invalid rows")
+        self._issued_tensor_refs: list[
+            tuple[weakref.ReferenceType[torch.Tensor], int]
+        ] = []
 
     @classmethod
     def open(cls, root: str | os.PathLike, *, verify_hashes: bool = True):
@@ -165,7 +169,64 @@ class DiskBackedLayerOutputSequence(Sequence[List[torch.Tensor]]):
         expected_shape = tuple(shard["shapes"][index - int(shard["start"])])
         if tuple(tensor.shape) != expected_shape:
             raise ValueError("disk-backed layer output tensor shape differs")
+        self._issued_tensor_refs.append(
+            (weakref.ref(tensor), tensor.untyped_storage().nbytes())
+        )
         return [tensor]
+
+    @staticmethod
+    def _referrer_summary(value: Any) -> dict[str, Any]:
+        summary: dict[str, Any] = {"type": type(value).__name__}
+        if isinstance(value, (list, tuple, set, dict)):
+            summary["length"] = len(value)
+        if isinstance(value, dict):
+            summary["string_keys"] = sorted(
+                key for key in value if isinstance(key, str)
+            )[:12]
+        return summary
+
+    def lifetime_diagnostic(self) -> dict[str, Any]:
+        """Describe tensors issued from disk that survived the layer handoff."""
+
+        import gc
+
+        alive_by_id: dict[int, tuple[torch.Tensor, int]] = {}
+        for tensor_ref, storage_bytes in self._issued_tensor_refs:
+            tensor = tensor_ref()
+            if tensor is not None:
+                alive_by_id.setdefault(id(tensor), (tensor, storage_bytes))
+        alive = list(alive_by_id.values())
+        result: dict[str, Any] = {
+            "issued": len(self._issued_tensor_refs),
+            "alive_tensors": len(alive),
+            "alive_storage_bytes": sum(storage_bytes for _, storage_bytes in alive),
+        }
+        if not alive:
+            return result
+
+        sample = max(alive, key=lambda entry: entry[1])[0]
+        ignored = {id(alive), id(alive_by_id), id(result)}
+        direct = [
+            value
+            for value in gc.get_referrers(sample)
+            if id(value) not in ignored
+        ]
+        result["sample_shape"] = list(sample.shape)
+        result["sample_direct_referrers"] = [
+            self._referrer_summary(value) for value in direct[:12]
+        ]
+        parents: list[dict[str, Any]] = []
+        for value in direct[:4]:
+            for parent in gc.get_referrers(value):
+                if id(parent) in ignored or parent is direct:
+                    continue
+                parents.append(self._referrer_summary(parent))
+                if len(parents) == 12:
+                    break
+            if len(parents) == 12:
+                break
+        result["sample_parent_referrers"] = parents
+        return result
 
 
 class DiskBackedLayerOutputWriter:

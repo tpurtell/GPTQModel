@@ -683,6 +683,9 @@ def run_layer_stage(
             execution_config = processor.execution_config
 
             layer_inputs = processor.inputs_cache.layer_inputs
+            input_lifetime_diagnostic = getattr(
+                layer_inputs, "lifetime_diagnostic", None
+            )
             if is_lm_head_module and layer_inputs:
                 layer_inputs = looper.gptq_model.lm_head_pre_quantize_generate_hook(layer_inputs)
             layer_input_kwargs = processor.inputs_cache.layer_input_kwargs
@@ -1185,6 +1188,12 @@ def run_layer_stage(
                         )
 
                 if layer_boundary_checkpoint is not None and not is_lm_head_module:
+                    if callable(input_lifetime_diagnostic):
+                        log.info(
+                            "StageLayer: input lifetime diagnostic layer=%s result=%s",
+                            layer_index,
+                            input_lifetime_diagnostic(),
+                        )
                     commit_boundary = getattr(
                         layer_boundary_checkpoint, "commit_layer", None
                     )

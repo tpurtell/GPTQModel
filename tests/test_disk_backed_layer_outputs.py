@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 
 import pytest
@@ -41,6 +42,33 @@ def test_disk_backed_layer_outputs_are_sharded_and_random_access(tmp_path):
     assert len(manifest["shards"]) == 3
     reopened = DiskBackedLayerOutputSequence.open(root / "layer-000001")
     assert torch.equal(reopened[3][0], expected[3])
+
+
+def test_disk_backed_layer_outputs_report_issued_tensor_lifetime(tmp_path):
+    root = tmp_path / "activations"
+    writer = DiskBackedLayerOutputWriter(
+        root,
+        layer_index=0,
+        expected_batches=1,
+        provenance={"plan": "lifetime"},
+    )
+    writer.put(0, [torch.zeros(2, 4)])
+    sequence = writer.finalize()
+
+    retained = sequence[0]
+    live = sequence.lifetime_diagnostic()
+    assert live["issued"] == 1
+    assert live["alive_tensors"] == 1
+    assert live["alive_storage_bytes"] == 2 * 4 * 4
+
+    del retained
+    gc.collect()
+    released = sequence.lifetime_diagnostic()
+    assert released == {
+        "issued": 1,
+        "alive_tensors": 0,
+        "alive_storage_bytes": 0,
+    }
 
 
 def test_disk_backed_layer_outputs_resume_complete_shards(tmp_path):
