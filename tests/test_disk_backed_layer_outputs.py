@@ -9,6 +9,7 @@ import torch
 from gptqmodel.looper.input_cache import (
     DiskBackedLayerOutputSequence,
     DiskBackedLayerOutputWriter,
+    TensorLifetimeDiagnostic,
 )
 
 
@@ -66,6 +67,25 @@ def test_disk_backed_layer_outputs_report_issued_tensor_lifetime(tmp_path):
     released = sequence.lifetime_diagnostic()
     assert released == {
         "issued": 1,
+        "alive_tensors": 0,
+        "alive_storage_bytes": 0,
+    }
+
+
+def test_tensor_lifetime_diagnostic_does_not_retain_nested_inputs():
+    layer_inputs = [[torch.zeros(2, 4)], [torch.ones(3, 4)]]
+    diagnostic = TensorLifetimeDiagnostic(layer_inputs)
+
+    live = diagnostic.lifetime_diagnostic()
+    assert live["issued"] == 2
+    assert live["alive_tensors"] == 2
+    assert live["alive_storage_bytes"] == (2 * 4 + 3 * 4) * 4
+
+    del layer_inputs
+    gc.collect()
+    released = diagnostic.lifetime_diagnostic()
+    assert released == {
+        "issued": 2,
         "alive_tensors": 0,
         "alive_storage_bytes": 0,
     }

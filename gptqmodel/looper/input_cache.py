@@ -35,6 +35,98 @@ class InputCache:
         return result
 
 
+class TensorLifetimeDiagnostic:
+    """Track tensor lifetime without retaining the tensors being observed."""
+
+    def __init__(self, value: Any):
+        self._issued_tensor_refs: list[
+            tuple[weakref.ReferenceType[torch.Tensor], int]
+        ] = []
+        seen: set[int] = set()
+
+        def visit(item: Any) -> None:
+            if isinstance(item, torch.Tensor):
+                identity = id(item)
+                if identity not in seen:
+                    seen.add(identity)
+                    self._issued_tensor_refs.append(
+                        (weakref.ref(item), item.untyped_storage().nbytes())
+                    )
+                return
+            if isinstance(item, dict):
+                for nested in item.values():
+                    visit(nested)
+                return
+            if isinstance(item, (list, tuple)):
+                for nested in item:
+                    visit(nested)
+
+        visit(value)
+
+    @staticmethod
+    def _referrer_summary(value: Any) -> dict[str, Any]:
+        summary: dict[str, Any] = {"type": type(value).__name__}
+        if isinstance(value, (list, tuple, set, dict)):
+            summary["length"] = len(value)
+        if isinstance(value, dict):
+            summary["string_keys"] = sorted(
+                key for key in value if isinstance(key, str)
+            )[:12]
+        return summary
+
+    def lifetime_diagnostic(self) -> dict[str, Any]:
+        """Describe tracked tensors that survived until the current boundary."""
+
+        import gc
+
+        alive_ids: set[int] = set()
+        alive_storage_bytes = 0
+        sample_ref: weakref.ReferenceType[torch.Tensor] | None = None
+        sample_bytes = -1
+        for tensor_ref, storage_bytes in self._issued_tensor_refs:
+            tensor = tensor_ref()
+            if tensor is None or id(tensor) in alive_ids:
+                continue
+            alive_ids.add(id(tensor))
+            alive_storage_bytes += storage_bytes
+            if storage_bytes > sample_bytes:
+                sample_ref = tensor_ref
+                sample_bytes = storage_bytes
+        # Do not let the loop local become another apparent owner.
+        tensor = None
+        result: dict[str, Any] = {
+            "issued": len(self._issued_tensor_refs),
+            "alive_tensors": len(alive_ids),
+            "alive_storage_bytes": alive_storage_bytes,
+        }
+        if sample_ref is None:
+            return result
+
+        sample = sample_ref()
+        if sample is None:
+            return result
+        ignored = {id(result), id(alive_ids)}
+        direct = [
+            value for value in gc.get_referrers(sample) if id(value) not in ignored
+        ]
+        result["sample_shape"] = list(sample.shape)
+        result["sample_direct_referrers"] = [
+            self._referrer_summary(value) for value in direct[:12]
+        ]
+        parents: list[dict[str, Any]] = []
+        for value in direct[:4]:
+            for parent in gc.get_referrers(value):
+                if id(parent) in ignored or parent is direct:
+                    continue
+                parents.append(self._referrer_summary(parent))
+                if len(parents) == 12:
+                    break
+            if len(parents) == 12:
+                break
+        result["sample_parent_referrers"] = parents
+        return result
+
+
 _DISK_BATCH_SCHEMA = "gptqmodel.disk-backed-layer-outputs"
 _DISK_BATCH_SCHEMA_VERSION = 1
 
@@ -174,59 +266,12 @@ class DiskBackedLayerOutputSequence(Sequence[List[torch.Tensor]]):
         )
         return [tensor]
 
-    @staticmethod
-    def _referrer_summary(value: Any) -> dict[str, Any]:
-        summary: dict[str, Any] = {"type": type(value).__name__}
-        if isinstance(value, (list, tuple, set, dict)):
-            summary["length"] = len(value)
-        if isinstance(value, dict):
-            summary["string_keys"] = sorted(
-                key for key in value if isinstance(key, str)
-            )[:12]
-        return summary
-
     def lifetime_diagnostic(self) -> dict[str, Any]:
         """Describe tensors issued from disk that survived the layer handoff."""
 
-        import gc
-
-        alive_by_id: dict[int, tuple[torch.Tensor, int]] = {}
-        for tensor_ref, storage_bytes in self._issued_tensor_refs:
-            tensor = tensor_ref()
-            if tensor is not None:
-                alive_by_id.setdefault(id(tensor), (tensor, storage_bytes))
-        alive = list(alive_by_id.values())
-        result: dict[str, Any] = {
-            "issued": len(self._issued_tensor_refs),
-            "alive_tensors": len(alive),
-            "alive_storage_bytes": sum(storage_bytes for _, storage_bytes in alive),
-        }
-        if not alive:
-            return result
-
-        sample = max(alive, key=lambda entry: entry[1])[0]
-        ignored = {id(alive), id(alive_by_id), id(result)}
-        direct = [
-            value
-            for value in gc.get_referrers(sample)
-            if id(value) not in ignored
-        ]
-        result["sample_shape"] = list(sample.shape)
-        result["sample_direct_referrers"] = [
-            self._referrer_summary(value) for value in direct[:12]
-        ]
-        parents: list[dict[str, Any]] = []
-        for value in direct[:4]:
-            for parent in gc.get_referrers(value):
-                if id(parent) in ignored or parent is direct:
-                    continue
-                parents.append(self._referrer_summary(parent))
-                if len(parents) == 12:
-                    break
-            if len(parents) == 12:
-                break
-        result["sample_parent_referrers"] = parents
-        return result
+        diagnostic = TensorLifetimeDiagnostic.__new__(TensorLifetimeDiagnostic)
+        diagnostic._issued_tensor_refs = self._issued_tensor_refs
+        return diagnostic.lifetime_diagnostic()
 
 
 class DiskBackedLayerOutputWriter:

@@ -39,6 +39,7 @@ from ..utils.logger import live_renderables_suppressed, log_time_block, setup_lo
 from ..utils.model import find_modules, get_layer_name, get_module
 from ..utils.offload import offload_to_disk
 from ..utils.torch import CPU, torch_empty_cache, torch_sync
+from .input_cache import TensorLifetimeDiagnostic
 from .stage_subset import SubsetPlan, build_layer_subset_plans, run_subset_stage
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only
@@ -686,6 +687,10 @@ def run_layer_stage(
             input_lifetime_diagnostic = getattr(
                 layer_inputs, "lifetime_diagnostic", None
             )
+            if not callable(input_lifetime_diagnostic):
+                input_lifetime_diagnostic = TensorLifetimeDiagnostic(
+                    layer_inputs
+                ).lifetime_diagnostic
             if is_lm_head_module and layer_inputs:
                 layer_inputs = looper.gptq_model.lm_head_pre_quantize_generate_hook(layer_inputs)
             layer_input_kwargs = processor.inputs_cache.layer_input_kwargs
