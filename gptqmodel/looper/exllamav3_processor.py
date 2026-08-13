@@ -105,6 +105,7 @@ from ..utils.exl3_remote import (
 )
 from ..utils.exllamav3 import create_exllamav3_module
 from ..utils.logger import setup_logger
+from ..utils.model import recurse_setattr
 from ..utils.module_locks import parent_module_lock
 from ..utils.offload import offload_to_disk
 
@@ -2177,8 +2178,20 @@ class EXL3Processor(LoopProcessor):
                 raise RuntimeError(
                     f"EXL3 restore target is absent: `{module_name}`"
                 ) from error
+            named_source = source_module
             if isinstance(source_module, ExllamaV3Linear):
-                raise RuntimeError(f"EXL3 restore target is already packed: `{module_name}`")
+                trellis = getattr(source_module, "trellis", None)
+                if trellis is None or trellis.device.type != "meta":
+                    raise RuntimeError(
+                        f"EXL3 restore target is already packed: `{module_name}`"
+                    )
+                named_source = torch.nn.Linear(
+                    source_module.in_features,
+                    source_module.out_features,
+                    bias=False,
+                    dtype=source_module.out_dtype,
+                    device="meta",
+                )
             bias = getattr(source_module, "bias", None)
             if bias is not None:
                 if getattr(bias, "is_meta", False):
@@ -2190,7 +2203,7 @@ class EXL3Processor(LoopProcessor):
                 f"model.layers.{layer_index}."
             )
             named = NamedModule(
-                source_module,
+                named_source,
                 name=relative_name,
                 full_name=module_name,
                 layer_index=layer_index,
@@ -2271,6 +2284,61 @@ class EXL3Processor(LoopProcessor):
                 except (TypeError, ValueError):
                     pass
                 self.durations.append(float(stat[PROCESS_LOG_TIME]))
+
+    def defer_completed_layer_checkpoints(
+        self,
+        *,
+        model: BaseQModel,
+        layer_index: int,
+        projection_entries: list[dict[str, str]],
+    ) -> None:
+        """Replace a durable packed layer with metadata-only EXL3 shells.
+
+        Projection checkpoints already own every packed tensor and the layer
+        boundary owns the outputs needed by the next decoder block. Keeping a
+        second in-memory copy until publication makes resident memory grow by
+        one complete routed layer per iteration.
+        """
+
+        expected = {
+            entry.get("module")
+            for entry in projection_entries
+            if isinstance(entry, dict)
+        }
+        if len(expected) != len(projection_entries) or not all(
+            isinstance(name, str) and name for name in expected
+        ):
+            raise RuntimeError(
+                f"EXL3 layer {layer_index} deferral index is malformed"
+            )
+        completed = {
+            entry["module"]
+            for entry in self.completed_layer_checkpoint_entries(layer_index)
+        }
+        if completed != expected:
+            raise RuntimeError(
+                f"EXL3 layer {layer_index} deferral differs from durable checkpoints"
+            )
+
+        for module_name in sorted(expected):
+            packed = model.model.get_submodule(module_name)
+            if not isinstance(packed, ExllamaV3Linear):
+                raise RuntimeError(
+                    f"EXL3 deferral target is not packed: `{module_name}`"
+                )
+            trellis = getattr(packed, "trellis", None)
+            if trellis is None or trellis.device.type == "meta":
+                raise RuntimeError(
+                    f"EXL3 deferral target is not materialized: `{module_name}`"
+                )
+            placeholder = ExllamaV3Linear(
+                in_features=packed.in_features,
+                out_features=packed.out_features,
+                name=module_name,
+                tensor_storage=packed.tensor_storage_entry(),
+                out_dtype=packed.out_dtype,
+            )
+            recurse_setattr(model.model, module_name, placeholder)
 
     def offload_restored_layer_checkpoints(
         self,

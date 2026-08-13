@@ -215,6 +215,56 @@ def test_capture_memory_summary_attributes_cache_model_and_heap_release(
     assert released["after"]["model_host_bytes"] == summary["model_host_bytes"]
 
 
+def test_completed_layer_deferral_replaces_packed_storage_with_meta_shell() -> None:
+    root = nn.Module()
+    root.model = nn.Module()
+    root.model.layers = nn.ModuleList([nn.Module()])
+    root.model.layers[0].proj = ExllamaV3Linear.from_tensors(
+        in_features=4,
+        out_features=8,
+        name="model.layers.0.proj",
+        tensors={
+            "trellis": torch.zeros((8, 1, 8), dtype=torch.int16),
+            "suh": torch.ones(4, dtype=torch.float16),
+            "svh": torch.ones(8, dtype=torch.float16),
+            "mcg": torch.tensor([123], dtype=torch.int32),
+        },
+    )
+    model = SimpleNamespace(model=root)
+    processor = EXL3Processor.__new__(EXL3Processor)
+    processor._stats_lock = threading.Lock()
+    processor.log = [
+        {
+            "layer": 0,
+            "exl3_error_ledger_record": {"module": "model.layers.0.proj"},
+            "exl3_projection_checkpoint": "request",
+            "exl3_error_record_sha256": "record",
+        }
+    ]
+    entries = [
+        {
+            "module": "model.layers.0.proj",
+            "request_sha256": "request",
+            "record_sha256": "record",
+        }
+    ]
+
+    before = processor._model_tensor_summary(model)
+    processor.defer_completed_layer_checkpoints(
+        model=model,
+        layer_index=0,
+        projection_entries=entries,
+    )
+    deferred = root.get_submodule("model.layers.0.proj")
+    after = processor._model_tensor_summary(model)
+
+    assert isinstance(deferred, ExllamaV3Linear)
+    assert deferred.trellis.device.type == "meta"
+    assert before["host_bytes"] > 0
+    assert after["host_bytes"] == 0
+    assert after["meta_tensor_count"] > 0
+
+
 def test_runtime_reconstruction_shares_the_device_trellis_lock(monkeypatch) -> None:
     processor = EXL3Processor.__new__(EXL3Processor)
     processor._stats_lock = threading.Lock()
@@ -358,3 +408,15 @@ def test_restore_completed_layer_installs_packed_modules_without_hessian(
     assert len(processor.log) == 6
     assert all(stat["exl3_layer_boundary_restore"] for stat in processor.log)
     assert len(list(offload_root.rglob("module.safetensors"))) == 6
+
+    # A metadata-only EXL3 shell is a deferred target, not a live duplicate.
+    # Publication may materialize it again from the same checkpoints.
+    processor.restore_completed_layer_checkpoints(
+        model=model,
+        layer_index=0,
+        projection_entries=entries,
+    )
+    assert all(
+        isinstance(root.get_submodule(entry["module"]), ExllamaV3Linear)
+        for entry in entries
+    )
