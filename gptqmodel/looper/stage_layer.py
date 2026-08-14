@@ -853,6 +853,40 @@ def run_layer_stage(
                 and execution_config.fwd_replay_after_process
             )
 
+            if replay_skipped_layer:
+                # A checkpoint-backed lazy layer normally materializes its
+                # direct state and projections while executing a subset. A
+                # fully excluded layer has no subset, but its untouched native
+                # forward is still required to advance calibration inputs.
+                # Restore every supported projection through the decoder-aware
+                # forward role before ForwardExecutor tries to replicate it.
+                looper._prepare_layer_direct_state_for_forward(
+                    module,
+                    cur_layer_device,
+                    projection_modules=full,
+                )
+                for relative_name, native_module in full.items():
+                    if isinstance(native_module, NamedModule):
+                        named_native = native_module
+                    else:
+                        full_name = (
+                            f"{layer_descriptor}.{relative_name}"
+                            if relative_name
+                            else layer_descriptor
+                        )
+                        named_native = NamedModule(
+                            native_module,
+                            name=relative_name,
+                            full_name=full_name,
+                            layer_index=layer_index,
+                        )
+                    prepared_native = looper._prepare_named_module_for_forward(
+                        named_module=named_native,
+                        fallback_device=cur_layer_device,
+                    )
+                    if not relative_name and prepared_native is not module:
+                        module = prepared_native
+
             # Some processors consume outputs only after `process()` updates the
             # current layer. In that case, replay the layer once using the
             # metadata already computed by the final subset plan.

@@ -2491,7 +2491,6 @@ def test_run_layer_stage_replays_untouched_layer_outputs_when_all_modules_skippe
         )
 
     monkeypatch.setattr("gptqmodel.looper.stage_layer.run_subset_stage", fake_run_subset_stage)
-    monkeypatch.setattr("gptqmodel.looper.stage_layer.find_modules", lambda *_, **__: {})
 
     class DummyPB:
         def __init__(self, iterable):
@@ -2632,6 +2631,8 @@ def test_run_layer_stage_replays_untouched_layer_outputs_when_all_modules_skippe
             self.moe_routing_override = None
             self.moe_routing_bypass = False
             self.forward_layer_indices = []
+            self.direct_state_layers = []
+            self.prepared_native_modules = []
             self.layers = layers
 
         def _run_forward_batches(self, **kwargs):
@@ -2664,6 +2665,29 @@ def test_run_layer_stage_replays_untouched_layer_outputs_when_all_modules_skippe
 
         def _emit_layer_complete(self, *, layer_idx, submodule_finalized, raise_in_place):
             return None
+
+        def _prepare_layer_direct_state_for_forward(
+            self, module, fallback_device, *, projection_modules=None
+        ):
+            self.direct_state_layers.append(
+                (module, fallback_device, projection_modules)
+            )
+            for relative_name, candidate in list(projection_modules.items()):
+                projection_modules[relative_name] = NamedModule(
+                    candidate,
+                    name=relative_name,
+                    full_name=f"model.layers.0.{relative_name}",
+                    layer_index=0,
+                )
+            return 0
+
+        def _prepare_named_module_for_forward(
+            self, *, named_module, fallback_device
+        ):
+            self.prepared_native_modules.append(
+                (named_module, fallback_device)
+            )
+            return named_module.module
 
         def _request_loop_stop(self, exc):
             self._stop_exc = exc
@@ -2740,6 +2764,22 @@ def test_run_layer_stage_replays_untouched_layer_outputs_when_all_modules_skippe
     expected_layer0_output = input_tensor * 6.0
 
     assert looper.forward_layer_indices == [0]
+    assert len(looper.direct_state_layers) == 1
+    assert {
+        named.full_name for named, _device in looper.prepared_native_modules
+    } == {
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.v_proj",
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.mlp.gate_proj",
+        "model.layers.0.mlp.up_proj",
+        "model.layers.0.mlp.down_proj",
+    }
+    assert all(
+        not isinstance(named.module, NamedModule)
+        for named, _device in looper.prepared_native_modules
+    )
     assert len(layers[0].forward_inputs) == 1
     assert torch.allclose(layers[0].forward_inputs[0], input_tensor)
     assert layer1_inputs

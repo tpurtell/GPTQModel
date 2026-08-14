@@ -8,6 +8,7 @@ import copy
 import threading
 import time
 from contextlib import contextmanager
+from types import MethodType
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -30,6 +31,27 @@ USE_TORCH_REPLICATE = env_flag("GPTQMODEL_USE_TORCH_REPLICATE", True)
 
 _THREAD_SAFE_PARALLEL = ThreadSafe(torch_parallel)
 _DEEPCOPY_LOCK = threading.Lock()
+
+
+def _rebind_copied_instance_methods(
+    source: torch.nn.Module,
+    replica: torch.nn.Module,
+) -> None:
+    """Rebind shallow-copied instance methods to the matching replica node."""
+
+    source_modules = dict(source.named_modules())
+    replica_modules = dict(replica.named_modules())
+    if source_modules.keys() != replica_modules.keys():
+        raise RuntimeError("replicated module topology changed while rebinding methods")
+    for path, source_module in source_modules.items():
+        replica_module = replica_modules[path]
+        for attribute, value in tuple(vars(replica_module).items()):
+            if isinstance(value, MethodType) and value.__self__ is source_module:
+                setattr(
+                    replica_module,
+                    attribute,
+                    MethodType(value.__func__, replica_module),
+                )
 
 def torch_replicate(
     module: torch.nn.Module,
@@ -347,6 +369,7 @@ def clone_module_for_devices(
             _record("replicate", replicate_start)
 
             for idx, (dev, replica) in enumerate(zip(devices, replicas), start=1):
+                _rebind_copied_instance_methods(module, replica)
                 replica.eval()
                 rehome_module_to_device(replica, dev, move_parameters=True, move_buffers=True)
                 clear_state_fn(replica)
@@ -378,6 +401,7 @@ def clone_module_for_devices(
         start_ts = time.perf_counter()
         with _DEEPCOPY_LOCK:
             replica = copy.deepcopy(module)
+        _rebind_copied_instance_methods(module, replica)
         replica.eval()
         rehome_module_to_device(replica, dev, move_parameters=True, move_buffers=True)
         clear_state_fn(replica)
