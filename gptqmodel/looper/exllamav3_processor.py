@@ -2348,11 +2348,14 @@ class EXL3Processor(LoopProcessor):
                 }
             else:
                 wait_started = time.perf_counter()
-                quant_lock = (
-                    self._distributed_local_quant_lock(target_device)
-                    if remote_client is not None
-                    else nullcontext()
-                )
+                # EXL3 caches trellis scratch tensors and a quantization stream
+                # per physical device.  The device worker pool may contain
+                # several host workers for staging/transport overlap, but two
+                # quantize_exl3 calls on the same GPU would alias that scratch
+                # state.  Serialize the device-local kernel region for both
+                # local-only and distributed runs; different GPUs retain their
+                # independent locks and still execute concurrently.
+                quant_lock = self._distributed_local_quant_lock(target_device)
                 with quant_lock:
                     if hessian.device != target_device:
                         hessian = hessian.to(
@@ -2417,11 +2420,16 @@ class EXL3Processor(LoopProcessor):
                 raise RuntimeError(
                     f"EXL3 quantizer returned no structured error metrics for `{module.full_name}`."
                 )
-            validate_exl3_hessian_metrics(
-                quantizer_metrics,
-                sample_count=capture.nsamples,
-                sigma_reg=float(quant_args["sigma_reg"]),
-            )
+            try:
+                validate_exl3_hessian_metrics(
+                    quantizer_metrics,
+                    sample_count=capture.nsamples,
+                    sigma_reg=float(quant_args["sigma_reg"]),
+                )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"{error} for `{module.full_name}`"
+                ) from error
             if isinstance(proxy_err, torch.Tensor):
                 proxy_err = proxy_err.item()
             encoded_bytes = sum(

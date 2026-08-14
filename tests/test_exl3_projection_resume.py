@@ -117,8 +117,22 @@ def test_process_resumes_from_packed_checkpoint_without_requantizing(
         weight,
         hessian,
     )
+    original_quantize_exl3 = processor_module.quantize_exl3
+    quant_lock_observations = []
+
+    def observe_device_trellis_lock(*args, **kwargs):
+        lock = first_processor._distributed_local_quant_lock(torch.device("cuda:0"))
+        quant_lock_observations.append(lock.locked())
+        return original_quantize_exl3(*args, **kwargs)
+
+    monkeypatch.setattr(
+        processor_module,
+        "quantize_exl3",
+        observe_device_trellis_lock,
+    )
     first_processor.process(first_module)
     first_module.stream_sync()
+    assert quant_lock_observations == [True]
     first_replay_weight = first_module.module.weight.detach().cpu().clone()
     assert first_processor.log[-1]["exl3_projection_checkpoint_hit"] is False
     assert len(list(checkpoint_root.rglob("*.json"))) == 1

@@ -445,8 +445,28 @@ def validate_exl3_hessian_metrics(
         or not math.isfinite(scale_search_mse)
         or scale_search_mse < 0.0
     ):
+        observed = {
+            key: metrics.get(key)
+            for key in (
+                "quantizer_path",
+                "hessian_metric_status",
+                "hessian_sample_count",
+                "hessian_regularization_sigma",
+                "hessian_numerical_contract",
+                "hessian_transform_compute_dtype",
+                "hessian_storage_dtype",
+                "hessian_regularization_placement",
+                "hessian_regularization_diagonal_addend",
+                "hessian_symmetry_restoration",
+                "hessian_symmetry_correction_max_abs",
+                "selected_global_scale",
+                "scale_search_mse",
+            )
+        }
         raise RuntimeError(
-            "EXL3 quantizer returned an invalid Hessian numerical contract"
+            "EXL3 quantizer returned an invalid Hessian numerical contract: "
+            f"expected_sample_count={sample_count}, expected_sigma_reg={sigma_reg}, "
+            f"observed={observed!r}"
         )
 
 
