@@ -2781,14 +2781,22 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
 
         def discard_superseded_capture(_outputs) -> None:
             if capture_root is None:
-                return
-            family_join = provenance.get("family_join")
-            if not isinstance(family_join, dict):
-                raise RuntimeError("MTP activation provenance has no family join")
-            EXL3CaptureFrontierStore(
-                capture_root,
-                family_join=family_join,
-            ).discard_through(layer_index, block_namespace="mtp")
+                pass
+            else:
+                family_join = provenance.get("family_join")
+                if not isinstance(family_join, dict):
+                    raise RuntimeError("MTP activation provenance has no family join")
+                EXL3CaptureFrontierStore(
+                    capture_root,
+                    family_join=family_join,
+                ).discard_through(layer_index, block_namespace="mtp")
+            prune_source = getattr(
+                getattr(self, "turtle_model", None),
+                "prune_active_source_scope_through",
+                None,
+            )
+            if callable(prune_source):
+                prune_source("mtp", layer_index)
 
         return DiskBackedLayerOutputWriter(
             root,

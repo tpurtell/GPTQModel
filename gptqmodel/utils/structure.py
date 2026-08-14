@@ -842,6 +842,126 @@ class LazyTurtle:
         self._runtime_to_checkpoint_renamings = tuple(alias_items)
         self._runtime_to_checkpoint_converters = self._normalize_runtime_to_checkpoint_converters(conversion_aliases)
         self._lock = threading.RLock()
+        self._active_source_root: Optional[str] = None
+        self._active_source_provenance: Optional[Dict[str, Any]] = None
+
+    def configure_active_source_staging(
+        self,
+        root: str,
+        *,
+        provenance: Dict[str, Any],
+    ) -> None:
+        """Stage active decoder/MTP shards on fast local storage on demand."""
+
+        if not isinstance(root, str) or not root or not os.path.isabs(root):
+            raise ValueError("LazyTurtle active source staging requires an absolute root")
+        if not isinstance(provenance, dict) or not provenance:
+            raise ValueError("LazyTurtle active source staging requires provenance")
+        os.makedirs(root, exist_ok=True)
+        if os.path.islink(root) or not os.path.isdir(root):
+            raise ValueError("LazyTurtle active source staging root is unsafe")
+        with self._lock:
+            if self._active_source_root not in {None, root}:
+                raise ValueError("LazyTurtle active source staging root changed")
+            if (
+                self._active_source_provenance is not None
+                and self._active_source_provenance != provenance
+            ):
+                raise ValueError("LazyTurtle active source provenance changed")
+            self._active_source_root = root
+            self._active_source_provenance = copy.deepcopy(provenance)
+
+    @staticmethod
+    def _active_source_scope(module_path: Optional[str]) -> Optional[str]:
+        if not isinstance(module_path, str):
+            return None
+        match = re.match(r"^(?:model\.)?layers\.(\d+)(?:\.|$)", module_path)
+        if match is not None:
+            return f"base-{int(match.group(1)):06d}"
+        match = re.match(r"^mtp\.(\d+)(?:\.|$)", module_path)
+        if match is not None:
+            return f"mtp-{int(match.group(1)):06d}"
+        return None
+
+    def _checkpoint_shard_path(
+        self,
+        shard: str,
+        *,
+        module_path: Optional[str],
+    ) -> str:
+        source_path = os.path.join(self.model_local_path, shard)
+        scope = self._active_source_scope(module_path)
+        root = self._active_source_root
+        if root is None or scope is None:
+            return source_path
+        if os.path.basename(shard) != shard:
+            raise ValueError("LazyTurtle checkpoint shard name is unsafe")
+        scope_root = os.path.join(root, scope)
+        staged_path = os.path.join(scope_root, shard)
+        source_stat = os.stat(source_path, follow_symlinks=True)
+        with self._lock:
+            os.makedirs(scope_root, exist_ok=True)
+            if os.path.islink(scope_root) or not os.path.isdir(scope_root):
+                raise RuntimeError("LazyTurtle active source scope is unsafe")
+            try:
+                staged_stat = os.stat(staged_path, follow_symlinks=False)
+            except FileNotFoundError:
+                staged_stat = None
+            if staged_stat is not None:
+                if not os.path.isfile(staged_path) or os.path.islink(staged_path):
+                    raise RuntimeError("LazyTurtle staged source shard is unsafe")
+                if staged_stat.st_size != source_stat.st_size:
+                    raise RuntimeError("LazyTurtle staged source shard size differs")
+                return staged_path
+
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{shard}.", suffix=".tmp", dir=scope_root
+            )
+            try:
+                with open(source_path, "rb", buffering=0) as source, os.fdopen(
+                    descriptor, "wb", buffering=0
+                ) as target:
+                    shutil.copyfileobj(source, target, length=32 * 1024 * 1024)
+                    target.flush()
+                    os.fsync(target.fileno())
+                if os.stat(temporary).st_size != source_stat.st_size:
+                    raise RuntimeError("LazyTurtle staged source shard was truncated")
+                os.chmod(temporary, 0o644)
+                os.replace(temporary, staged_path)
+                directory = os.open(scope_root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except BaseException:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                raise
+        return staged_path
+
+    def prune_active_source_scope_through(
+        self, namespace: str, layer_index: int
+    ) -> None:
+        """Delete staged shards only after the matching output is durable."""
+
+        root = self._active_source_root
+        if root is None:
+            return
+        if namespace not in {"base", "mtp"}:
+            raise ValueError("LazyTurtle active source namespace is invalid")
+        with self._lock:
+            for entry in os.scandir(root):
+                match = re.fullmatch(rf"{namespace}-(\d{{6}})", entry.name)
+                if match is None or int(match.group(1)) > layer_index:
+                    continue
+                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    raise RuntimeError("LazyTurtle active source scope is unsafe")
+                shutil.rmtree(entry.path)
+
+    def prune_active_source_through(self, layer_index: int) -> None:
+        self.prune_active_source_scope_through("base", layer_index)
 
     @classmethod
     def maybe_create(
@@ -1069,7 +1189,9 @@ class LazyTurtle:
                             grouped_names.setdefault(shard, []).append(raw_name)
 
                     for shard, names in grouped_names.items():
-                        shard_path = os.path.join(self.model_local_path, shard)
+                        shard_path = self._checkpoint_shard_path(
+                            shard, module_path=path
+                        )
                         with safe_open(shard_path, framework="pt", device="cpu") as handler:
                             for raw_name in names:
                                 if raw_name == source_name:
@@ -2372,7 +2494,9 @@ class LazyTurtle:
 
         tensors: Dict[str, torch.Tensor] = {}
         for shard, names in grouped_names.items():
-            shard_path = os.path.join(self.model_local_path, shard)
+            shard_path = self._checkpoint_shard_path(
+                shard, module_path=module_path
+            )
             with safe_open(shard_path, framework="pt", device="cpu") as handler:
                 for rel_name, full_name in names:
                     tensors[rel_name] = handler.get_tensor(full_name)
@@ -2496,7 +2620,9 @@ class LazyTurtle:
                                     target_shape=expected_shape,
                                 )
                             )
-                        shard_path = os.path.join(self.model_local_path, shard)
+                        shard_path = self._checkpoint_shard_path(
+                            shard, module_path=module_path
+                        )
                         with safe_open(shard_path, framework="pt", device="cpu") as handler:
                             parts.append(handler.get_tensor(full_name))
 
@@ -2580,7 +2706,9 @@ class LazyTurtle:
                         progress.draw()
 
                 for shard, entries in grouped_names.items():
-                    shard_path = os.path.join(self.model_local_path, shard)
+                    shard_path = self._checkpoint_shard_path(
+                        shard, module_path=module_path
+                    )
                     with safe_open(shard_path, framework="pt", device="cpu") as handler:
                         for kind, rel_name, full_name, expert_index, split_index, split_dim in entries:
                             if progress is not None:
@@ -2865,7 +2993,9 @@ class LazyTurtle:
                                 full_name=full_name,
                                 target_shape=tuple(shell_param.shape),
                             ))
-                        source_path = os.path.join(self.model_local_path, shard)
+                        source_path = self._checkpoint_shard_path(
+                            shard, module_path=module_path
+                        )
                         with safe_open(source_path, framework="pt", device="cpu") as handler:
                             parts.append(handler.get_tensor(full_name))
 
@@ -2926,7 +3056,9 @@ class LazyTurtle:
                         split_dim=split_dim,
                     ))
 
-                source_path = os.path.join(self.model_local_path, shard)
+                source_path = self._checkpoint_shard_path(
+                    shard, module_path=module_path
+                )
                 with safe_open(source_path, framework="pt", device="cpu") as handler:
                     checkpoint_param = handler.get_tensor(full_name)
                 source_param = self._transform_checkpoint_tensor(
@@ -3000,7 +3132,9 @@ class LazyTurtle:
                                 full_name=full_name,
                                 target_shape=tuple(shell_buffer.shape),
                             ))
-                        source_path = os.path.join(self.model_local_path, shard)
+                        source_path = self._checkpoint_shard_path(
+                            shard, module_path=module_path
+                        )
                         with safe_open(source_path, framework="pt", device="cpu") as handler:
                             parts.append(handler.get_tensor(full_name))
 
@@ -3059,7 +3193,9 @@ class LazyTurtle:
                         split_dim=split_dim,
                     ))
 
-                source_path = os.path.join(self.model_local_path, shard)
+                source_path = self._checkpoint_shard_path(
+                    shard, module_path=module_path
+                )
                 with safe_open(source_path, framework="pt", device="cpu") as handler:
                     checkpoint_buffer = handler.get_tensor(full_name)
                 source_buffer = self._transform_checkpoint_tensor(
