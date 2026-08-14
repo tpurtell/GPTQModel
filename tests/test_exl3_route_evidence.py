@@ -9,7 +9,9 @@ import torch
 from torch import nn
 
 from gptqmodel.looper.exllamav3_processor import EXL3Processor
+from gptqmodel.quantization.gptq import GPTQ
 from gptqmodel.utils.exl3_error_ledger import ROUTE_EVIDENCE_SCHEMA
+from gptqmodel.utils.exl3_capture_batch_spool import CAPTURE_BATCH_SPOOL_ENV
 
 
 class _Router(nn.Module):
@@ -115,3 +117,111 @@ def test_failed_subset_forward_removes_router_hook_without_committing_evidence()
 
     assert not layer.mlp.gate._forward_hooks
     assert all("route_evidence" not in task for task in processor.tasks.values())
+
+
+class _TwoExpertRouter(nn.Module):
+    def forward(self, hidden_states):
+        logits = hidden_states[:, :2].float()
+        indices = logits.argmax(dim=-1, keepdim=True)
+        weights = torch.ones_like(indices, dtype=torch.float32)
+        return logits, weights, indices
+
+
+class _TwoExpertLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Module()
+        self.mlp.gate = _TwoExpertRouter()
+
+
+def _recoverable_processor_and_subset():
+    processor = EXL3Processor.__new__(EXL3Processor)
+    family_join = {
+        "source": {"revision": "test"},
+        "route_evidence_contract": ROUTE_EVIDENCE_SCHEMA,
+    }
+    processor.qcfg = SimpleNamespace(
+        meta={"ds4rt_error_ledger": {"family_join": family_join}}
+    )
+    processor._mask_tls = threading.local()
+    processor._hooks_paused_tls = threading.local()
+    processor._batch_tls = threading.local()
+    processor._active_capture_batch_spool = None
+    processor._active_capture_batch_layer = None
+    processor._active_natural_route_capture = None
+    processor._restored_route_accumulators = {}
+    processor._natural_route_evidence_cache = {}
+    processor.tasks = {}
+    subset = {}
+    for expert in range(2):
+        gate = GPTQ(nn.Linear(4, 2, bias=False))
+        up = GPTQ(nn.Linear(4, 2, bias=False))
+        gate.set_hessian_accumulator_device("cpu")
+        up.share_hessian_state_from(gate)
+        for projection, capture in (("gate_proj", gate), ("up_proj", up)):
+            task_name = f"mlp.experts.{expert}.{projection}"
+            processor.tasks[task_name] = {"capture": capture}
+            subset[task_name] = SimpleNamespace(
+                full_name=f"model.layers.7.{task_name}"
+            )
+    return processor, subset
+
+
+def test_capture_batch_resume_rebuilds_shared_hessians_and_route_state(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(CAPTURE_BATCH_SPOOL_ENV, str(tmp_path))
+    processor, subset = _recoverable_processor_and_subset()
+    layer = _TwoExpertLayer()
+    committed = processor.restore_subset_capture_batches(
+        layer_index=7,
+        subset_index=0,
+        subset_total=2,
+        expected_batches=2,
+        subset=subset,
+    )
+    assert committed == frozenset()
+
+    rows = torch.tensor(
+        [[4.0, 1.0, 2.0, 3.0], [1.0, 5.0, 6.0, 7.0], [3.0, 2.0, 8.0, 9.0]]
+    )
+    processor._set_current_batch_index(0)
+    with processor.subset_forward_capture_context(
+        layer_module=layer,
+        subset=subset,
+    ):
+        _logits, _weights, indices = layer.mlp.gate(rows)
+        for expert in range(2):
+            expert_rows = rows[indices[:, 0] == expert]
+            for projection in ("gate_proj", "up_proj"):
+                task_name = f"mlp.experts.{expert}.{projection}"
+                processor.pre_process_fwd_hook(task_name)(
+                    None, (expert_rows,), torch.empty(0)
+                )
+        processor.forward_batch_completed(layer_index=7, batch_index=0)
+    processor._set_current_batch_index(None)
+
+    restored, restored_subset = _recoverable_processor_and_subset()
+    restored_indices = restored.restore_subset_capture_batches(
+        layer_index=7,
+        subset_index=0,
+        subset_total=2,
+        expected_batches=2,
+        subset=restored_subset,
+    )
+    assert restored_indices == frozenset({0})
+    for expert in range(2):
+        expected_rows = rows[indices[:, 0] == expert]
+        gate = restored.tasks[f"mlp.experts.{expert}.gate_proj"]["capture"]
+        up = restored.tasks[f"mlp.experts.{expert}.up_proj"]["capture"]
+        assert gate.nsamples == up.nsamples == expected_rows.shape[0]
+        assert gate._hessian_state is up._hessian_state
+        assert torch.equal(
+            gate.snapshot_hessian(torch.device("cpu")),
+            (expected_rows.T @ expected_rows)
+            * (2.0 / expected_rows.shape[0]),
+        )
+    route_state = restored._restored_route_accumulators[("base", 7)]
+    assert route_state["router_calls"] == 1
+    assert route_state["router_token_count"] == 3
+    assert route_state["expert_counts"].tolist() == [2, 1]

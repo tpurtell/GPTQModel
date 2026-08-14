@@ -824,6 +824,77 @@ def test_deepseek_v4_target_learned_router_uses_same_recovery_policy() -> None:
     } == {10}
 
 
+def test_deepseek_v4_recovery_replays_rank_rows_from_capture_spool() -> None:
+    block = nn.Module()
+    block.mlp = _RecoveryMLP()
+    inner = nn.Module()
+    inner.layers = nn.ModuleList([block])
+    shell = nn.Module()
+    shell.model = inner
+    adapter = object.__new__(DeepSeekV4QModel)
+    nn.Module.__init__(adapter)
+    adapter.model = shell
+    subset = {
+        f"mlp.experts.6.{projection}": SimpleNamespace(
+            full_name=f"model.layers.0.mlp.experts.6.{projection}"
+        )
+        for projection in ("gate_proj", "up_proj")
+    }
+    task_names = tuple(sorted(subset))
+    processor = _recovery_processor(task_names, natural_count=1014)
+    router_input = torch.randn(10, 4)
+    candidate_indices = torch.full((10, 6), 12, dtype=torch.int64)
+    candidate_indices[:, 0] = 6
+    candidate_gaps = torch.arange(60, dtype=torch.float32).reshape(10, 6)
+
+    class _Spool:
+        phase = "gate-up"
+        key = {"expected_batches": 1}
+        committed_indices = frozenset({0})
+
+        @staticmethod
+        def load(batch_index):
+            assert batch_index == 0
+            return {
+                "router_input": router_input,
+                "candidate_indices": candidate_indices,
+                "candidate_score_gaps": candidate_gaps,
+            }, {}
+
+    processor._active_capture_batch_spool = _Spool()
+    calls = []
+    handles = []
+    expert = block.mlp.experts[6]
+    for projection in ("gate_proj", "up_proj"):
+        handles.append(
+            getattr(expert, projection).register_forward_hook(
+                lambda _module, _args, _output, key=projection: calls.append(key)
+            )
+        )
+    try:
+        with adapter.zero_route_recovery_context(
+            looper=SimpleNamespace(_set_processor_hooks_paused=lambda *_args: None),
+            processor=processor,
+            layer_module=block,
+            subset=subset,
+            task_names=task_names,
+        ) as replay_required:
+            assert replay_required is False
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert calls == ["gate_proj", "up_proj"]
+    assert {
+        task["zero_route_recovery_capture"]["candidate_rows_selected"]
+        for task in processor.tasks.values()
+    } == {10}
+    assert {
+        task["zero_route_recovery_capture"]["candidate_rank_histogram"]["7"]
+        for task in processor.tasks.values()
+    } == {10}
+
+
 def test_deepseek_v4_recovery_uses_identity_only_for_rank_shortfall() -> None:
     torch.manual_seed(0xD54)
     block = nn.Module()
@@ -1038,11 +1109,11 @@ def test_deepseek_v4_true_zero_without_near_rows_uses_identity_hessian() -> None
                 columns=columns[projection],
                 nsamples=0,
                 H=None,
-                _device_hessian_partials={},
-                _device_sample_counts={},
-                _hessian_dirty=False,
-                _final_hessian_device_hint=None,
-            ),
+                    _device_hessian_partials={},
+                    _device_sample_counts={},
+                    _hessian_dirty=False,
+                    _final_hessian_device_hint=torch.device("cpu"),
+                ),
         }
     looper = SimpleNamespace(
         _set_processor_hooks_paused=lambda _processor, _value: None

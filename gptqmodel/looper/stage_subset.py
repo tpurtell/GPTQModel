@@ -827,6 +827,18 @@ def _run_single_subset_pass(
         )
         if capture_restored:
             execute_forward = False
+    if execute_forward and not capture_restored:
+        restore_capture_batches = getattr(
+            processor, "restore_subset_capture_batches", None
+        )
+        if callable(restore_capture_batches):
+            restore_capture_batches(
+                layer_index=layer_index,
+                subset_index=subset_index,
+                subset_total=subset_total,
+                expected_batches=batch_count,
+                subset=subset,
+            )
 
     handle = []
     subset_size = len(subset_names)
@@ -1080,31 +1092,32 @@ def _run_single_subset_pass(
                     layer_module=module,
                     subset=subset,
                     task_names=zero_recovery_tasks,
-                ):
-                    looper._run_forward_batches(
-                        module=module,
-                        processor=processor,
-                        current_subset=subset,
-                        ordered_module_names=subset_names,
-                        layer_inputs=layer_inputs,
-                        layer_input_kwargs=layer_input_kwargs,
-                        position_ids=position_ids,
-                        attention_masks=attention_masks,
-                        cur_layer_device=cur_layer_device,
-                        is_lm_head_module=is_lm_head_module,
-                        shared_kv_cache_dict=shared_kv_cache_dict,
-                        layer_index=layer_index,
-                        need_outputs=False,
-                        reuse_kv=reuse_kv,
-                        progress_pb=recovery_pb,
-                        progress_title=recovery_msg,
-                        progress_stage="Zero-route recovery",
-                        progress_rows_per_batch=forward_row_counts,
-                        progress_total_rows=plan.forward_total_rows,
-                        force_serial=True,
-                        preserve_module_devices=preserve_devices,
-                        apply_moe_config=False,
-                    )
+                ) as replay_required:
+                    if replay_required is not False:
+                        looper._run_forward_batches(
+                            module=module,
+                            processor=processor,
+                            current_subset=subset,
+                            ordered_module_names=subset_names,
+                            layer_inputs=layer_inputs,
+                            layer_input_kwargs=layer_input_kwargs,
+                            position_ids=position_ids,
+                            attention_masks=attention_masks,
+                            cur_layer_device=cur_layer_device,
+                            is_lm_head_module=is_lm_head_module,
+                            shared_kv_cache_dict=shared_kv_cache_dict,
+                            layer_index=layer_index,
+                            need_outputs=False,
+                            reuse_kv=reuse_kv,
+                            progress_pb=recovery_pb,
+                            progress_title=recovery_msg,
+                            progress_stage="Zero-route recovery",
+                            progress_rows_per_batch=forward_row_counts,
+                            progress_total_rows=plan.forward_total_rows,
+                            force_serial=True,
+                            preserve_module_devices=preserve_devices,
+                            apply_moe_config=False,
+                        )
                 finish_zero_recovery = getattr(
                     processor, "finish_subset_zero_route_recovery", None
                 )

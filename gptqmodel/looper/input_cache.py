@@ -262,7 +262,11 @@ class DiskBackedLayerOutputSequence(Sequence[List[torch.Tensor]]):
         shard = self._shards[shard_index]
         path = self.root / shard["path"]
         with safe_open(path, framework="pt", device="cpu") as source:
-            tensor = source.get_tensor(f"batch_{index:09d}")
+            tensor = source.get_tensor(
+                "hidden"
+                if self._shard_batches == 1
+                else f"batch_{index:09d}"
+            )
         expected_shape = tuple(shard["shapes"][index - int(shard["start"])])
         if tuple(tensor.shape) != expected_shape:
             raise ValueError("disk-backed layer output tensor shape differs")
@@ -438,10 +442,14 @@ class DiskBackedLayerOutputWriter:
         ) as output:
             temporary = Path(output.name)
         try:
-            ordered = {
-                f"batch_{index:09d}": pending[index]
-                for index in range(start, start + count)
-            }
+            ordered = (
+                {"hidden": pending[start]}
+                if self.shard_batches == 1
+                else {
+                    f"batch_{index:09d}": pending[index]
+                    for index in range(start, start + count)
+                }
+            )
             save_safetensors_file(ordered, temporary)
             with temporary.open("rb") as source:
                 os.fsync(source.fileno())

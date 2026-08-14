@@ -300,6 +300,13 @@ class ForwardExecutor:
         committed_indices = frozenset(
             getattr(outputs, "committed_indices", frozenset())
         )
+        capture_committed = getattr(
+            processor, "forward_committed_batch_indices", None
+        )
+        if callable(capture_committed):
+            committed_indices = committed_indices.union(
+                capture_committed(layer_index=layer_index)
+            )
 
         for batch_idx in range(total_batches):
             if batch_idx in committed_indices:
@@ -423,6 +430,10 @@ class ForwardExecutor:
                 if module_output is not None:
                     del module_output
 
+                batch_complete = getattr(processor, "forward_batch_completed", None)
+                if callable(batch_complete):
+                    batch_complete(layer_index=layer_index, batch_index=batch_idx)
+
                 rows_for_batch = batch_row_counts[batch_idx] if batch_idx < len(batch_row_counts) else 0
                 if rows_for_batch <= 0:
                     rows_for_batch = self.looper._batch_row_count(cached_layer_inputs) if layer_inputs and batch_idx < len(layer_inputs) else 1
@@ -487,6 +498,13 @@ class ForwardExecutor:
         committed_indices = frozenset(
             getattr(output_collection, "committed_indices", frozenset())
         )
+        capture_committed = getattr(
+            processor, "forward_committed_batch_indices", None
+        )
+        if callable(capture_committed):
+            committed_indices = committed_indices.union(
+                capture_committed(layer_index=layer_index)
+            )
 
         replica_pb: "ProgressBar" | None = None
         replica_title = ""
@@ -693,6 +711,15 @@ class ForwardExecutor:
                         del module_output
                     if (reuse_kv or write_shared_kv_cache) and kv_next is not None and shared_kv_cache_dict.get(layer_index) is None:
                         shared_kv_cache_dict[layer_index] = nested_move_to(kv_next, device=cur_layer_device)
+
+                    batch_complete = getattr(
+                        processor, "forward_batch_completed", None
+                    )
+                    if callable(batch_complete):
+                        batch_complete(
+                            layer_index=layer_index,
+                            batch_index=batch_idx,
+                        )
 
                     rows_for_batch = batch_row_counts[batch_idx] if batch_idx < len(batch_row_counts) else 0
                     if rows_for_batch <= 0:

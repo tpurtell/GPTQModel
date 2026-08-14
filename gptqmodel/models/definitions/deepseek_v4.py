@@ -2574,14 +2574,24 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                                 "DeepSeek V4 identity recovery found a nonempty capture"
                             )
                         columns = int(columns)
+                        target_device = getattr(
+                            capture, "hessian_accumulator_device", None
+                        ) or getattr(
+                            capture, "_final_hessian_device_hint", None
+                        )
+                        if target_device is None:
+                            raise RuntimeError(
+                                "DeepSeek V4 identity recovery has no Hessian owner"
+                            )
+                        target_device = torch.device(target_device)
                         capture.H = torch.eye(
                             columns,
                             dtype=torch.float32,
-                            device="cpu",
+                            device=target_device,
                         ).mul_(2.0)
                         capture.nsamples = ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
                         capture._hessian_dirty = False
-                        capture._final_hessian_device_hint = torch.device("cpu")
+                        capture._final_hessian_device_hint = target_device
                     gap_summary = None
                     selected_candidate_count = 0
                     router_augmented_count = 0
@@ -2604,6 +2614,14 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     expert = experts[expert_index]
                     projections = targets[expert_index]
                     if expert_input is not None:
+                        expert_parameter = next(expert.parameters(), None)
+                        if (
+                            expert_parameter is not None
+                            and expert_input.device != expert_parameter.device
+                        ):
+                            expert_input = expert_input.to(
+                                device=expert_parameter.device
+                            )
                         if "down_proj" in projections:
                             gate = expert.gate_proj(expert_input)
                             up = expert.up_proj(expert_input)
@@ -2753,6 +2771,85 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     task["zero_route_recovery_capture"] = copy.deepcopy(summary)
                 if not pure_identity_recovery and expert_input is not None:
                     del expert_input
+
+        capture_spool = getattr(processor, "_active_capture_batch_spool", None)
+        spool_recovery = capture_spool is not None
+        if spool_recovery:
+            expected_phase = (
+                "down"
+                if {projection for values in targets.values() for projection in values}
+                == {"down_proj"}
+                else "gate-up"
+            )
+            if capture_spool.phase != expected_phase:
+                raise RuntimeError(
+                    "DeepSeek V4 recovery spool belongs to another projection phase"
+                )
+            expected_batches = int(capture_spool.key["expected_batches"])
+            if capture_spool.committed_indices != frozenset(
+                range(expected_batches)
+            ):
+                raise RuntimeError(
+                    "DeepSeek V4 recovery requires every natural capture batch"
+                )
+            candidate_width = (
+                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+                - ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN
+                + 1
+            )
+            for batch_index in range(expected_batches):
+                tensors, _metadata = capture_spool.load(batch_index)
+                expert_input = tensors.get("router_input")
+                candidate_indices = tensors.get("candidate_indices")
+                candidate_score_gaps = tensors.get("candidate_score_gaps")
+                if (
+                    not isinstance(expert_input, torch.Tensor)
+                    or not isinstance(candidate_indices, torch.Tensor)
+                    or not isinstance(candidate_score_gaps, torch.Tensor)
+                    or expert_input.ndim != 2
+                    or candidate_indices.shape
+                    != (expert_input.shape[0], candidate_width)
+                    or candidate_score_gaps.shape != candidate_indices.shape
+                ):
+                    raise RuntimeError(
+                        "DeepSeek V4 recovery batch lacks rank-7--12 evidence"
+                    )
+                candidate_indices = candidate_indices.to(torch.int64)
+                for expert_index in sorted(targets):
+                    matches = candidate_indices.eq(expert_index)
+                    observed_by_expert[expert_index] += int(matches.sum().item())
+                    for rank_offset in range(candidate_width):
+                        rank = ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN + rank_offset
+                        remaining = (
+                            needed_by_expert[expert_index]
+                            - retained_by_rank[expert_index][rank]
+                        )
+                        if remaining <= 0:
+                            continue
+                        row_indices = torch.nonzero(
+                            matches[:, rank_offset], as_tuple=False
+                        )[:, 0][:remaining]
+                        if row_indices.numel() == 0:
+                            continue
+                        candidate_rows[expert_index][rank].append(
+                            expert_input.index_select(0, row_indices).clone()
+                        )
+                        candidate_gaps[expert_index][rank].append(
+                            candidate_score_gaps[
+                                row_indices, rank_offset
+                            ].float().clone()
+                        )
+                        retained_by_rank[expert_index][rank] += int(
+                            row_indices.numel()
+                        )
+                del tensors
+
+            try:
+                yield False
+                finish_router_candidates()
+            finally:
+                pass
+            return
 
         @contextmanager
         def pause_normal_mlp_capture():

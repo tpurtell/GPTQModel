@@ -87,6 +87,10 @@ from ..utils.exl3_capture_frontier import (
     EXL3CaptureFrontierStore,
     EXL3CaptureRecord,
 )
+from ..utils.exl3_capture_batch_spool import (
+    CAPTURE_BATCH_SPOOL_ENV,
+    EXL3CaptureBatchSpool,
+)
 from ..utils.exl3_projection_checkpoint import (
     EXL3ProjectionCheckpointStore,
     build_projection_request,
@@ -108,6 +112,12 @@ from ..utils.logger import setup_logger
 from ..utils.model import recurse_setattr
 from ..utils.module_locks import parent_module_lock
 from ..utils.offload import offload_to_disk
+
+HOST_RSS_LIMIT_ENV = "GPTQMODEL_EXL3_HOST_RSS_LIMIT_BYTES"
+CUDA_ALLOCATION_LIMIT_ENV = "GPTQMODEL_EXL3_CUDA_ALLOCATION_LIMIT_BYTES"
+MEMORY_TELEMETRY_INTERVAL_ENV = (
+    "GPTQMODEL_EXL3_MEMORY_TELEMETRY_INTERVAL_BATCHES"
+)
 
 log = setup_logger()
 
@@ -164,6 +174,9 @@ class _EXL3NaturalRouteCapture:
         subset: Dict[str, NamedModule],
     ) -> None:
         self.processor = processor
+        self.spool = getattr(processor, "_active_capture_batch_spool", None)
+        self.collect_route_evidence = True
+        self._batch_payloads: dict[int, dict[str, Any]] = {}
         self.targets: dict[str, dict[str, Any]] = {}
         for task_name, named_module in subset.items():
             full_name = getattr(named_module, "full_name", None)
@@ -182,6 +195,7 @@ class _EXL3NaturalRouteCapture:
             raise ValueError(
                 "EXL3 natural-route capture requires one routed block per subset"
             )
+        self.family_id = next(iter(family_ids))
 
         mlp = getattr(layer_module, "mlp", None)
         if mlp is None:
@@ -201,8 +215,28 @@ class _EXL3NaturalRouteCapture:
         self._gate_squared_mass: torch.Tensor | None = None
         self._router_weight_dtypes: set[str] = set()
         self._mask_modes: set[str] = set()
+        restored = getattr(processor, "_restored_route_accumulators", {}).pop(
+            self.family_id, None
+        )
+        if restored is not None:
+            self._expert_counts = restored["expert_counts"]
+            self._gate_sums = restored["gate_sums"]
+            self._gate_squared_mass = restored["gate_squared_mass"]
+            self._router_calls = restored["router_calls"]
+            self._router_token_count = restored["router_token_count"]
+            self._router_selected_route_count = restored[
+                "router_selected_route_count"
+            ]
+            self._router_top_k = restored["router_top_k"]
+            self._router_weight_dtypes = set(
+                restored["router_weight_dtypes"]
+            )
+            self._mask_modes = set(restored["mask_modes"])
 
     def __enter__(self) -> "_EXL3NaturalRouteCapture":
+        if getattr(self.processor, "_active_natural_route_capture", None) is not None:
+            raise RuntimeError("EXL3 batch capture context is already active")
+        self.processor._active_natural_route_capture = self
         self._handle = self.router.register_forward_hook(self._capture)
         return self
 
@@ -211,17 +245,25 @@ class _EXL3NaturalRouteCapture:
         if self._handle is not None:
             self._handle.remove()
             self._handle = None
-        if exc_type is None:
+        self.processor._active_natural_route_capture = None
+        if exc_type is None and self._batch_payloads:
+            raise RuntimeError("EXL3 capture ended with uncommitted batches")
+        if exc_type is None and self.collect_route_evidence:
             self.processor._commit_natural_route_capture(self)
         return False
 
-    def _capture(self, _module, _inputs, output) -> None:
+    def _capture(self, _module, inputs, output) -> None:
         paused_tls = getattr(self.processor, "_hooks_paused_tls", None)
         if paused_tls is not None and getattr(paused_tls, "value", False):
             return
         if not isinstance(output, (tuple, list)) or len(output) != 3:
             raise RuntimeError("EXL3 natural-route capture requires router triplets")
         logits, weights, indices = output
+        router_input = (
+            inputs[0]
+            if isinstance(inputs, (tuple, list)) and inputs
+            else None
+        )
         if (
             not isinstance(logits, torch.Tensor)
             or not isinstance(weights, torch.Tensor)
@@ -230,11 +272,13 @@ class _EXL3NaturalRouteCapture:
             or weights.ndim != 2
             or logits.ndim != 2
             or logits.shape[0] != weights.shape[0]
+            or not isinstance(router_input, torch.Tensor)
         ):
             raise RuntimeError(
                 "EXL3 natural-route capture received malformed router output"
             )
 
+        router_input = router_input.reshape(-1, router_input.shape[-1])
         keep_mask = getattr(getattr(self.processor, "_mask_tls", None), "value", None)
         if keep_mask is None:
             mask_mode = "absent"
@@ -249,6 +293,67 @@ class _EXL3NaturalRouteCapture:
             mask_mode = "all-valid" if bool(flat_keep.all().item()) else "filtered"
             weights = weights[flat_keep]
             indices = indices[flat_keep]
+            logits = logits[flat_keep]
+            router_input = router_input[flat_keep]
+
+        if self.spool is not None:
+            batch_index = self.processor.current_batch_index()
+            if batch_index is None:
+                raise RuntimeError(
+                    "EXL3 router capture has no calibration batch index"
+                )
+            correction = getattr(self.router, "e_score_correction_bias", None)
+            score_fn = getattr(self.router, "score_fn", None)
+            if (
+                isinstance(correction, torch.Tensor)
+                and callable(score_fn)
+                and logits.shape[-1] >= ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+            ):
+                choice_scores = score_fn(logits.float()) + correction.float()
+                ranked_scores, ranked_indices = torch.topk(
+                    choice_scores,
+                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+                    dim=-1,
+                    largest=True,
+                    sorted=True,
+                )
+                candidate_indices = ranked_indices[
+                    :, ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN - 1 :
+                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+                ]
+                candidate_score_gaps = (
+                    ranked_scores[:, 5:6]
+                    - ranked_scores[
+                        :, ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN - 1 :
+                        ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+                    ]
+                ).float()
+                del choice_scores, ranked_scores, ranked_indices
+            else:
+                candidate_indices = torch.empty(
+                    (indices.shape[0], 0),
+                    dtype=torch.int64,
+                    device=indices.device,
+                )
+                candidate_score_gaps = torch.empty(
+                    (indices.shape[0], 0),
+                    dtype=torch.float32,
+                    device=indices.device,
+                )
+            with self._lock:
+                if batch_index in self._batch_payloads:
+                    raise RuntimeError("EXL3 router ran twice for one capture batch")
+                self._batch_payloads[batch_index] = {
+                    "router_input": router_input.detach(),
+                    "top_weights": weights.detach(),
+                    "top_indices": indices.detach(),
+                    "candidate_indices": candidate_indices.detach(),
+                    "candidate_score_gaps": candidate_score_gaps.detach(),
+                    "num_experts": int(logits.shape[-1]),
+                    "expert_rows": {},
+                    "verified_gate_experts": set(),
+                    "mask_mode": mask_mode,
+                }
 
         num_experts = int(logits.shape[-1])
         top_k = int(indices.shape[-1])
@@ -307,6 +412,90 @@ class _EXL3NaturalRouteCapture:
             self._router_selected_route_count += int(flat_indices.numel())
             self._router_weight_dtypes.add(str(weights.dtype))
             self._mask_modes.add(mask_mode)
+
+    def capture_expert_input(self, task_name: str, value: torch.Tensor) -> None:
+        """Prove gate inputs or retain exact down inputs for the active batch."""
+
+        if self.spool is None:
+            return
+        identity = self.targets.get(task_name)
+        if identity is None:
+            return
+        batch_index = self.processor.current_batch_index()
+        if batch_index is None:
+            raise RuntimeError("EXL3 expert capture has no calibration batch index")
+        with self._lock:
+            payload = self._batch_payloads.get(batch_index)
+            if payload is None:
+                raise RuntimeError("EXL3 expert capture preceded its router record")
+            rows = value.detach().reshape(-1, value.shape[-1])
+            expert = identity["expert"]
+            if self.spool.phase == "gate-up":
+                expected_indices = torch.nonzero(
+                    payload["top_indices"].eq(expert), as_tuple=False
+                )[:, 0]
+                expected = payload["router_input"].index_select(
+                    0, expected_indices.to(payload["router_input"].device)
+                )
+                if (
+                    rows.shape != expected.shape
+                    or not torch.equal(rows, expected.to(device=rows.device))
+                ):
+                    raise RuntimeError(
+                        "EXL3 pre-fanout recovery rows differ from the gate hook"
+                    )
+                if identity["projection"] == "w1":
+                    payload["verified_gate_experts"].add(expert)
+            elif identity["projection"] == "w2":
+                previous = payload["expert_rows"].setdefault(expert, rows)
+                if previous is not rows:
+                    raise RuntimeError("EXL3 down expert ran twice in one batch")
+
+    def commit_batch(self, batch_index: int) -> None:
+        """Durably publish one exact additive recovery input record."""
+
+        if self.spool is None:
+            return
+        with self._lock:
+            payload = self._batch_payloads.pop(batch_index, None)
+        if payload is None:
+            if batch_index in self.spool.committed_indices:
+                return
+            raise RuntimeError("EXL3 completed a batch without capture payload")
+        selected_experts = set(
+            int(value)
+            for value in payload["top_indices"].detach().unique().tolist()
+        )
+        tensors = {
+            "router_input": payload["router_input"],
+            "top_weights": payload["top_weights"],
+            "top_indices": payload["top_indices"],
+            "candidate_indices": payload["candidate_indices"],
+            "candidate_score_gaps": payload["candidate_score_gaps"],
+        }
+        if self.spool.phase == "gate-up":
+            if not selected_experts <= payload["verified_gate_experts"]:
+                raise RuntimeError("EXL3 did not verify every selected gate input")
+        else:
+            if selected_experts != set(payload["expert_rows"]):
+                raise RuntimeError("EXL3 did not capture every selected down input")
+            tensors.update(
+                {
+                    f"expert_{expert:06d}": rows
+                    for expert, rows in payload["expert_rows"].items()
+                }
+            )
+        self.spool.commit(
+            batch_index,
+            tensors=tensors,
+            metadata={
+                "batch_index": batch_index,
+                "mask_mode": payload["mask_mode"],
+                "num_experts": payload["num_experts"],
+                "selected_experts": sorted(selected_experts),
+                "pre_fanout_gate_input_verified": self.spool.phase == "gate-up",
+            },
+        )
 
     def evidence_by_expert(self) -> dict[int, dict[str, Any]]:
         """Finalize the bounded route metrics needed by expert-family tiering."""
@@ -457,6 +646,12 @@ class EXL3Processor(LoopProcessor):
         self._pending_hessian_family_aliases: dict[
             tuple[str, int, int], list[tuple[str, GPTQ]]
         ] = {}
+        self._active_capture_batch_spool: EXL3CaptureBatchSpool | None = None
+        self._active_capture_batch_layer: int | None = None
+        self._active_natural_route_capture = None
+        self._restored_route_accumulators: dict[
+            tuple[str, int], dict[str, Any]
+        ] = {}
         self.error_journal_path = os.getenv(JOURNAL_ENV) or str(
             Path(self.log_tmp_log_file_name).with_suffix(".exl3-error-ledger.jsonl")
         )
@@ -536,6 +731,246 @@ class EXL3Processor(LoopProcessor):
         if store is not None and store.root != root:
             raise ValueError("EXL3 capture-frontier root changed during the run")
         return store
+
+    @staticmethod
+    def _subset_capture_phase(
+        subset: Dict[str, NamedModule],
+    ) -> tuple[str, dict[str, dict[str, Any]]]:
+        identities = {
+            task_name: identity
+            for task_name, named_module in subset.items()
+            if isinstance(getattr(named_module, "full_name", None), str)
+            and (identity := routed_expert_identity(named_module.full_name))
+            is not None
+        }
+        projections = {identity["projection"] for identity in identities.values()}
+        if projections and projections <= {"w1", "w3"}:
+            return "gate-up", identities
+        if projections == {"w2"}:
+            return "down", identities
+        raise RuntimeError("EXL3 capture subset is not one routed projection phase")
+
+    @staticmethod
+    def _route_batch_statistics(
+        *,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        num_experts: int,
+        mask_mode: str,
+    ) -> dict[str, Any]:
+        flat_indices = indices.detach().reshape(-1).to(device="cpu", dtype=torch.int64)
+        flat_weights = weights.detach().reshape(-1).to(device="cpu", dtype=torch.float64)
+        return {
+            "expert_counts": torch.bincount(
+                flat_indices, minlength=num_experts
+            ).to(torch.int64),
+            "gate_sums": torch.bincount(
+                flat_indices, weights=flat_weights, minlength=num_experts
+            ).to(torch.float64),
+            "gate_squared_mass": torch.bincount(
+                flat_indices,
+                weights=flat_weights.square(),
+                minlength=num_experts,
+            ).to(torch.float64),
+            "router_calls": 1,
+            "router_token_count": int(indices.shape[0]),
+            "router_selected_route_count": int(flat_indices.numel()),
+            "router_top_k": int(indices.shape[-1]),
+            "router_weight_dtypes": {str(weights.dtype)},
+            "mask_modes": {str(mask_mode)},
+        }
+
+    @staticmethod
+    def _merge_route_statistics(
+        target: dict[str, Any] | None,
+        addition: dict[str, Any],
+    ) -> dict[str, Any]:
+        if target is None:
+            return addition
+        for key in ("expert_counts", "gate_sums", "gate_squared_mass"):
+            target[key].add_(addition[key])
+        for key in (
+            "router_calls",
+            "router_token_count",
+            "router_selected_route_count",
+        ):
+            target[key] += addition[key]
+        if target["router_top_k"] != addition["router_top_k"]:
+            raise RuntimeError("restored router top-k changed between batches")
+        target["router_weight_dtypes"].update(addition["router_weight_dtypes"])
+        target["mask_modes"].update(addition["mask_modes"])
+        return target
+
+    def restore_subset_capture_batches(
+        self,
+        *,
+        layer_index: int,
+        subset_index: int,
+        subset_total: int,
+        expected_batches: int,
+        subset: Dict[str, NamedModule],
+    ) -> frozenset[int]:
+        """Rebuild live Hessians from durable batches before missing forwards."""
+
+        configured_root = os.getenv(CAPTURE_BATCH_SPOOL_ENV)
+        if not configured_root:
+            self._active_capture_batch_spool = None
+            self._active_capture_batch_layer = None
+            return frozenset()
+        phase, identities = self._subset_capture_phase(subset)
+        family_ids = {
+            (identity["block_namespace"], identity["logical_layer"])
+            for identity in identities.values()
+        }
+        if len(family_ids) != 1:
+            raise RuntimeError("capture batch subset crosses routed blocks")
+        ownership: dict[str, str] = {}
+        for task_name, identity in identities.items():
+            task = self.tasks.get(task_name)
+            capture = task.get("capture") if isinstance(task, dict) else None
+            owner = getattr(capture, "hessian_accumulator_device", None)
+            if owner is None:
+                raise RuntimeError("capture batch task has no Hessian owner")
+            previous = ownership.setdefault(str(identity["expert"]), str(owner))
+            if previous != str(owner):
+                raise RuntimeError("expert Hessian ownership differs by projection")
+        provenance = self._ledger_provenance()
+        spool = EXL3CaptureBatchSpool(
+            configured_root,
+            layer_index=layer_index,
+            subset_index=subset_index,
+            subset_total=subset_total,
+            expected_batches=expected_batches,
+            phase=phase,
+            module_names=sorted(
+                named.full_name for named in subset.values()
+            ),
+            provenance={
+                "family_join": (
+                    provenance.get("family_join")
+                    if isinstance(provenance, dict)
+                    else None
+                )
+            },
+            ownership=ownership,
+        )
+        self._active_capture_batch_spool = spool
+        self._active_capture_batch_layer = layer_index
+
+        task_by_expert: dict[int, tuple[str, GPTQ]] = {}
+        for task_name, identity in identities.items():
+            if (
+                phase == "gate-up" and identity["projection"] != "w1"
+            ) or (phase == "down" and identity["projection"] != "w2"):
+                continue
+            task = self.tasks[task_name]
+            task_by_expert[identity["expert"]] = (task_name, task["capture"])
+
+        restored_stats = None
+        for batch_index in sorted(spool.committed_indices):
+            tensors, metadata = spool.load(batch_index)
+            if phase == "gate-up":
+                router_input = tensors["router_input"]
+                indices = tensors["top_indices"].to(torch.int64)
+                weights = tensors["top_weights"]
+                num_experts = metadata.get("num_experts")
+                if (
+                    isinstance(num_experts, bool)
+                    or not isinstance(num_experts, int)
+                    or num_experts <= 0
+                ):
+                    raise RuntimeError(
+                        "restored EXL3 capture batch lacks router geometry"
+                    )
+                restored_stats = self._merge_route_statistics(
+                    restored_stats,
+                    self._route_batch_statistics(
+                        weights=weights,
+                        indices=indices,
+                        num_experts=num_experts,
+                        mask_mode=metadata.get("mask_mode", "absent"),
+                    ),
+                )
+                for expert, (_task_name, capture) in task_by_expert.items():
+                    row_indices = torch.nonzero(
+                        indices.eq(expert), as_tuple=False
+                    )[:, 0]
+                    if row_indices.numel():
+                        capture.add_batch(
+                            router_input.index_select(0, row_indices),
+                            torch.empty(0),
+                            batch_index=batch_index,
+                        )
+            else:
+                for expert, (_task_name, capture) in task_by_expert.items():
+                    key = f"expert_{expert:06d}"
+                    rows = tensors.get(key)
+                    if rows is not None:
+                        capture.add_batch(
+                            rows,
+                            torch.empty(0),
+                            batch_index=batch_index,
+                        )
+            del tensors
+        if restored_stats is not None:
+            self._restored_route_accumulators[next(iter(family_ids))] = (
+                restored_stats
+            )
+        return spool.committed_indices
+
+    def forward_committed_batch_indices(
+        self, *, layer_index: int
+    ) -> frozenset[int]:
+        spool = getattr(self, "_active_capture_batch_spool", None)
+        if spool is None or getattr(
+            self, "_active_capture_batch_layer", None
+        ) != layer_index:
+            return frozenset()
+        return spool.committed_indices
+
+    def forward_batch_completed(self, *, layer_index: int, batch_index: int) -> None:
+        capture = getattr(self, "_active_natural_route_capture", None)
+        if capture is not None and getattr(
+            self, "_active_capture_batch_layer", None
+        ) == layer_index:
+            capture.commit_batch(batch_index)
+            interval = int(os.getenv(MEMORY_TELEMETRY_INTERVAL_ENV, "0"))
+            spool = getattr(self, "_active_capture_batch_spool", None)
+            complete = (
+                spool is not None
+                and len(spool.committed_indices)
+                == int(spool.key["expected_batches"])
+            )
+            if interval > 0 and (batch_index % interval == 0 or complete):
+                self._enforce_capture_memory_limits(
+                    context=f"layer-{layer_index}-batch-{batch_index}"
+                )
+
+    def _enforce_capture_memory_limits(self, *, context: str) -> dict[str, Any]:
+        """Stop after a durable batch if host or device capture memory is unsafe."""
+
+        try:
+            host_limit = int(os.getenv(HOST_RSS_LIMIT_ENV, "0"))
+            cuda_limit = int(os.getenv(CUDA_ALLOCATION_LIMIT_ENV, "0"))
+        except ValueError as error:
+            raise RuntimeError("EXL3 memory-safety environment is invalid") from error
+        summary = self.log_capture_memory_summary(context)
+        rss = int(summary.get("process_rss_bytes", 0))
+        if host_limit > 0 and rss > host_limit:
+            raise RuntimeError(
+                f"EXL3 host RSS safety limit exceeded after {context}: "
+                f"actual={rss} limit={host_limit}"
+            )
+        if cuda_limit > 0:
+            for device, values in summary.get("cuda_devices", {}).items():
+                allocated = int(values.get("allocated_bytes", 0))
+                if allocated > cuda_limit:
+                    raise RuntimeError(
+                        f"EXL3 CUDA allocation safety limit exceeded after "
+                        f"{context}: device={device} actual={allocated} "
+                        f"limit={cuda_limit}"
+                    )
+        return summary
 
     @staticmethod
     def _subset_task_names_by_full_name(
@@ -697,6 +1132,11 @@ class EXL3Processor(LoopProcessor):
                 full_name
             ].snapshot_hessian(target_device=torch.device("cpu")),
         )
+        batch_spool = getattr(self, "_active_capture_batch_spool", None)
+        if batch_spool is not None:
+            batch_spool.discard()
+            self._active_capture_batch_spool = None
+            self._active_capture_batch_layer = None
         after = self.capture_memory_summary()
         log.info(
             "EXL3 capture frontier committed streaming: layer=%s subset=%s/%s "
@@ -1064,7 +1504,15 @@ class EXL3Processor(LoopProcessor):
         target_experts = {identity["expert"] for identity in targets.values()}
         if cached is not None and target_experts.issubset(cached):
             self._attach_natural_route_evidence(targets, cached)
-            return nullcontext()
+            if getattr(self, "_active_capture_batch_spool", None) is None:
+                return nullcontext()
+            capture = _EXL3NaturalRouteCapture(
+                self,
+                layer_module=layer_module,
+                subset=subset,
+            )
+            capture.collect_route_evidence = False
+            return capture
         return _EXL3NaturalRouteCapture(
             self,
             layer_module=layer_module,
@@ -1606,6 +2054,11 @@ class EXL3Processor(LoopProcessor):
 
             capture = self.tasks[name]["capture"]
             batch_idx = self.current_batch_index()
+            active_batch_capture = getattr(
+                self, "_active_natural_route_capture", None
+            )
+            if active_batch_capture is not None:
+                active_batch_capture.capture_expert_input(name, inp[0].data)
             capture.add_batch(inp[0].data, out.data, batch_index=batch_idx)
             del inp, out
 
