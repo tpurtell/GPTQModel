@@ -10,6 +10,7 @@ from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from numbers import Integral
+from pathlib import Path
 from types import MethodType
 from typing import Any, Callable, Iterable, Sequence
 

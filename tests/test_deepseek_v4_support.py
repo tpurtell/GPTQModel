@@ -98,6 +98,18 @@ def test_deepseek_v4_preserves_integrated_mtp_namespace() -> None:
     assert DeepSeekV4QModel.out_of_model_tensors == {"prefixes": ["mtp"]}
 
 
+def test_deepseek_v4_configures_base_replay_store_with_resolved_path(
+    tmp_path,
+) -> None:
+    harness = object.__new__(DeepSeekV4QModel)
+    root = tmp_path / "nested" / ".." / "replay"
+
+    harness.configure_base_replay_store(root, provenance={"plan_sha256": "abc"})
+
+    assert harness._base_replay_store_root == str((tmp_path / "replay").resolve())
+    assert harness._base_replay_store_provenance == {"plan_sha256": "abc"}
+
+
 def test_deepseek_v4_target_input_capture_keeps_first_layer_lazy() -> None:
     first = nn.Linear(2, 2, device="meta")
     second = nn.Linear(2, 2, device="meta")
