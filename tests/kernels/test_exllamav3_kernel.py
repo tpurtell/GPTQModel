@@ -64,6 +64,40 @@ def test_exllamav3_fallback_reports_unweighted_mse_without_fake_hessian_error():
     assert metrics["hessian_metric_status"] == "not_applicable_fallback"
 
 
+def test_exllamav3_projection_seed_does_not_mutate_global_cuda_rng():
+    quantize_exl3 = _get_quantize_exl3()
+    device = torch.device("cuda:0")
+    global_generator = torch.Generator(device=device).manual_seed(9917)
+    torch.cuda.set_rng_state(global_generator.get_state(), device=device)
+    state_before = torch.cuda.get_rng_state(device=device)
+    input_generator = torch.Generator(device=device).manual_seed(23)
+    weight = torch.randn(
+        256,
+        128,
+        device=device,
+        dtype=torch.float32,
+        generator=input_generator,
+    )
+    hessian = torch.eye(256, device=device, dtype=torch.float32)
+    quant_args = {
+        "K": 2,
+        "devices": [device],
+        "apply_out_scales": True,
+        "sigma_reg": 0.025,
+        "seed": 787,
+        "mcg": True,
+    }
+
+    quantize_exl3(
+        weight=weight,
+        H_data={"H": hessian, "count": 256, "finalized": False},
+        quant_args=quant_args,
+        return_weight_q=False,
+    )
+
+    assert torch.equal(torch.cuda.get_rng_state(device=device), state_before)
+
+
 def _build_kernels(
     bits: int, codebook: str
 ) -> tuple[torch.Tensor, ExllamaV3TorchLinear, ExllamaV3Linear]:

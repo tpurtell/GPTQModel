@@ -413,6 +413,8 @@ def validate_exl3_hessian_metrics(
 
     diagonal_addend = metrics.get("hessian_regularization_diagonal_addend")
     symmetry_correction = metrics.get("hessian_symmetry_correction_max_abs")
+    selected_global_scale = metrics.get("selected_global_scale")
+    scale_search_mse = metrics.get("scale_search_mse")
     if (
         metrics.get("quantizer_path") != "hessian_ldlq"
         or metrics.get("hessian_metric_status") != "ok"
@@ -434,6 +436,14 @@ def validate_exl3_hessian_metrics(
         or not isinstance(symmetry_correction, (int, float))
         or not math.isfinite(symmetry_correction)
         or symmetry_correction < 0.0
+        or isinstance(selected_global_scale, bool)
+        or not isinstance(selected_global_scale, (int, float))
+        or not math.isfinite(selected_global_scale)
+        or selected_global_scale <= 0.0
+        or isinstance(scale_search_mse, bool)
+        or not isinstance(scale_search_mse, (int, float))
+        or not math.isfinite(scale_search_mse)
+        or scale_search_mse < 0.0
     ):
         raise RuntimeError(
             "EXL3 quantizer returned an invalid Hessian numerical contract"

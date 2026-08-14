@@ -327,6 +327,8 @@ def test_hessian_metrics_bind_fp64_congruence_contract() -> None:
         "hessian_regularization_diagonal_addend": 0.000180678,
         "hessian_symmetry_restoration": EXL3_HESSIAN_SYMMETRY_CONTRACT,
         "hessian_symmetry_correction_max_abs": 1e-12,
+        "selected_global_scale": 0.9926824431197947,
+        "scale_search_mse": 0.10599474608898163,
     }
     validate_exl3_hessian_metrics(
         metrics,
@@ -335,6 +337,32 @@ def test_hessian_metrics_bind_fp64_congruence_contract() -> None:
     )
 
     metrics["hessian_numerical_contract"] = "legacy-fp32"
+    with pytest.raises(RuntimeError, match="numerical contract"):
+        validate_exl3_hessian_metrics(
+            metrics,
+            sample_count=2821,
+            sigma_reg=0.025,
+        )
+
+
+@pytest.mark.parametrize("invalid_mse", [-1.0, float("nan"), float("inf")])
+def test_hessian_metrics_reject_invalid_scale_search_mse(invalid_mse: float) -> None:
+    metrics = {
+        "quantizer_path": "hessian_ldlq",
+        "hessian_metric_status": "ok",
+        "hessian_sample_count": 2821,
+        "hessian_regularization_sigma": 0.025,
+        "hessian_numerical_contract": EXL3_HESSIAN_NUMERICAL_CONTRACT,
+        "hessian_transform_compute_dtype": "torch.float64",
+        "hessian_storage_dtype": "torch.float32",
+        "hessian_regularization_placement": "before-fp64-congruence",
+        "hessian_regularization_diagonal_addend": 0.000180678,
+        "hessian_symmetry_restoration": EXL3_HESSIAN_SYMMETRY_CONTRACT,
+        "hessian_symmetry_correction_max_abs": 1e-12,
+        "selected_global_scale": 0.9926824431197947,
+        "scale_search_mse": invalid_mse,
+    }
+
     with pytest.raises(RuntimeError, match="numerical contract"):
         validate_exl3_hessian_metrics(
             metrics,

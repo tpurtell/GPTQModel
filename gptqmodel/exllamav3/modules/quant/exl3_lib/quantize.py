@@ -645,7 +645,12 @@ def regularize_and_transform_hessian_(
     quant_args["hessian_regularization_diagonal_addend"] = regularization
 
 
-def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
+def finalize_capture_H(
+    H_data: dict,
+    quant_args: dict,
+    verbose: bool,
+    generator: torch.Generator | None = None,
+):
     with finalize_capture_H_mutex:
 
         # Unswap H
@@ -682,7 +687,12 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
 
         # Random sign flips for input channel, fixed for the first linear layer to quantize with this H
         k = H.shape[0]
-        su = (torch.randn(k, device = H.device).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
+        su = (
+            (torch.randn(k, device=H.device, generator=generator).sign() + 1e-5)
+            .sign()
+            .to(torch.float)
+            .unsqueeze(1)
+        )
         H_data["su"] = su
 
         # Input signed-Hadamard congruence. FP64 preserves the positive margin
@@ -1153,9 +1163,6 @@ def quantize_exl3(
         assert weight.dtype == torch.float
         tiles_k = weight.shape[0] // 16
 
-        if "seed" in quant_args:
-            torch.manual_seed(quant_args["seed"])
-
         devices = quant_args["devices"]
         if weight.device != torch.device(devices[0]):
             weight = weight.to(devices[0])
@@ -1163,8 +1170,27 @@ def quantize_exl3(
         device = weight.device if swap_to_device is None else swap_to_device
         k, n = weight.shape
 
+        # Never mutate the process-global CUDA generators from free-threaded
+        # projection workers. Concurrent ``torch.manual_seed`` calls reseed all
+        # devices while kernels are active on peer workers, making the sign
+        # transforms nondeterministic and, under sustained dual-GPU execution,
+        # corrupting the scale-search result. A projection-local generator keeps
+        # the established seed/sequence while isolating devices and threads.
+        generator = None
+        if "seed" in quant_args:
+            seed = quant_args["seed"]
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise ValueError("EXL3 quantizer seed must be an integer")
+            generator = torch.Generator(device=device)
+            generator.manual_seed(seed)
+
         # Get H, LDL decomp. and input/output sign flips
-        q_fallback, H, L, su, H_diag = finalize_capture_H(H_data, quant_args, verbose)
+        q_fallback, H, L, su, H_diag = finalize_capture_H(
+            H_data,
+            quant_args,
+            verbose,
+            generator=generator,
+        )
         if H.is_cuda:
             H = H.to(device)
         if L is not None and L.is_cuda:
@@ -1173,7 +1199,12 @@ def quantize_exl3(
             su = su.to(device)
         if H_diag.is_cuda:
             H_diag = H_diag.to(device)
-        sv = (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+        sv = (
+            (torch.randn(n, device=device, generator=generator).sign() + 1e-5)
+            .sign()
+            .to(torch.float)
+            .unsqueeze(0)
+        )
 
         # Move stored L to CPU (if not already), move working L to device
         if H_data["L"] is not None:
