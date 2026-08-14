@@ -1343,6 +1343,49 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         },
     ]
 
+    def configure_base_replay_store(
+        self,
+        root: str | os.PathLike[str],
+        *,
+        provenance: dict[str, Any],
+    ) -> None:
+        """Enable one-batch durable checkpoints for base-layer final replay."""
+
+        if not isinstance(provenance, dict) or not provenance:
+            raise ValueError("base replay storage requires immutable provenance")
+        self._base_replay_store_root = os.fspath(Path(root).expanduser().resolve())
+        self._base_replay_store_provenance = copy.deepcopy(provenance)
+
+    def create_quantization_layer_output_writer(
+        self,
+        *,
+        layer_index: int,
+        expected_batches: int,
+        progress_stage: str | None,
+        apply_moe_config: bool,
+    ):
+        """Persist every authoritative base replay batch before proceeding."""
+
+        if apply_moe_config or progress_stage != "Forward replay":
+            return None
+        root = getattr(self, "_base_replay_store_root", None)
+        provenance = getattr(self, "_base_replay_store_provenance", None)
+        if not isinstance(root, str) or not isinstance(provenance, dict):
+            return None
+        from ...looper.input_cache import DiskBackedLayerOutputWriter
+
+        return DiskBackedLayerOutputWriter(
+            root,
+            layer_index=layer_index,
+            expected_batches=expected_batches,
+            provenance={
+                **copy.deepcopy(provenance),
+                "layer_index": int(layer_index),
+                "replay_contract": "deepseek-v4-base-post-quant-bf16-v1",
+            },
+            shard_batches=1,
+        )
+
     def prepare_input_capture_layer(
         self,
         layer: nn.Module,
@@ -2506,9 +2549,14 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     remaining = 0
 
                 if pure_identity_recovery:
+                    initialized_states: set[int] = set()
                     for task_name in task_names_by_expert[expert_index]:
                         task = processor.tasks.get(task_name)
                         capture = task.get("capture") if isinstance(task, dict) else None
+                        state_id = id(getattr(capture, "_hessian_state", capture))
+                        if state_id in initialized_states:
+                            continue
+                        initialized_states.add(state_id)
                         columns = getattr(capture, "columns", None)
                         partials = getattr(capture, "_device_hessian_partials", None)
                         sample_counts = getattr(capture, "_device_sample_counts", None)
@@ -2581,6 +2629,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                             if "up_proj" in projections:
                                 expert.up_proj(expert_input)
                     if identity_residual_count:
+                        adjusted_states: set[int] = set()
                         for task_name in task_names_by_expert[expert_index]:
                             task = processor.tasks.get(task_name)
                             capture = (
@@ -2588,6 +2637,12 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                                 if isinstance(task, dict)
                                 else None
                             )
+                            state_id = id(
+                                getattr(capture, "_hessian_state", capture)
+                            )
+                            if state_id in adjusted_states:
+                                continue
+                            adjusted_states.add(state_id)
                             columns = getattr(capture, "columns", None)
                             partials = getattr(
                                 capture, "_device_hessian_partials", None
@@ -2791,7 +2846,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     family_join=family_join,
                 ).discard_through(layer_index, block_namespace="mtp")
             prune_source = getattr(
-                getattr(self, "turtle_model", None),
+                self.__dict__.get("turtle_model"),
                 "prune_active_source_scope_through",
                 None,
             )
@@ -2807,6 +2862,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 "block_index": int(layer_index),
                 "replay_contract": "deepseek-v4-mtp-joint-five-row-v1",
             },
+            shard_batches=1,
             on_finalize=discard_superseded_capture,
         )
 

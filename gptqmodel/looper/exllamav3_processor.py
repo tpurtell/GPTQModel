@@ -140,6 +140,15 @@ def prepare_exl3_hessian(
         )
     # GPTQ capture stores 2/N * X^T X. ExLlamaV3's H_data finalizer divides
     # by `count`, so restore the raw X^T X sum before handing it over.
+    # Gate/up projections may share one normalized accumulator. EXL3 mutates
+    # H_data while finalizing it, so each consumer gets a bounded working copy
+    # while the canonical shared Hessian remains immutable on its owner GPU.
+    if bool(getattr(capture, "hessian_is_shared", False)):
+        hessian = hessian.detach().to(
+            device=target_device,
+            dtype=torch.float32,
+            copy=True,
+        )
     hessian.mul_(float(capture.nsamples) / 2.0)
     return hessian
 
@@ -442,6 +451,12 @@ class EXL3Processor(LoopProcessor):
         self._capture_frontier_store_initialized = False
         self._capture_frontier_store = None
         self._distributed_local_quant_locks: dict[str, threading.Lock] = {}
+        self._hessian_family_owners: dict[
+            tuple[str, int, int], tuple[str, GPTQ]
+        ] = {}
+        self._pending_hessian_family_aliases: dict[
+            tuple[str, int, int], list[tuple[str, GPTQ]]
+        ] = {}
         self.error_journal_path = os.getenv(JOURNAL_ENV) or str(
             Path(self.log_tmp_log_file_name).with_suffix(".exl3-error-ledger.jsonl")
         )
@@ -565,30 +580,43 @@ class EXL3Processor(LoopProcessor):
             route_cache = {}
             self._natural_route_evidence_cache = route_cache
         requires_routes = route_evidence_required(provenance)
+        restored_shared_states: dict[int, EXL3CaptureRecord] = {}
         for full_name, record in records.items():
             task_name = task_names[full_name]
             task = self.tasks.get(task_name)
             if not isinstance(task, dict):
                 raise RuntimeError(f"EXL3 capture task disappeared: `{full_name}`")
             capture: GPTQ = task["capture"]
-            if (
-                getattr(capture, "nsamples", 0) != 0
-                or getattr(capture, "H", None) is not None
-                or getattr(capture, "_device_hessian_partials", {})
-                or getattr(capture, "_device_sample_counts", {})
+            state_id = id(getattr(capture, "_hessian_state", capture))
+            shared_record = restored_shared_states.get(state_id)
+            if shared_record is None:
+                if (
+                    getattr(capture, "nsamples", 0) != 0
+                    or getattr(capture, "H", None) is not None
+                    or getattr(capture, "_device_hessian_partials", {})
+                    or getattr(capture, "_device_sample_counts", {})
+                ):
+                    raise RuntimeError(
+                        f"EXL3 refused to mix live and restored capture for `{full_name}`"
+                    )
+                restored_shared_states[state_id] = record
+            elif (
+                shared_record.path != record.path
+                or shared_record.sample_count != record.sample_count
             ):
                 raise RuntimeError(
-                    f"EXL3 refused to mix live and restored capture for `{full_name}`"
+                    "EXL3 shared gate/up frontier records differ"
                 )
             if requires_routes and record.route_evidence is None:
                 raise RuntimeError(
                     f"EXL3 restored no required route evidence for `{full_name}`"
                 )
-            capture.nsamples = record.sample_count
-            capture._device_hessian_partials.clear()
-            capture._device_sample_counts.clear()
-            capture._hessian_dirty = False
-            capture._final_hessian_device_hint = None
+            if shared_record is None:
+                capture.nsamples = record.sample_count
+                capture._device_hessian_partials.clear()
+                capture._device_sample_counts.clear()
+                capture._hessian_dirty = False
+                capture._final_hessian_device_hint = None
             task["capture_frontier_record"] = record
             task["route_evidence"] = copy.deepcopy(record.route_evidence)
             if record.zero_route_recovery is not None:
@@ -699,30 +727,30 @@ class EXL3Processor(LoopProcessor):
         store = self._capture_frontier_store_for_run(self._ledger_provenance())
         if store is None:
             raise RuntimeError("EXL3 restored capture store disappeared")
-        if getattr(capture, "H", None) is not None or getattr(
-            capture, "_device_hessian_partials", {}
-        ):
-            raise RuntimeError("EXL3 refused to mix lazy and live capture state")
-        # Keep durable frontier payloads in owned host storage. Checkpoint
-        # lookup and Spark transport consume CPU tensors directly; only a
-        # coordinator miss should ever create a CUDA copy. Besides bounding
-        # VRAM, this prevents queued distributed jobs from leaving mutable
-        # Hessians resident beside an active local EXL3 kernel.
-        host_hessian = store.load_record_hessian(record, device="cpu")
-        hessian = host_hessian.to(
-            device=target_device,
-            dtype=torch.float32,
-            non_blocking=False,
-            copy=True,
-        )
-        if target_device.type == "cuda":
-            torch.cuda.synchronize(target_device)
-        del host_hessian
-        capture.H = hessian
-        capture.nsamples = record.sample_count
-        capture._hessian_dirty = False
-        capture._final_hessian_device_hint = target_device
-        task_entry.pop("capture_frontier_record", None)
+        capture_lock = getattr(capture, "lock", None)
+        lock_context = capture_lock if capture_lock is not None else nullcontext()
+        with lock_context:
+            if getattr(capture, "_device_hessian_partials", {}):
+                raise RuntimeError("EXL3 refused to mix lazy and live capture state")
+            if capture.H is None:
+                # Keep durable frontier payloads in owned host storage.
+                host_hessian = store.load_record_hessian(record, device="cpu")
+                hessian = host_hessian.to(
+                    device=target_device,
+                    dtype=torch.float32,
+                    non_blocking=False,
+                    copy=True,
+                )
+                if target_device.type == "cuda":
+                    torch.cuda.synchronize(target_device)
+                del host_hessian
+                capture.H = hessian
+                capture.nsamples = record.sample_count
+                capture._hessian_dirty = False
+                capture._final_hessian_device_hint = target_device
+            elif capture.nsamples != record.sample_count:
+                raise RuntimeError("EXL3 shared lazy capture sample count differs")
+            task_entry.pop("capture_frontier_record", None)
 
     @staticmethod
     def _tensor_storage_summary(value: Any) -> dict[str, int]:
@@ -879,6 +907,7 @@ class EXL3Processor(LoopProcessor):
             pass
 
         seen_sources: set[int] = set()
+        seen_capture_storages: set[tuple[str, int, int]] = set()
         for task in self.tasks.values():
             if not isinstance(task, dict):
                 continue
@@ -888,19 +917,36 @@ class EXL3Processor(LoopProcessor):
             capture = task.get("capture")
             hessian = getattr(capture, "H", None)
             if isinstance(hessian, torch.Tensor):
-                key = (
-                    "host_hessian_bytes"
-                    if hessian.device.type == "cpu"
-                    else "device_hessian_bytes"
+                storage = hessian.untyped_storage()
+                storage_key = (
+                    str(hessian.device),
+                    int(storage.data_ptr()),
+                    int(storage.nbytes()),
                 )
-                summary[key] += hessian.numel() * hessian.element_size()
+                if storage_key not in seen_capture_storages:
+                    seen_capture_storages.add(storage_key)
+                    key = (
+                        "host_hessian_bytes"
+                        if hessian.device.type == "cpu"
+                        else "device_hessian_bytes"
+                    )
+                    summary[key] += storage.nbytes()
             for partial in getattr(capture, "_device_hessian_partials", {}).values():
+                storage = partial.untyped_storage()
+                storage_key = (
+                    str(partial.device),
+                    int(storage.data_ptr()),
+                    int(storage.nbytes()),
+                )
+                if storage_key in seen_capture_storages:
+                    continue
+                seen_capture_storages.add(storage_key)
                 key = (
                     "host_partial_bytes"
                     if partial.device.type == "cpu"
                     else "device_partial_bytes"
                 )
-                summary[key] += partial.numel() * partial.element_size()
+                summary[key] += storage.nbytes()
             named_module = getattr(capture, "_named_module", None)
             state = getattr(named_module, "state", None)
             source = state.get("quant_source_module") if isinstance(state, dict) else None
@@ -1466,9 +1512,68 @@ class EXL3Processor(LoopProcessor):
         task.expected_nsamples = getattr(self, "total_calibration_tokens", None)
         task.quantizer.configure(perchannel=True)
 
+        identity = routed_expert_identity(module.full_name)
+        capture_contract = None
+        if identity is not None:
+            configured_devices = list(
+                getattr(self.qcfg, "moe_vram_strategy_devices", None) or []
+            )
+            devices = [torch.device(device) for device in configured_devices]
+            if not devices:
+                configured = getattr(self.qcfg, "device", None)
+                if configured is not None:
+                    devices = [torch.device(configured)]
+            if not devices:
+                raise ValueError("routed EXL3 Hessian capture has no ownership device")
+            owner_device = devices[identity["expert"] % len(devices)]
+            task.set_hessian_accumulator_device(owner_device)
+            family = (
+                identity["block_namespace"],
+                identity["logical_layer"],
+                identity["expert"],
+            )
+            owners = getattr(self, "_hessian_family_owners", None)
+            if owners is None:
+                owners = {}
+                self._hessian_family_owners = owners
+            pending_aliases = getattr(
+                self, "_pending_hessian_family_aliases", None
+            )
+            if pending_aliases is None:
+                pending_aliases = {}
+                self._pending_hessian_family_aliases = pending_aliases
+            if identity["projection"] == "w1":
+                if family in owners:
+                    raise RuntimeError("duplicate gate Hessian owner")
+                owners[family] = (module.name, task)
+                pending = pending_aliases.pop(family, [])
+                for _alias_name, alias in pending:
+                    alias.share_hessian_state_from(task)
+                if pending:
+                    owners.pop(family, None)
+            elif identity["projection"] == "w3":
+                owner = owners.pop(family, None)
+                if owner is None:
+                    pending_aliases.setdefault(family, []).append(
+                        (module.name, task)
+                    )
+                else:
+                    task.share_hessian_state_from(owner[1])
+            capture_contract = {
+                "schema": "ds4rt.exl3-shared-sharded-hessian",
+                "schema_version": 1,
+                "owner_device": str(owner_device),
+                "owner_projection": (
+                    "w1" if identity["projection"] in {"w1", "w3"}
+                    else "w2"
+                ),
+                "capture_enabled": identity["projection"] != "w3",
+            }
+
         self.tasks[module.name] = {
             "capture": task,
             "qcfg": module_qcfg,
+            "hessian_capture": capture_contract,
         }
         remote_client = self._remote_client_for_run(self._ledger_provenance())
         if remote_client is not None:
@@ -1659,8 +1764,11 @@ class EXL3Processor(LoopProcessor):
             raise ValueError("EXL3 quantization requires CUDA/HIP execution.")
 
         restored_frontier = task_entry.get("capture_frontier_record") is not None
+        accumulator_device = getattr(capture, "hessian_accumulator_device", None)
         staging_device = (
-            torch.device("cpu") if restored_frontier else target_device
+            torch.device("cpu")
+            if restored_frontier
+            else (accumulator_device or target_device)
         )
         self._hydrate_capture_frontier(
             task_entry=task_entry,
@@ -1717,6 +1825,11 @@ class EXL3Processor(LoopProcessor):
                 "hessian_numerical": EXL3_HESSIAN_NUMERICAL_CONTRACT,
                 "hessian_symmetry": EXL3_HESSIAN_SYMMETRY_CONTRACT,
             }
+            hessian_ownership = task_entry.get("hessian_capture")
+            if isinstance(hessian_ownership, dict):
+                quantizer_contract["hessian_ownership"] = copy.deepcopy(
+                    hessian_ownership
+                )
             if execution_contract is not None:
                 quantizer_contract["execution"] = copy.deepcopy(execution_contract)
             checkpoint_request = build_projection_request(

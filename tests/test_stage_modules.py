@@ -1231,6 +1231,42 @@ def test_forward_executor_run_single_streams_outputs_through_model_writer():
     assert torch.equal(writer.outputs[0][0], torch.zeros(1, 1, 1))
 
 
+def test_forward_executor_run_single_skips_durable_output_batch():
+    class Writer:
+        committed_indices = frozenset({0})
+
+        def put(self, _index, _value):
+            raise AssertionError("durable replay batch was rewritten")
+
+        def finalize(self):
+            return "recovered"
+
+    class NoForward(torch.nn.Module):
+        def forward(self, *_args, **_kwargs):
+            raise AssertionError("durable replay batch was executed")
+
+    looper = _make_forward_executor_looper()
+    looper.gptq_model.create_quantization_layer_output_writer = (
+        lambda **_kwargs: Writer()
+    )
+    result = ForwardExecutor(looper).run_single(
+        module=NoForward(),
+        processor=_DummyForwardProcessor(),
+        layer_inputs=[[torch.zeros(1, 1, 1)]],
+        layer_input_kwargs=[{}],
+        position_ids=[],
+        attention_masks=[None],
+        cur_layer_device=torch.device("cpu"),
+        is_lm_head_module=False,
+        shared_kv_cache_dict={},
+        layer_index=0,
+        need_outputs=True,
+        reuse_kv=False,
+        apply_moe_config=False,
+    )
+    assert result == "recovered"
+
+
 def test_forward_executor_run_single_can_skip_moe_lifecycle_for_replay():
     """Replay must also skip bypass/lifecycle hooks, not just routing override."""
 

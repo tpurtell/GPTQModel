@@ -297,8 +297,17 @@ class ForwardExecutor:
         )
         processed_rows = 0
         stage_label = progress_stage or "Forward"
+        committed_indices = frozenset(
+            getattr(outputs, "committed_indices", frozenset())
+        )
 
         for batch_idx in range(total_batches):
+            if batch_idx in committed_indices:
+                rows_for_batch = batch_row_counts[batch_idx]
+                processed_rows = min(
+                    processed_rows + max(rows_for_batch, 1), total_rows
+                )
+                continue
             processor._set_current_batch_index(batch_idx)
             try:
                 exec_device = cur_layer_device
@@ -475,6 +484,9 @@ class ForwardExecutor:
             progress_stage=progress_stage,
             apply_moe_config=apply_moe_config,
         )
+        committed_indices = frozenset(
+            getattr(output_collection, "committed_indices", frozenset())
+        )
 
         replica_pb: "ProgressBar" | None = None
         replica_title = ""
@@ -573,6 +585,8 @@ class ForwardExecutor:
                 for device in forward_devices:
                     device_segments[device] = []
                 for batch_idx in range(total_batches):
+                    if batch_idx in committed_indices:
+                        continue
                     if layer_inputs[batch_idx]:
                         batch_device = layer_inputs[batch_idx][0].device
                         # Check if this device is in our forward_devices, otherwise use first one
@@ -584,8 +598,16 @@ class ForwardExecutor:
                             device_segments[fallback_device].append(batch_idx)
             else:
                 # Default behavior: split batches contiguously across devices
+                pending_indices = [
+                    index
+                    for index in range(total_batches)
+                    if index not in committed_indices
+                ]
+                pending_start = 0
                 for index, device in enumerate(forward_devices):
-                    remaining_batches = max(total_batches - segment_start, 0)
+                    remaining_batches = max(
+                        len(pending_indices) - pending_start, 0
+                    )
                     remaining_devices = max(num_devices - index, 1)
                     segment_length = remaining_batches // remaining_devices
                     remainder = remaining_batches % remaining_devices
@@ -596,9 +618,13 @@ class ForwardExecutor:
                         device_segments[device] = []
                         continue
 
-                    segment_end = min(segment_start + segment_length, total_batches)
-                    device_segments[device] = list(range(segment_start, segment_end))
-                    segment_start = segment_end
+                    segment_end = min(
+                        pending_start + segment_length, len(pending_indices)
+                    )
+                    device_segments[device] = pending_indices[
+                        pending_start:segment_end
+                    ]
+                    pending_start = segment_end
 
             max_segment_length = 0
             for indices in device_segments.values():

@@ -84,3 +84,47 @@ def test_exl3_projection_capture_does_not_allocate_an_offload_tempdir(
     assert processor.tasks[module.name]["qcfg"].offload_to_disk_path == str(
         tmp_path / "shared-offload"
     )
+
+
+def test_exl3_gate_up_preprocess_shares_one_owned_hessian(tmp_path):
+    qcfg = EXL3Config(
+        bits=2.0,
+        module_include=[
+            r"^model\.layers\.0\.mlp\.experts\.7\.(?:gate_proj|up_proj)$"
+        ],
+        offload_to_disk=True,
+        offload_to_disk_path=str(tmp_path / "shared-offload"),
+        device="cpu",
+        moe_vram_strategy_devices=["cpu"],
+    )
+    processor = EXL3Processor.__new__(EXL3Processor)
+    processor.qcfg = qcfg
+    processor.tasks = {}
+    processor.total_calibration_tokens = 8
+    processor._remote_client_initialized = True
+    processor._remote_client = None
+
+    for projection in ("gate_proj", "up_proj"):
+        processor.preprocess(
+            NamedModule(
+                torch.nn.Linear(16, 8, bias=False),
+                name=projection,
+                full_name=(
+                    f"model.layers.0.mlp.experts.7.{projection}"
+                ),
+                layer_index=0,
+            )
+        )
+
+    gate = processor.tasks["gate_proj"]["capture"]
+    up = processor.tasks["up_proj"]["capture"]
+    assert gate._hessian_state is up._hessian_state
+    assert gate._hessian_capture_enabled is True
+    assert up._hessian_capture_enabled is False
+    assert processor.tasks["gate_proj"]["hessian_capture"] == {
+        "schema": "ds4rt.exl3-shared-sharded-hessian",
+        "schema_version": 1,
+        "owner_device": "cpu",
+        "owner_projection": "w1",
+        "capture_enabled": True,
+    }

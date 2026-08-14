@@ -53,6 +53,29 @@ def _log_hessian_verbose() -> bool:
 
 lock = threading.Lock()
 
+
+class _HessianAccumulatorState:
+    """Reference-counted capture state shared by identical projection inputs."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.hessian: Optional[torch.Tensor] = None
+        self.nsamples = 0
+        self.device_partials: Dict[torch.device, torch.Tensor] = {}
+        self.device_sample_counts: Dict[torch.device, int] = {}
+        self.dirty = False
+        self.final_device_hint: Optional[torch.device] = None
+        self.users = 1
+
+    def release(self) -> None:
+        self.users -= 1
+        if self.users < 0:
+            raise RuntimeError("Hessian accumulator state was released twice")
+        if self.users == 0:
+            self.hessian = None
+            self.device_partials.clear()
+            self.device_sample_counts.clear()
+
 # Shared workspaces are cached globally per device so that concurrent GPTQ
 # instances reuse temporary buffers instead of repeatedly allocating large
 # tensors during Hessian accumulation. Each device retains at most a single
@@ -155,6 +178,64 @@ def get_number_of_rows_and_cols(layer: nn.Module):
 
 
 class GPTQ:
+    @property
+    def H(self) -> Optional[torch.Tensor]:
+        return self._hessian_state.hessian
+
+    @H.setter
+    def H(self, value: Optional[torch.Tensor]) -> None:
+        self._hessian_state.hessian = value
+
+    @H.deleter
+    def H(self) -> None:
+        self._hessian_state.hessian = None
+
+    @property
+    def nsamples(self) -> int:
+        return self._hessian_state.nsamples
+
+    @nsamples.setter
+    def nsamples(self, value: int) -> None:
+        self._hessian_state.nsamples = int(value)
+
+    @property
+    def _device_hessian_partials(self) -> Dict[torch.device, torch.Tensor]:
+        return self._hessian_state.device_partials
+
+    @_device_hessian_partials.setter
+    def _device_hessian_partials(
+        self, value: Dict[torch.device, torch.Tensor]
+    ) -> None:
+        self._hessian_state.device_partials = value
+
+    @property
+    def _device_sample_counts(self) -> Dict[torch.device, int]:
+        return self._hessian_state.device_sample_counts
+
+    @_device_sample_counts.setter
+    def _device_sample_counts(self, value: Dict[torch.device, int]) -> None:
+        self._hessian_state.device_sample_counts = value
+
+    @property
+    def _hessian_dirty(self) -> bool:
+        return self._hessian_state.dirty
+
+    @_hessian_dirty.setter
+    def _hessian_dirty(self, value: bool) -> None:
+        self._hessian_state.dirty = bool(value)
+
+    @property
+    def _final_hessian_device_hint(self) -> Optional[torch.device]:
+        return self._hessian_state.final_device_hint
+
+    @_final_hessian_device_hint.setter
+    def _final_hessian_device_hint(
+        self, value: Optional[torch.device]
+    ) -> None:
+        self._hessian_state.final_device_hint = (
+            None if value is None else torch.device(value)
+        )
+
     @staticmethod
     def resolve_module_source(module: nn.Module) -> nn.Module:
         """Resolve the dense module view GPTQ should quantize for one wrapper."""
@@ -167,7 +248,11 @@ class GPTQ:
         return module
 
     def __init__(self, module: nn.Module, qcfg: Optional[QuantizeConfig] = None, region_timer=None):
-        self.lock = threading.Lock()
+        self._hessian_state = _HessianAccumulatorState()
+        self.lock = self._hessian_state.lock
+        self._hessian_capture_enabled = True
+        self._hessian_state_released = False
+        self._hessian_accumulator_device: Optional[torch.device] = None
         self.region_timer = region_timer
 
         # self.num_tied_handles = 0
@@ -263,6 +348,46 @@ class GPTQ:
         self._borrow_workspace_stage_dtype: Optional[torch.dtype] = None
         self._borrow_workspace_last_chunk_rows: Optional[int] = None
 
+    def share_hessian_state_from(self, source: "GPTQ") -> None:
+        """Use one accumulator for projections fed by exactly the same rows."""
+
+        if not isinstance(source, GPTQ) or source is self:
+            raise TypeError("shared Hessian source must be another GPTQ capture")
+        if self.columns != source.columns:
+            raise ValueError("shared Hessian projections have different input widths")
+        if (
+            self.nsamples
+            or self.H is not None
+            or self._device_hessian_partials
+            or self._device_sample_counts
+        ):
+            raise RuntimeError("cannot share a Hessian after capture has started")
+        self._hessian_state.release()
+        self._hessian_state = source._hessian_state
+        self._hessian_state.users += 1
+        self.lock = self._hessian_state.lock
+        self._hessian_capture_enabled = False
+        self._hessian_accumulator_device = source._hessian_accumulator_device
+
+    def set_hessian_accumulator_device(
+        self, device: torch.device | str | None
+    ) -> None:
+        target = None if device is None else torch.device(device)
+        current = self._hessian_accumulator_device
+        if current is not None and target is not None and current != target:
+            raise RuntimeError("shared Hessian accumulator ownership changed")
+        self._hessian_accumulator_device = target
+        if target is not None:
+            self._final_hessian_device_hint = target
+
+    @property
+    def hessian_accumulator_device(self) -> Optional[torch.device]:
+        return self._hessian_accumulator_device
+
+    @property
+    def hessian_is_shared(self) -> bool:
+        return self._hessian_state.users > 1
+
     def _validate_act_group_aware_shape(self) -> None:
         if not getattr(self.qcfg, "act_group_aware", False):
             return
@@ -343,6 +468,8 @@ class GPTQ:
         return tensor.narrow(tensor.dim() - 1, 0, trim).contiguous()
 
     def add_batch(self, inp: torch.Tensor, out: torch.Tensor, batch_index: Optional[int] = None):
+        if not self._hessian_capture_enabled:
+            return
         batch_token_size, xtx, device = self.process_batch(inp)
         if batch_token_size == 0 or xtx is None:
             return
@@ -546,6 +673,14 @@ class GPTQ:
             reshaped_inp = torch.cat((reshaped_inp, pad), dim=1)
             del pad
         canonical_device = torch.device(inp_device)
+
+        accumulator_device = self._hessian_accumulator_device
+        if accumulator_device is not None and canonical_device != accumulator_device:
+            reshaped_inp = reshaped_inp.to(
+                device=accumulator_device,
+                non_blocking=False,
+            )
+            canonical_device = accumulator_device
 
         batch_token_size = reshaped_inp.shape[0]
 
@@ -1477,8 +1612,9 @@ class GPTQ:
         self._borrow_workspace_last_chunk_rows = None
 
     def free(self):
-        if hasattr(self, "H"):
-            del self.H
+        if not self._hessian_state_released:
+            self._hessian_state.release()
+            self._hessian_state_released = True
         del self.quantizer
         if hasattr(self, "module_copy"):
             del self.module_copy

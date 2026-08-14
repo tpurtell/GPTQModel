@@ -347,6 +347,13 @@ class DiskBackedLayerOutputWriter:
             raise RuntimeError("disk-backed outputs are not finalized")
         return self._complete.row_counts
 
+    @property
+    def committed_indices(self) -> frozenset[int]:
+        """Batches already durable and safe for the executor to skip."""
+
+        with self._lock:
+            return frozenset(self._committed_indices)
+
     def _progress_body(self) -> dict[str, Any]:
         return {
             "schema": _DISK_BATCH_SCHEMA,

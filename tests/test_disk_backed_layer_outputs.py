@@ -112,11 +112,13 @@ def test_disk_backed_layer_outputs_resume_complete_shards(tmp_path):
         provenance=provenance,
         shard_batches=2,
     )
+    assert resumed.committed_indices == frozenset({0, 1})
     # The complete first shard is content-validated and need not be rewritten.
     resumed.put(0, [torch.full((2, 4), 99.0)])
     resumed.put(1, [torch.full((2, 4), 99.0)])
     resumed.put(2, [torch.full((1, 4), 2.0)])
     sequence = resumed.finalize()
+    assert resumed.committed_indices == frozenset({0, 1, 2})
     assert torch.equal(sequence[0][0], torch.zeros(2, 4))
     assert torch.equal(sequence[1][0], torch.ones(2, 4))
     assert torch.equal(sequence[2][0], torch.full((1, 4), 2.0))
