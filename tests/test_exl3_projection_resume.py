@@ -131,7 +131,11 @@ def test_process_resumes_from_packed_checkpoint_without_requantizing(
         observe_device_trellis_lock,
     )
     first_processor.process(first_module)
-    first_module.stream_sync()
+    assert first_module.module.weight.is_meta
+    first_processor.prepare_runtime_weight_for_forward(
+        module=first_module,
+        target_device=torch.device("cuda:0"),
+    )
     assert quant_lock_observations == [True]
     first_replay_weight = first_module.module.weight.detach().cpu().clone()
     assert first_processor.log[-1]["exl3_projection_checkpoint_hit"] is False
@@ -171,7 +175,11 @@ def test_process_resumes_from_packed_checkpoint_without_requantizing(
 
     monkeypatch.setattr(processor_module, "quantize_exl3", fail_requantization)
     second_processor.process(second_module)
-    second_module.stream_sync()
+    assert second_module.module.weight.is_meta
+    second_processor.prepare_runtime_weight_for_forward(
+        module=second_module,
+        target_device=torch.device("cuda:0"),
+    )
     assert second_capture.clone_devices == [torch.device("cpu")]
     assert second_processor.log[-1]["exl3_projection_checkpoint_hit"] is True
     assert torch.equal(
@@ -279,7 +287,9 @@ def test_completed_layer_deferral_replaces_packed_storage_with_meta_shell() -> N
     assert after["meta_tensor_count"] > 0
 
 
-def test_runtime_reconstruction_shares_the_device_trellis_lock(monkeypatch) -> None:
+def test_runtime_reconstruction_is_deferred_and_shares_the_device_trellis_lock(
+    monkeypatch,
+) -> None:
     processor = EXL3Processor.__new__(EXL3Processor)
     processor._stats_lock = threading.Lock()
     processor._distributed_local_quant_locks = {}
@@ -302,12 +312,24 @@ def test_runtime_reconstruction_shares_the_device_trellis_lock(monkeypatch) -> N
         return torch.arange(6, dtype=torch.float32).reshape(2, 3)
 
     monkeypatch.setattr(processor_module, "reconstruct_exl3_tensors", reconstruct)
+    packed = {
+        "trellis": torch.zeros(1),
+        "suh": torch.zeros(1),
+        "svh": torch.zeros(1),
+    }
+    module.state.update(packed)
     processor._stage_runtime_weight(
         module=module,
-        out_tensors={"trellis": torch.zeros(1)},
+        out_tensors=packed,
         target_device=device,
     )
 
+    assert observed == []
+    assert module.module.weight.is_meta
+    processor.prepare_runtime_weight_for_forward(
+        module=module,
+        target_device=device,
+    )
     assert observed == [(True, torch.bfloat16)]
     assert torch.equal(
         module.module.weight.detach(),
@@ -318,7 +340,7 @@ def test_runtime_reconstruction_shares_the_device_trellis_lock(monkeypatch) -> N
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_runtime_reconstruction_does_not_retain_dense_cuda_weight(
+def test_runtime_reconstruction_retains_no_dense_weight_until_forward(
     monkeypatch,
 ) -> None:
     processor = EXL3Processor.__new__(EXL3Processor)
@@ -345,18 +367,33 @@ def test_runtime_reconstruction_does_not_retain_dense_cuda_weight(
         ).reshape(2, 3)
 
     monkeypatch.setattr(processor_module, "reconstruct_exl3_tensors", reconstruct)
+    packed = {
+        "trellis": torch.zeros(1),
+        "suh": torch.zeros(1),
+        "svh": torch.zeros(1),
+    }
+    module.state.update(packed)
     processor._stage_runtime_weight(
         module=module,
-        out_tensors={"trellis": torch.zeros(1)},
+        out_tensors=packed,
         target_device=device,
     )
 
-    assert module.module.weight.device.type == "cpu"
+    assert module.module.weight.is_meta
+    assert "quant_source_module" not in module.state
+    processor.prepare_runtime_weight_for_forward(
+        module=module,
+        target_device=device,
+    )
+
+    assert module.module.weight.device == device
     assert torch.equal(
         module.module.weight.detach(),
-        torch.arange(6, dtype=torch.float32).reshape(2, 3).T.to(torch.bfloat16),
+        torch.arange(6, dtype=torch.float32, device=device)
+        .reshape(2, 3)
+        .T.to(torch.bfloat16),
     )
-    assert "quant_source_module" not in module.state
+    assert "exl3_deferred_runtime_weight" not in module.state
 
 
 def test_restore_completed_layer_installs_packed_modules_without_hessian(

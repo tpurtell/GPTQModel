@@ -1114,6 +1114,27 @@ class ModuleLooper():
     ) -> torch.nn.Module:
         """Prepare one named module for the forward role before replay starts."""
 
+        # Quantizers may retain a compact processed representation while the
+        # dense replay weight is deliberately absent. Give the owning
+        # processor the first opportunity to materialize that representation
+        # directly on the final forward device, after capture/Hessian state has
+        # been released.
+        for processor in getattr(self, "processors", ()):
+            prepare_runtime = getattr(
+                processor, "prepare_runtime_weight_for_forward", None
+            )
+            if not callable(prepare_runtime):
+                continue
+            prepared_runtime = prepare_runtime(
+                module=named_module,
+                target_device=fallback_device,
+            )
+            if prepared_runtime is not None:
+                named_module.module = prepared_runtime
+                setattr(named_module, "target_device", fallback_device)
+                setattr(named_module.module, "target_device", fallback_device)
+                return prepared_runtime
+
         target_device = get_device(named_module.module)
         if target_device == META:
             target_device = (

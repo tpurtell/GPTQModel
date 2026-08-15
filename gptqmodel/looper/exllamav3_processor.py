@@ -122,6 +122,7 @@ MEMORY_TELEMETRY_INTERVAL_ENV = (
 log = setup_logger()
 
 _EXL3_SIGMA_REG = 0.025
+_DEFERRED_RUNTIME_WEIGHT_STATE = "exl3_deferred_runtime_weight"
 _OUT_SCALES_TO_ARG = {
     "always": True,
     "never": False,
@@ -2131,39 +2132,99 @@ class EXL3Processor(LoopProcessor):
         out_tensors: dict[str, torch.Tensor],
         target_device: torch.device,
     ) -> None:
-        """Reconstruct one packed result and stage its replay weight on CPU.
+        """Drop the dense source and defer reconstruction until layer replay.
 
-        Distributed checkpoint catch-up can return many packed results much faster
-        than fresh trellis work.  Their EXL3 reconstruction kernels must not overlap
-        a local Hessian transform/trellis kernel (or another reconstruction) on the
-        same coordinator GPU.  The dense BF16 result is needed by the later subset
-        replay, but retaining every completed expert on its quantization GPU makes
-        device memory grow across the projection family.  Keep it on CPU until the
-        existing forward device map materializes the completed family for replay,
-        after the Hessians have been released.
+        ``process()`` has already started streaming the packed result to the
+        module's CPU state and, when configured, committed the same tensors to
+        the projection checkpoint.  Reconstructing every result here makes one
+        complete dense expert family accumulate either on CUDA or in host RAM
+        while Hessian/capture state is still live.  A META placeholder retains
+        only shape and dtype; the replay preparation hook reconstructs directly
+        onto the final balanced forward device after quantization has released
+        the Hessians.
         """
+
+        del target_device
+        required = {"trellis", "suh", "svh"}
+        if not required.issubset(out_tensors):
+            raise RuntimeError(
+                f"EXL3 packed result is incomplete for `{module.full_name}`"
+            )
+        target = module.module
+        weight = target.weight
+        marker = {
+            "dtype": str(weight.dtype),
+            "shape": list(weight.shape),
+            "requires_grad": bool(weight.requires_grad),
+        }
+        placeholder = torch.nn.Parameter(
+            torch.empty(tuple(weight.shape), dtype=weight.dtype, device="meta"),
+            requires_grad=weight.requires_grad,
+        )
+        with parent_module_lock(module.full_name):
+            target.weight = placeholder
+            module.state[_DEFERRED_RUNTIME_WEIGHT_STATE] = marker
+        module.state.pop("quant_source_module", None)
+
+    def prepare_runtime_weight_for_forward(
+        self,
+        *,
+        module: NamedModule,
+        target_device: torch.device | str,
+    ) -> torch.nn.Module | None:
+        """Materialize one deferred dense EXL3 replay weight on its final GPU."""
+
+        marker = module.state.get(_DEFERRED_RUNTIME_WEIGHT_STATE)
+        if marker is None:
+            return None
+        if not isinstance(marker, dict):
+            raise RuntimeError(
+                f"EXL3 deferred replay marker is malformed for `{module.full_name}`"
+            )
+        target = module.module
+        if not getattr(target.weight, "is_meta", False):
+            raise RuntimeError(
+                f"EXL3 deferred replay weight is unexpectedly materialized for "
+                f"`{module.full_name}`"
+            )
+        if marker.get("shape") != list(target.weight.shape) or marker.get(
+            "dtype"
+        ) != str(target.weight.dtype):
+            raise RuntimeError(
+                f"EXL3 deferred replay geometry changed for `{module.full_name}`"
+            )
+
+        module.stream_sync()
+        packed_names = ("trellis", "suh", "svh", "su", "sv", "mcg", "mul1")
+        packed = {
+            name: module.state[name]
+            for name in packed_names
+            if isinstance(module.state.get(name), torch.Tensor)
+        }
+        if not {"trellis", "suh", "svh"}.issubset(packed):
+            raise RuntimeError(
+                f"EXL3 deferred replay tensors are incomplete for `{module.full_name}`"
+            )
 
         target_device = torch.device(target_device)
         with self._distributed_local_quant_lock(target_device):
             runtime_weight = reconstruct_exl3_tensors(
-                out_tensors,
+                packed,
                 device=target_device,
-                dtype=module.weight.dtype,
+                dtype=target.weight.dtype,
             )
             restored_weight = self._restore_module_weight(module, runtime_weight)
-            module.weight.data = restored_weight.to(
-                device=torch.device("cpu"),
-                dtype=module.weight.dtype,
-                non_blocking=False,
+            replay_weight = torch.nn.Parameter(
+                restored_weight,
+                requires_grad=bool(marker.get("requires_grad", False)),
             )
+            with parent_module_lock(module.full_name):
+                target.weight = replay_weight
+                module.state.pop(_DEFERRED_RUNTIME_WEIGHT_STATE, None)
             if target_device.type == "cuda":
                 torch.cuda.synchronize(target_device)
             del runtime_weight, restored_weight
-
-        # The native dense source has served both Hessian capture and the
-        # quantizer input.  Releasing it here offsets the CPU replay weight and
-        # prevents host RSS from growing by another full expert family.
-        module.state.pop("quant_source_module", None)
+        return target
 
     def process(
         self,

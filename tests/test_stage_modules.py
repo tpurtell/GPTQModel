@@ -115,6 +115,39 @@ def test_assign_quant_device_prefers_balanced_hint():
     assert looper._quant_device_rr == 0
 
 
+def test_forward_preparation_allows_processor_to_materialize_deferred_weight():
+    target = torch.nn.Linear(4, 4, bias=False, device="meta")
+    named = NamedModule(
+        target,
+        name="mlp.experts.1.gate_proj",
+        full_name="model.layers.0.mlp.experts.1.gate_proj",
+        layer_index=0,
+    )
+    calls = []
+
+    class Processor:
+        def prepare_runtime_weight_for_forward(self, **kwargs):
+            calls.append(kwargs)
+            kwargs["module"].module.weight = torch.nn.Parameter(
+                torch.ones((4, 4)), requires_grad=False
+            )
+            return kwargs["module"].module
+
+    looper = ModuleLooper.__new__(ModuleLooper)
+    looper.processors = [Processor()]
+    prepared = looper._prepare_named_module_for_forward(
+        named_module=named,
+        fallback_device=torch.device("cpu"),
+    )
+
+    assert prepared is target
+    assert prepared.weight.device.type == "cpu"
+    assert calls == [
+        {"module": named, "target_device": torch.device("cpu")}
+    ]
+    assert named.target_device == torch.device("cpu")
+
+
 def test_module_looper_runtime_telemetry_reports_gil_and_split_pools(monkeypatch):
     emitted = []
     info_logs = []
