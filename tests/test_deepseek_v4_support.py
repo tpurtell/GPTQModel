@@ -14,6 +14,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 )
 
 from gptqmodel.models import auto
+from gptqmodel.nn_modules.hooked_linear import HookedLinear
 from gptqmodel.models.definitions.deepseek_v4 import (
     DeepSeekV4MTPAuxiliary,
     DeepSeekV4MTPAuxiliaryShell,
@@ -877,12 +878,16 @@ def test_deepseek_v4_recovery_replays_rank_rows_from_capture_spool() -> None:
     calls = []
     handles = []
     expert = block.mlp.experts[6]
-    for projection in ("gate_proj", "up_proj"):
-        handles.append(
-            getattr(expert, projection).register_forward_hook(
-                lambda _module, _args, _output, key=projection: calls.append(key)
-            )
+    handles.append(
+        expert.gate_proj.register_forward_hook(
+            lambda _module, _args, _output: calls.append("gate_proj")
         )
+    )
+    expert.up_proj = HookedLinear.from_linear(expert.up_proj)
+    expert.up_proj.forward_hook = (
+        lambda _module, _args, _output: calls.append("up_proj")
+    )
+    expert.up_proj.forward_hook_last = True
     try:
         with adapter.zero_route_recovery_context(
             looper=SimpleNamespace(_set_processor_hooks_paused=lambda *_args: None),
@@ -897,6 +902,7 @@ def test_deepseek_v4_recovery_replays_rank_rows_from_capture_spool() -> None:
             handle.remove()
 
     assert calls == ["gate_proj", "up_proj"]
+    assert expert.up_proj.forward_hook_last is True
     assert {
         task["zero_route_recovery_capture"]["candidate_rows_selected"]
         for task in processor.tasks.values()

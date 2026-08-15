@@ -2773,6 +2773,42 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 if not pure_identity_recovery and expert_input is not None:
                     del expert_input
 
+        @contextmanager
+        def suppress_direct_recovery_early_stop():
+            """Keep capture hooks active without aborting direct expert calls.
+
+            The subset's final ``HookedLinear`` carries ``forward_hook_last``
+            so the ordinary model forward can stop once every requested hook
+            has fired.  Recovery invokes those projections directly after the
+            natural forward has already ended.  If the final subset module is
+            under-covered, its otherwise-intentional ``StopForward`` would
+            escape the recovery context after capturing the row.  Temporarily
+            suppress only the early-stop flag; the hooks themselves must stay
+            installed to accumulate the recovery Hessian.
+            """
+
+            restored: list[tuple[nn.Module, bool]] = []
+            try:
+                experts = layer_module.mlp.experts
+                for expert_index in sorted(targets):
+                    expert = experts[expert_index]
+                    for projection in sorted(allowed):
+                        projection_module = getattr(expert, projection)
+                        if not hasattr(projection_module, "forward_hook_last"):
+                            continue
+                        enabled = projection_module.forward_hook_last
+                        if not isinstance(enabled, bool):
+                            raise RuntimeError(
+                                "DeepSeek V4 recovery found an invalid "
+                                "projection early-stop flag"
+                            )
+                        restored.append((projection_module, enabled))
+                        projection_module.forward_hook_last = False
+                yield
+            finally:
+                for projection_module, enabled in restored:
+                    projection_module.forward_hook_last = enabled
+
         capture_spool = getattr(processor, "_active_capture_batch_spool", None)
         spool_recovery = capture_spool is not None
         if spool_recovery:
@@ -2847,7 +2883,8 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
 
             try:
                 yield False
-                finish_router_candidates()
+                with suppress_direct_recovery_early_stop():
+                    finish_router_candidates()
             finally:
                 pass
             return
@@ -2895,7 +2932,8 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             if router_pre_handle is not None:
                 router_pre_handle.remove()
                 router_pre_handle = None
-            finish_router_candidates()
+            with suppress_direct_recovery_early_stop():
+                finish_router_candidates()
         finally:
             if base_hooks_paused:
                 looper._set_processor_hooks_paused(processor, False)
