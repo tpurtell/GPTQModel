@@ -2131,12 +2131,16 @@ class EXL3Processor(LoopProcessor):
         out_tensors: dict[str, torch.Tensor],
         target_device: torch.device,
     ) -> None:
-        """Reconstruct one packed result inside the device trellis critical section.
+        """Reconstruct one packed result and stage its replay weight on CPU.
 
         Distributed checkpoint catch-up can return many packed results much faster
         than fresh trellis work.  Their EXL3 reconstruction kernels must not overlap
         a local Hessian transform/trellis kernel (or another reconstruction) on the
-        same coordinator GPU.
+        same coordinator GPU.  The dense BF16 result is needed by the later subset
+        replay, but retaining every completed expert on its quantization GPU makes
+        device memory grow across the projection family.  Keep it on CPU until the
+        existing forward device map materializes the completed family for replay,
+        after the Hessians have been released.
         """
 
         target_device = torch.device(target_device)
@@ -2147,9 +2151,19 @@ class EXL3Processor(LoopProcessor):
                 dtype=module.weight.dtype,
             )
             restored_weight = self._restore_module_weight(module, runtime_weight)
-            module.weight.data = restored_weight.to(dtype=module.weight.dtype)
+            module.weight.data = restored_weight.to(
+                device=torch.device("cpu"),
+                dtype=module.weight.dtype,
+                non_blocking=False,
+            )
             if target_device.type == "cuda":
                 torch.cuda.synchronize(target_device)
+            del runtime_weight, restored_weight
+
+        # The native dense source has served both Hessian capture and the
+        # quantizer input.  Releasing it here offsets the CPU replay weight and
+        # prevents host RSS from growing by another full expert family.
+        module.state.pop("quant_source_module", None)
 
     def process(
         self,

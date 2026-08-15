@@ -290,6 +290,9 @@ def test_runtime_reconstruction_shares_the_device_trellis_lock(monkeypatch) -> N
         "model.layers.0.mlp.experts.0.gate_proj",
         0,
     )
+    module.state["quant_source_module"] = nn.Linear(
+        2, 3, bias=False, dtype=torch.bfloat16
+    )
     device = torch.device("cpu")
     observed = []
 
@@ -310,6 +313,50 @@ def test_runtime_reconstruction_shares_the_device_trellis_lock(monkeypatch) -> N
         module.module.weight.detach(),
         torch.arange(6, dtype=torch.float32).reshape(2, 3).T.to(torch.bfloat16),
     )
+    assert module.module.weight.device.type == "cpu"
+    assert "quant_source_module" not in module.state
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_runtime_reconstruction_does_not_retain_dense_cuda_weight(
+    monkeypatch,
+) -> None:
+    processor = EXL3Processor.__new__(EXL3Processor)
+    processor._stats_lock = threading.Lock()
+    processor._distributed_local_quant_locks = {}
+    device = torch.device("cuda:0")
+    module = NamedModule(
+        nn.Linear(2, 3, bias=False, dtype=torch.bfloat16, device=device),
+        "mlp.experts.0.gate_proj",
+        "model.layers.0.mlp.experts.0.gate_proj",
+        0,
+    )
+    module.state["quant_source_module"] = nn.Linear(
+        2, 3, bias=False, dtype=torch.bfloat16
+    )
+
+    def reconstruct(_out_tensors, *, device, dtype):
+        assert processor._distributed_local_quant_lock(
+            torch.device(device)
+        ).locked()
+        assert dtype == torch.bfloat16
+        return torch.arange(
+            6, dtype=torch.float32, device=device
+        ).reshape(2, 3)
+
+    monkeypatch.setattr(processor_module, "reconstruct_exl3_tensors", reconstruct)
+    processor._stage_runtime_weight(
+        module=module,
+        out_tensors={"trellis": torch.zeros(1)},
+        target_device=device,
+    )
+
+    assert module.module.weight.device.type == "cpu"
+    assert torch.equal(
+        module.module.weight.detach(),
+        torch.arange(6, dtype=torch.float32).reshape(2, 3).T.to(torch.bfloat16),
+    )
+    assert "quant_source_module" not in module.state
 
 
 def test_restore_completed_layer_installs_packed_modules_without_hessian(
