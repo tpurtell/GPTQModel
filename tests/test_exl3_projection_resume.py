@@ -251,7 +251,7 @@ def test_capture_memory_limit_trims_only_unallocated_cuda_cache(
     after = {
         "process_rss_bytes": 100,
         "cuda_devices": {
-            "cuda:0": {"allocated_bytes": 70, "reserved_bytes": 72},
+            "cuda:0": {"allocated_bytes": 70, "reserved_bytes": 93},
             "cuda:1": {"allocated_bytes": 75, "reserved_bytes": 77},
         },
     }

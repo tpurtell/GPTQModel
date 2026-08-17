@@ -1023,17 +1023,10 @@ class EXL3Processor(LoopProcessor):
                 )
                 for device, values in summary.get("cuda_devices", {}).items():
                     allocated = int(values.get("allocated_bytes", 0))
-                    reserved = int(values.get("reserved_bytes", 0))
                     if allocated > cuda_limit:
                         raise RuntimeError(
                             f"EXL3 CUDA allocation safety limit exceeded after "
                             f"{context}: device={device} actual={allocated} "
-                            f"limit={cuda_limit}"
-                        )
-                    if reserved > cuda_limit:
-                        raise RuntimeError(
-                            f"EXL3 CUDA reserved-memory safety limit exceeded "
-                            f"after {context}: device={device} actual={reserved} "
                             f"limit={cuda_limit}"
                         )
         return summary
