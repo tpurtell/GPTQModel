@@ -118,6 +118,10 @@ CUDA_ALLOCATION_LIMIT_ENV = "GPTQMODEL_EXL3_CUDA_ALLOCATION_LIMIT_BYTES"
 MEMORY_TELEMETRY_INTERVAL_ENV = (
     "GPTQMODEL_EXL3_MEMORY_TELEMETRY_INTERVAL_BATCHES"
 )
+HESSIAN_OWNER_POLICY_META = "ds4rt_hessian_owner_policy"
+HESSIAN_OWNER_WEIGHTED_ROUND_ROBIN = (
+    "ds4rt.exl3-hessian-owner-weighted-round-robin-v1"
+)
 
 log = setup_logger()
 
@@ -129,6 +133,40 @@ _OUT_SCALES_TO_ARG = {
     "auto": None,
     None: None,
 }
+
+
+def resolve_hessian_owner_device(
+    *,
+    expert_index: int,
+    devices: list[torch.device],
+    policy: dict[str, Any] | None,
+) -> torch.device:
+    """Resolve deterministic capture ownership, optionally with device weights."""
+
+    if not devices:
+        raise ValueError("routed EXL3 Hessian capture has no ownership device")
+    if policy is None:
+        return devices[expert_index % len(devices)]
+    weights = policy.get("device_weights") if isinstance(policy, dict) else None
+    if (
+        not isinstance(policy, dict)
+        or policy.get("contract") != HESSIAN_OWNER_WEIGHTED_ROUND_ROBIN
+        or not isinstance(weights, list)
+        or len(weights) != len(devices)
+        or any(
+            isinstance(weight, bool)
+            or not isinstance(weight, int)
+            or weight <= 0
+            for weight in weights
+        )
+    ):
+        raise ValueError("EXL3 Hessian owner policy is invalid")
+    slot = expert_index % sum(weights)
+    for device, weight in zip(devices, weights, strict=True):
+        if slot < weight:
+            return device
+        slot -= weight
+    raise AssertionError("validated Hessian owner weights did not select a device")
 
 
 def prepare_exl3_hessian(
@@ -1972,9 +2010,16 @@ class EXL3Processor(LoopProcessor):
                 configured = getattr(self.qcfg, "device", None)
                 if configured is not None:
                     devices = [torch.device(configured)]
-            if not devices:
-                raise ValueError("routed EXL3 Hessian capture has no ownership device")
-            owner_device = devices[identity["expert"] % len(devices)]
+            owner_policy = (
+                self.qcfg.meta.get(HESSIAN_OWNER_POLICY_META)
+                if isinstance(self.qcfg.meta, dict)
+                else None
+            )
+            owner_device = resolve_hessian_owner_device(
+                expert_index=identity["expert"],
+                devices=devices,
+                policy=owner_policy,
+            )
             task.set_hessian_accumulator_device(owner_device)
             family = (
                 identity["block_namespace"],
@@ -2018,6 +2063,8 @@ class EXL3Processor(LoopProcessor):
                 ),
                 "capture_enabled": identity["projection"] != "w3",
             }
+            if owner_policy is not None:
+                capture_contract["owner_policy"] = copy.deepcopy(owner_policy)
 
         self.tasks[module.name] = {
             "capture": task,
