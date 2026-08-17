@@ -1001,7 +1001,8 @@ class EXL3Processor(LoopProcessor):
                 f"actual={rss} limit={host_limit}"
             )
         if cuda_limit > 0:
-            for device, values in summary.get("cuda_devices", {}).items():
+            cuda_devices = summary.get("cuda_devices", {})
+            for device, values in cuda_devices.items():
                 allocated = int(values.get("allocated_bytes", 0))
                 if allocated > cuda_limit:
                     raise RuntimeError(
@@ -1009,6 +1010,32 @@ class EXL3Processor(LoopProcessor):
                         f"{context}: device={device} actual={allocated} "
                         f"limit={cuda_limit}"
                     )
+            if any(
+                int(values.get("reserved_bytes", 0)) > cuda_limit
+                for values in cuda_devices.values()
+            ):
+                # Long attention forwards can leave large, fragmented cache
+                # segments around the live Hessians. They are not recovery
+                # state and can prevent the next workspace mapping.
+                torch.cuda.empty_cache()
+                summary = self.log_capture_memory_summary(
+                    f"{context}-after-cache-trim"
+                )
+                for device, values in summary.get("cuda_devices", {}).items():
+                    allocated = int(values.get("allocated_bytes", 0))
+                    reserved = int(values.get("reserved_bytes", 0))
+                    if allocated > cuda_limit:
+                        raise RuntimeError(
+                            f"EXL3 CUDA allocation safety limit exceeded after "
+                            f"{context}: device={device} actual={allocated} "
+                            f"limit={cuda_limit}"
+                        )
+                    if reserved > cuda_limit:
+                        raise RuntimeError(
+                            f"EXL3 CUDA reserved-memory safety limit exceeded "
+                            f"after {context}: device={device} actual={reserved} "
+                            f"limit={cuda_limit}"
+                        )
         return summary
 
     @staticmethod

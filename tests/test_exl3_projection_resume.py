@@ -237,6 +237,44 @@ def test_capture_memory_summary_attributes_cache_model_and_heap_release(
     assert released["after"]["model_host_bytes"] == summary["model_host_bytes"]
 
 
+def test_capture_memory_limit_trims_only_unallocated_cuda_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = EXL3Processor.__new__(EXL3Processor)
+    before = {
+        "process_rss_bytes": 100,
+        "cuda_devices": {
+            "cuda:0": {"allocated_bytes": 70, "reserved_bytes": 95},
+            "cuda:1": {"allocated_bytes": 75, "reserved_bytes": 80},
+        },
+    }
+    after = {
+        "process_rss_bytes": 100,
+        "cuda_devices": {
+            "cuda:0": {"allocated_bytes": 70, "reserved_bytes": 72},
+            "cuda:1": {"allocated_bytes": 75, "reserved_bytes": 77},
+        },
+    }
+    summaries = iter((before, after))
+    contexts: list[str] = []
+    trims: list[bool] = []
+
+    def log_summary(context: str):
+        contexts.append(context)
+        return next(summaries)
+
+    processor.log_capture_memory_summary = log_summary
+    monkeypatch.setenv(processor_module.HOST_RSS_LIMIT_ENV, "200")
+    monkeypatch.setenv(processor_module.CUDA_ALLOCATION_LIMIT_ENV, "90")
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: trims.append(True))
+
+    result = processor._enforce_capture_memory_limits(context="batch-64")
+
+    assert result is after
+    assert trims == [True]
+    assert contexts == ["batch-64", "batch-64-after-cache-trim"]
+
+
 def test_completed_layer_deferral_replaces_packed_storage_with_meta_shell() -> None:
     root = nn.Module()
     root.model = nn.Module()
