@@ -1135,12 +1135,12 @@ class ModuleLooper():
                 setattr(named_module.module, "target_device", fallback_device)
                 return prepared_runtime
 
-        target_device = get_device(named_module.module)
+        preferred_device = normalize_device_like(
+            named_module.state.get("preferred_quant_device")
+        )
+        target_device = preferred_device or get_device(named_module.module)
         if target_device == META:
-            target_device = (
-                normalize_device_like(named_module.state.get("preferred_quant_device"))
-                or fallback_device
-            )
+            target_device = fallback_device
 
         prepared = self.gptq_model.shell_module_materialize(
             target_submodule=named_module.module,

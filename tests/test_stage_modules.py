@@ -148,6 +148,45 @@ def test_forward_preparation_allows_processor_to_materialize_deferred_weight():
     assert named.target_device == torch.device("cpu")
 
 
+def test_forward_preparation_materializes_directly_on_preferred_device():
+    target = torch.nn.Linear(4, 4, bias=False)
+    named = NamedModule(
+        target,
+        name="mlp.experts.1.gate_proj",
+        full_name="model.layers.0.mlp.experts.1.gate_proj",
+        layer_index=0,
+    )
+    named.state["preferred_quant_device"] = torch.device("cuda:1")
+    calls = []
+
+    class Model:
+        @staticmethod
+        def shell_module_materialize(**kwargs):
+            calls.append(kwargs)
+            return kwargs["target_submodule"]
+
+    looper = ModuleLooper.__new__(ModuleLooper)
+    looper.processors = []
+    looper.gptq_model = Model()
+
+    prepared = looper._prepare_named_module_for_forward(
+        named_module=named,
+        fallback_device=torch.device("cuda:0"),
+    )
+
+    assert prepared is target
+    assert calls == [
+        {
+            "target_submodule": target,
+            "device": torch.device("cuda:1"),
+            "role": "forward",
+            "named_module": named,
+        }
+    ]
+    assert named.target_device == torch.device("cuda:1")
+    assert target.target_device == torch.device("cuda:1")
+
+
 def test_module_looper_runtime_telemetry_reports_gil_and_split_pools(monkeypatch):
     emitted = []
     info_logs = []
