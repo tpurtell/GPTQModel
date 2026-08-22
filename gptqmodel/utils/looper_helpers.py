@@ -26,7 +26,11 @@ from ..utils.safe import ThreadSafe
 from ..utils.torch import ALL_DEVICES, CPU, HAS_NPU, torch_sync
 
 
-USE_TORCH_REPLICATE = env_flag("GPTQMODEL_USE_TORCH_REPLICATE", True)
+# torch.nn.parallel.replicate has repeatedly proved unsafe in free-threaded
+# quantization processes. Keep the serialized deepcopy implementation as the
+# fail-safe default; callers may still opt into replicate explicitly when they
+# have qualified it for their Python/PyTorch build.
+USE_TORCH_REPLICATE = env_flag("GPTQMODEL_USE_TORCH_REPLICATE", False)
 
 
 _THREAD_SAFE_PARALLEL = ThreadSafe(torch_parallel)
