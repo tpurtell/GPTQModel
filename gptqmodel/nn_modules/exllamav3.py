@@ -168,6 +168,9 @@ class ExllamaV3Linear(nn.Module):
         tensor = getattr(self, name, None)
         if tensor is None:
             return None
+        if tensor.device.type == "meta":
+            stored = self.tensor_storage.get(f"{name}_multiplier")
+            return int(stored) if stored is not None else None
         return int(tensor.view(torch.uint32).item())
 
     def tensor_storage_entry(self) -> Dict[str, Any]:

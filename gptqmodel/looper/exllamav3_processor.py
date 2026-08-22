@@ -2955,6 +2955,9 @@ class EXL3Processor(LoopProcessor):
                 tensors=tensors,
             )
             if materialize_device is None:
+                # Preserve scalar multiplier values before Accelerate turns
+                # every packed buffer into a META tensor.
+                packed.tensor_storage = packed.tensor_storage_entry()
                 offload_to_disk(
                     model=model.model,
                     module=packed,
@@ -3067,15 +3070,35 @@ class EXL3Processor(LoopProcessor):
                     f"EXL3 deferral target is not packed: `{module_name}`"
                 )
             trellis = getattr(packed, "trellis", None)
-            if trellis is None or trellis.device.type == "meta":
+            if trellis is None:
                 raise RuntimeError(
-                    f"EXL3 deferral target is not materialized: `{module_name}`"
+                    f"EXL3 deferral target has no Trellis storage: `{module_name}`"
+                )
+            # Packed catch-up replay disk-offloads the restored module before
+            # boundary commit.  Accelerate consequently leaves a valid EXL3
+            # module with META buffers and an execution hook here.  Deferral
+            # is deliberately idempotent: normalize either that state or a
+            # freshly materialized packed module to our hook-free metadata
+            # shell.  The completed-set equality above still binds this shell
+            # to a committed projection checkpoint.
+            tensor_storage = (
+                packed.tensor_storage_entry()
+                if trellis.device.type != "meta"
+                else packed.tensor_storage
+            )
+            if (
+                not isinstance(tensor_storage, dict)
+                or tensor_storage.get("quant_format") != "exl3"
+                or not tensor_storage.get("stored_tensors")
+            ):
+                raise RuntimeError(
+                    f"EXL3 deferral target has no durable tensor metadata: `{module_name}`"
                 )
             placeholder = ExllamaV3Linear(
                 in_features=packed.in_features,
                 out_features=packed.out_features,
                 name=module_name,
-                tensor_storage=packed.tensor_storage_entry(),
+                tensor_storage=tensor_storage,
                 out_dtype=packed.out_dtype,
             )
             recurse_setattr(model.model, module_name, placeholder)
@@ -3103,6 +3126,7 @@ class EXL3Processor(LoopProcessor):
                 raise RuntimeError(
                     f"EXL3 restored layer target is not packed: `{module_name}`"
                 )
+            packed.tensor_storage = packed.tensor_storage_entry()
             offload_to_disk(
                 model=model.model,
                 module=packed,
