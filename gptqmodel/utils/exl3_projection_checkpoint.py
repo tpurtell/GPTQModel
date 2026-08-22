@@ -154,6 +154,10 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         with os.fdopen(descriptor, "wb") as target:
             target.write(payload)
             target.flush()
+            # Projection checkpoints are model artifacts, not secrets. Make
+            # an atomically published checkpoint readable by an unprivileged
+            # host validator even when quantization runs as root in Docker.
+            os.fchmod(target.fileno(), 0o644)
             os.fsync(target.fileno())
         os.replace(temporary_name, path)
     except BaseException:

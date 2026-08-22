@@ -73,6 +73,11 @@ def test_projection_checkpoint_round_trips_and_is_idempotent(tmp_path) -> None:
         if path.is_file()
     }
     assert second_files == first_files
+    assert {
+        path.stat().st_mode & 0o777
+        for path in store.root.rglob("*")
+        if path.is_file()
+    } == {0o644}
 
     loaded_tensors, loaded_result = store.load(request)
     assert loaded_result == result
