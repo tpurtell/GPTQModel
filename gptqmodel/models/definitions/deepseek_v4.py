@@ -20,12 +20,10 @@ from torch import nn
 
 from .deepseek_v3 import DeepSeekV3QModel
 from ...utils.exl3_error_ledger import (
-    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
-    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
     ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
     ZERO_ROUTE_RECOVERY_MODE_MIXED,
     ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
-    ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
+    zero_route_recovery_recipe,
 )
 
 
@@ -2270,6 +2268,19 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
     ):
         """Top up under-covered experts from router-near same-selection rows."""
 
+        ledger_provenance = getattr(processor, "_ledger_provenance", None)
+        provenance = ledger_provenance() if callable(ledger_provenance) else None
+        family_join = (
+            provenance.get("family_join")
+            if isinstance(provenance, dict)
+            else None
+        )
+        recovery_recipe = zero_route_recovery_recipe(family_join)
+        candidate_rank_min = recovery_recipe["candidate_rank_min"]
+        candidate_rank_max = recovery_recipe["candidate_rank_max"]
+        target_sample_count = recovery_recipe["target_sample_count"]
+        router_top_k = candidate_rank_min - 1
+
         mtp_blocks = tuple(getattr(self.model, "mtp", ()) or ())
         target_blocks = tuple(
             getattr(getattr(self.model, "model", None), "layers", ()) or ()
@@ -2339,7 +2350,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 or not isinstance(natural_count, int)
                 or not 0
                 <= natural_count
-                < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                < target_sample_count
             ):
                 raise RuntimeError(
                     f"DeepSeek V4 recovery target has invalid natural count: `{full_name}`"
@@ -2352,15 +2363,15 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             task_names_by_expert.setdefault(expert_index, []).append(task_name)
 
         needed_by_expert = {
-            expert: ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT - natural_count
+            expert: target_sample_count - natural_count
             for expert, natural_count in natural_counts.items()
         }
         candidate_rows: dict[int, dict[int, list[torch.Tensor]]] = {
             expert: {
                 rank: []
                 for rank in range(
-                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
-                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX + 1,
+                    candidate_rank_min,
+                    candidate_rank_max + 1,
                 )
             }
             for expert in targets
@@ -2439,8 +2450,8 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 not isinstance(logits, torch.Tensor)
                 or logits.ndim != 2
                 or logits.shape[0] != expert_input.shape[0]
-                or int(getattr(router, "top_k", 0)) != 6
-                or logits.shape[1] < ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+                or int(getattr(router, "top_k", 0)) != router_top_k
+                or logits.shape[1] < candidate_rank_max
             ):
                 raise RuntimeError("DeepSeek V4 recovery router geometry is invalid")
             if keep_mask is not None:
@@ -2455,16 +2466,16 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             choice_scores = scores + correction.float()
             ranked_scores, ranked_indices = torch.topk(
                 choice_scores,
-                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+                candidate_rank_max,
                 dim=-1,
                 largest=True,
                 sorted=True,
             )
-            boundary = ranked_scores[:, 5]
+            boundary = ranked_scores[:, router_top_k - 1]
             for expert_index in sorted(targets):
                 needed = needed_by_expert[expert_index]
                 candidate_indices = torch.nonzero(
-                    ranked_indices[:, 6:ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX]
+                    ranked_indices[:, router_top_k:candidate_rank_max]
                     == expert_index,
                     as_tuple=False,
                 )
@@ -2472,9 +2483,9 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     candidate_indices.shape[0]
                 )
                 for rank_offset in range(
-                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX - 6
+                    candidate_rank_max - router_top_k
                 ):
-                    rank = rank_offset + 7
+                    rank = rank_offset + candidate_rank_min
                     remaining = needed - retained_by_rank[expert_index][rank]
                     if remaining <= 0:
                         continue
@@ -2511,14 +2522,14 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 selected_histogram = {
                     str(rank): 0
                     for rank in range(
-                        ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
-                        ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX + 1,
+                        candidate_rank_min,
+                        candidate_rank_max + 1,
                     )
                 }
                 remaining = needed
                 for rank in range(
-                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
-                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX + 1,
+                    candidate_rank_min,
+                    candidate_rank_max + 1,
                 ):
                     if remaining <= 0:
                         break
@@ -2590,13 +2601,13 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                             dtype=torch.float32,
                             device=target_device,
                         ).mul_(2.0)
-                        capture.nsamples = ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                        capture.nsamples = target_sample_count
                         capture._hessian_dirty = False
                         capture._final_hessian_device_hint = target_device
                     gap_summary = None
                     selected_candidate_count = 0
                     router_augmented_count = 0
-                    identity_count = ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                    identity_count = target_sample_count
                     recovery_mode = ZERO_ROUTE_RECOVERY_MODE_IDENTITY
                 else:
                     selected_candidate_count = needed - identity_residual_count
@@ -2830,9 +2841,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     "DeepSeek V4 recovery requires every natural capture batch"
                 )
             candidate_width = (
-                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
-                - ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN
-                + 1
+                candidate_rank_max - candidate_rank_min + 1
             )
             for batch_index in range(expected_batches):
                 tensors, _metadata = capture_spool.load(batch_index)
@@ -2849,14 +2858,15 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     or candidate_score_gaps.shape != candidate_indices.shape
                 ):
                     raise RuntimeError(
-                        "DeepSeek V4 recovery batch lacks rank-7--12 evidence"
+                        "routed MoE recovery batch lacks the configured "
+                        f"rank-{candidate_rank_min}--{candidate_rank_max} evidence"
                     )
                 candidate_indices = candidate_indices.to(torch.int64)
                 for expert_index in sorted(targets):
                     matches = candidate_indices.eq(expert_index)
                     observed_by_expert[expert_index] += int(matches.sum().item())
                     for rank_offset in range(candidate_width):
-                        rank = ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN + rank_offset
+                        rank = candidate_rank_min + rank_offset
                         remaining = (
                             needed_by_expert[expert_index]
                             - retained_by_rank[expert_index][rank]

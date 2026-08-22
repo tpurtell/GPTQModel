@@ -57,15 +57,11 @@ from ..utils.exl3_error_ledger import (
     ROUTE_EVIDENCE_SCHEMA,
     ROUTE_EVIDENCE_SCHEMA_VERSION,
     ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
-    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
-    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
     ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
     ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
     ZERO_ROUTE_RECOVERY_MODE_MIXED,
     ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
-    ZERO_ROUTE_RECOVERY_SELECTION_CAP,
     ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
-    ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
     ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA,
     ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION,
     ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
@@ -80,6 +76,7 @@ from ..utils.exl3_error_ledger import (
     validate_zero_route_recovery,
     validate_zero_route_recovery_authorization,
     zero_route_recovery_enabled,
+    zero_route_recovery_recipe,
 )
 from ..utils.exl3_capture_frontier import (
     CAPTURE_FRONTIER_ENV,
@@ -235,6 +232,13 @@ class _EXL3NaturalRouteCapture:
                 "EXL3 natural-route capture requires one routed block per subset"
             )
         self.family_id = next(iter(family_ids))
+        provenance = processor._ledger_provenance()
+        family_join = (
+            provenance.get("family_join")
+            if isinstance(provenance, dict)
+            else None
+        )
+        self.recovery_recipe = zero_route_recovery_recipe(family_join)
 
         mlp = getattr(layer_module, "mlp", None)
         if mlp is None:
@@ -343,28 +347,35 @@ class _EXL3NaturalRouteCapture:
                 )
             correction = getattr(self.router, "e_score_correction_bias", None)
             score_fn = getattr(self.router, "score_fn", None)
+            candidate_rank_min = self.recovery_recipe["candidate_rank_min"]
+            candidate_rank_max = self.recovery_recipe["candidate_rank_max"]
+            router_top_k = int(indices.shape[-1])
+            if candidate_rank_min != router_top_k + 1:
+                raise RuntimeError(
+                    "EXL3 recovery candidates must start immediately after "
+                    f"router top-k: top_k={router_top_k} "
+                    f"candidate_rank_min={candidate_rank_min}"
+                )
             if (
                 isinstance(correction, torch.Tensor)
                 and callable(score_fn)
-                and logits.shape[-1] >= ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+                and logits.shape[-1] >= candidate_rank_max
             ):
                 choice_scores = score_fn(logits.float()) + correction.float()
                 ranked_scores, ranked_indices = torch.topk(
                     choice_scores,
-                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+                    candidate_rank_max,
                     dim=-1,
                     largest=True,
                     sorted=True,
                 )
                 candidate_indices = ranked_indices[
-                    :, ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN - 1 :
-                    ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+                    :, candidate_rank_min - 1 : candidate_rank_max
                 ]
                 candidate_score_gaps = (
-                    ranked_scores[:, 5:6]
+                    ranked_scores[:, router_top_k - 1 : router_top_k]
                     - ranked_scores[
-                        :, ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN - 1 :
-                        ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
+                        :, candidate_rank_min - 1 : candidate_rank_max
                     ]
                 ).float()
                 del choice_scores, ranked_scores, ranked_indices
@@ -1647,6 +1658,12 @@ class EXL3Processor(LoopProcessor):
         provenance = self._ledger_provenance()
         if not route_evidence_required(provenance):
             return ()
+        family_join = (
+            provenance.get("family_join")
+            if isinstance(provenance, dict)
+            else None
+        )
+        recipe = zero_route_recovery_recipe(family_join)
         authorization = self._zero_route_recovery_authorization(provenance)
         mlp = getattr(layer_module, "mlp", None)
         if mlp is None:
@@ -1707,7 +1724,7 @@ class EXL3Processor(LoopProcessor):
             if (
                 authorization is not None
                 and learned_topk_router
-                and natural_count < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                and natural_count < recipe["target_sample_count"]
             ):
                 recovery_tasks.append(task_name)
         if len(family_ids) > 1:
@@ -1740,6 +1757,7 @@ class EXL3Processor(LoopProcessor):
         )
         if not isinstance(family_join, dict):
             return None
+        recipe = zero_route_recovery_recipe(family_join)
         if zero_route_recovery_enabled(provenance):
             family_digest = sha256_bytes(canonical_json_bytes(family_join))
             authorization = {
@@ -1747,14 +1765,16 @@ class EXL3Processor(LoopProcessor):
                 "schema_version": ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION,
                 "kind": "immutable-family-join",
                 "recovery_contract": ZERO_ROUTE_RECOVERY_SCHEMA,
-                "trigger": ZERO_ROUTE_RECOVERY_TRIGGER,
-                "sample_source": ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
-                "capture_method": ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
-                "selection_policy": ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
-                "candidate_rank_min": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
-                "candidate_rank_max": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
-                "target_sample_count": ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
-                "identity_calibration_policy": ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+                "trigger": recipe["trigger"],
+                "sample_source": recipe["sample_source"],
+                "capture_method": recipe["capture_method"],
+                "selection_policy": recipe["selection_policy"],
+                "candidate_rank_min": recipe["candidate_rank_min"],
+                "candidate_rank_max": recipe["candidate_rank_max"],
+                "target_sample_count": recipe["target_sample_count"],
+                "identity_calibration_policy": recipe[
+                    "identity_calibration_policy"
+                ],
                 "family_join_sha256": family_digest,
                 "authorization_sha256": family_digest,
             }
@@ -1791,6 +1811,7 @@ class EXL3Processor(LoopProcessor):
         authorization = self._zero_route_recovery_authorization(provenance)
         if not isinstance(family_join, dict) or authorization is None:
             raise RuntimeError("EXL3 route-coverage top-up lost its authorization")
+        recipe = zero_route_recovery_recipe(family_join)
         recovered_by_expert: dict[int, tuple[str, int, int]] = {}
         for task_name in task_names:
             named_module = subset.get(task_name)
@@ -1815,11 +1836,11 @@ class EXL3Processor(LoopProcessor):
                 or not isinstance(natural_count, int)
                 or not 0
                 <= natural_count
-                < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                < recipe["target_sample_count"]
                 or not isinstance(recovery_capture, dict)
                 or isinstance(total_count, bool)
                 or not isinstance(total_count, int)
-                or total_count != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                or total_count != recipe["target_sample_count"]
             ):
                 raise RuntimeError(
                     "EXL3 under-coverage recovery did not produce a valid "
@@ -1865,15 +1886,17 @@ class EXL3Processor(LoopProcessor):
             task["zero_route_recovery"] = {
                 "schema": ZERO_ROUTE_RECOVERY_SCHEMA,
                 "schema_version": ZERO_ROUTE_RECOVERY_SCHEMA_VERSION,
-                "trigger": ZERO_ROUTE_RECOVERY_TRIGGER,
-                "sample_source": ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
-                "capture_method": ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
-                "selection_policy": ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
-                "candidate_rank_min": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
-                "candidate_rank_max": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
-                "selection_cap": ZERO_ROUTE_RECOVERY_SELECTION_CAP,
-                "target_sample_count": ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
-                "identity_calibration_policy": ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+                "trigger": recipe["trigger"],
+                "sample_source": recipe["sample_source"],
+                "capture_method": recipe["capture_method"],
+                "selection_policy": recipe["selection_policy"],
+                "candidate_rank_min": recipe["candidate_rank_min"],
+                "candidate_rank_max": recipe["candidate_rank_max"],
+                "selection_cap": recipe["selection_cap"],
+                "target_sample_count": recipe["target_sample_count"],
+                "identity_calibration_policy": recipe[
+                    "identity_calibration_policy"
+                ],
                 "block_namespace": identity["block_namespace"],
                 "logical_layer": identity["logical_layer"],
                 "expert": identity["expert"],
@@ -1917,6 +1940,7 @@ class EXL3Processor(LoopProcessor):
         if not route_evidence_required(provenance):
             return
         family_join = provenance.get("family_join")
+        recipe = zero_route_recovery_recipe(family_join)
         authorization = self._zero_route_recovery_authorization(provenance)
         mlp = getattr(layer_module, "mlp", None)
         if mlp is None:
@@ -1956,7 +1980,7 @@ class EXL3Processor(LoopProcessor):
             recovery_required = (
                 authorization is not None
                 and learned_topk_router
-                and natural_count < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+                and natural_count < recipe["target_sample_count"]
             )
             if recovery_required:
                 if not isinstance(recovery, dict):

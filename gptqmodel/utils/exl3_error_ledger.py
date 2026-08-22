@@ -52,6 +52,7 @@ ZERO_ROUTE_RECOVERY_AUTHORIZATION_KINDS = {
     "immutable-family-join",
     "content-bound-execution-upgrade",
 }
+ZERO_ROUTE_RECOVERY_RECIPE_KEY = "zero_route_recovery_recipe"
 
 _BASE_EXPERT = re.compile(
     r"^(?:model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\."
@@ -143,6 +144,68 @@ def zero_route_recovery_enabled(provenance: dict[str, Any] | None) -> bool:
     )
 
 
+def zero_route_recovery_recipe(
+    family_join: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve the content-bound route-recovery recipe for one model family.
+
+    The original DeepSeek policy remains the default so existing immutable
+    plans keep their byte-for-byte contract. New model families can bind a
+    different adjacent-rank window (for example ranks 9--16 for a top-8 GLM
+    router) without changing global quantizer behavior.
+    """
+
+    default = {
+        "trigger": ZERO_ROUTE_RECOVERY_TRIGGER,
+        "sample_source": ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
+        "capture_method": ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
+        "selection_policy": ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
+        "candidate_rank_min": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
+        "candidate_rank_max": ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
+        "selection_cap": ZERO_ROUTE_RECOVERY_SELECTION_CAP,
+        "target_sample_count": ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT,
+        "identity_calibration_policy": ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+    }
+    configured = (
+        family_join.get(ZERO_ROUTE_RECOVERY_RECIPE_KEY)
+        if isinstance(family_join, dict)
+        else None
+    )
+    if configured is None:
+        return default
+    clean = _finite_json_value(configured, ZERO_ROUTE_RECOVERY_RECIPE_KEY)
+    if not isinstance(clean, dict) or set(clean) != set(default):
+        raise ValueError("EXL3 zero-route recovery recipe has invalid fields")
+    integer_fields = (
+        "candidate_rank_min",
+        "candidate_rank_max",
+        "selection_cap",
+        "target_sample_count",
+    )
+    if (
+        any(
+            isinstance(clean.get(field), bool)
+            or not isinstance(clean.get(field), int)
+            or clean[field] <= 0
+            for field in integer_fields
+        )
+        or clean["candidate_rank_max"] < clean["candidate_rank_min"]
+        or clean["selection_cap"] > clean["target_sample_count"]
+        or any(
+            not isinstance(clean.get(field), str) or not clean[field]
+            for field in (
+                "trigger",
+                "sample_source",
+                "capture_method",
+                "selection_policy",
+                "identity_calibration_policy",
+            )
+        )
+    ):
+        raise ValueError("EXL3 zero-route recovery recipe is invalid")
+    return clean
+
+
 def validate_zero_route_recovery_authorization(
     authorization: dict[str, Any],
     *,
@@ -154,6 +217,7 @@ def validate_zero_route_recovery_authorization(
         authorization,
         "zero_route_recovery_authorization",
     )
+    recipe = zero_route_recovery_recipe(family_join)
     family_join_sha256 = hashlib.sha256(
         _canonical_json_bytes(family_join)
     ).hexdigest()
@@ -164,19 +228,15 @@ def validate_zero_route_recovery_authorization(
         != ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION
         or clean.get("kind") not in ZERO_ROUTE_RECOVERY_AUTHORIZATION_KINDS
         or clean.get("recovery_contract") != ZERO_ROUTE_RECOVERY_SCHEMA
-        or clean.get("trigger") != ZERO_ROUTE_RECOVERY_TRIGGER
-        or clean.get("sample_source") != ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE
-        or clean.get("capture_method") != ZERO_ROUTE_RECOVERY_CAPTURE_METHOD
-        or clean.get("selection_policy")
-        != ZERO_ROUTE_RECOVERY_SELECTION_POLICY
-        or clean.get("candidate_rank_min")
-        != ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN
-        or clean.get("candidate_rank_max")
-        != ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
-        or clean.get("target_sample_count")
-        != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        or clean.get("trigger") != recipe["trigger"]
+        or clean.get("sample_source") != recipe["sample_source"]
+        or clean.get("capture_method") != recipe["capture_method"]
+        or clean.get("selection_policy") != recipe["selection_policy"]
+        or clean.get("candidate_rank_min") != recipe["candidate_rank_min"]
+        or clean.get("candidate_rank_max") != recipe["candidate_rank_max"]
+        or clean.get("target_sample_count") != recipe["target_sample_count"]
         or clean.get("identity_calibration_policy")
-        != ZERO_ROUTE_RECOVERY_IDENTITY_POLICY
+        != recipe["identity_calibration_policy"]
         or clean.get("family_join_sha256") != family_join_sha256
         or not isinstance(digest, str)
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
@@ -311,6 +371,7 @@ def validate_zero_route_recovery(
     recovery_mode = clean.get("recovery_mode")
     if not isinstance(family_join, dict):
         raise ValueError("EXL3 zero-route recovery requires family identity")
+    recipe = zero_route_recovery_recipe(family_join)
     validated_authorization = validate_zero_route_recovery_authorization(
         authorization,
         family_join=family_join,
@@ -318,20 +379,16 @@ def validate_zero_route_recovery(
     if (
         clean.get("schema") != ZERO_ROUTE_RECOVERY_SCHEMA
         or clean.get("schema_version") != ZERO_ROUTE_RECOVERY_SCHEMA_VERSION
-        or clean.get("trigger") != ZERO_ROUTE_RECOVERY_TRIGGER
-        or clean.get("sample_source") != ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE
-        or clean.get("capture_method") != ZERO_ROUTE_RECOVERY_CAPTURE_METHOD
-        or clean.get("selection_policy")
-        != ZERO_ROUTE_RECOVERY_SELECTION_POLICY
-        or clean.get("candidate_rank_min")
-        != ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN
-        or clean.get("candidate_rank_max")
-        != ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX
-        or clean.get("selection_cap") != ZERO_ROUTE_RECOVERY_SELECTION_CAP
-        or clean.get("target_sample_count")
-        != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        or clean.get("trigger") != recipe["trigger"]
+        or clean.get("sample_source") != recipe["sample_source"]
+        or clean.get("capture_method") != recipe["capture_method"]
+        or clean.get("selection_policy") != recipe["selection_policy"]
+        or clean.get("candidate_rank_min") != recipe["candidate_rank_min"]
+        or clean.get("candidate_rank_max") != recipe["candidate_rank_max"]
+        or clean.get("selection_cap") != recipe["selection_cap"]
+        or clean.get("target_sample_count") != recipe["target_sample_count"]
         or clean.get("identity_calibration_policy")
-        != ZERO_ROUTE_RECOVERY_IDENTITY_POLICY
+        != recipe["identity_calibration_policy"]
         or clean.get("block_namespace") != identity["block_namespace"]
         or clean.get("logical_layer") != identity["logical_layer"]
         or clean.get("expert") != identity["expert"]
@@ -342,9 +399,9 @@ def validate_zero_route_recovery(
         )
         or not 0
         <= clean["natural_sample_count"]
-        < ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        < recipe["target_sample_count"]
         or clean["total_sample_count"]
-        != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        != recipe["target_sample_count"]
         or clean["total_sample_count"] != int(sample_count)
         or clean["forced_pass_count"] != 1
         or isinstance(clean.get("candidate_rows_observed"), bool)
@@ -356,15 +413,15 @@ def validate_zero_route_recovery(
         <= clean["candidate_rows_selected"]
         <= min(
             clean["candidate_rows_observed"],
-            ZERO_ROUTE_RECOVERY_SELECTION_CAP,
+            recipe["selection_cap"],
         )
         or not isinstance(candidate_histogram, dict)
         or set(candidate_histogram)
         != {
             str(rank)
             for rank in range(
-                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MIN,
-                ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX + 1,
+                recipe["candidate_rank_min"],
+                recipe["candidate_rank_max"] + 1,
             )
         }
         or any(
@@ -393,7 +450,7 @@ def validate_zero_route_recovery(
         if (
             clean["identity_calibration_count"] != 0
             or clean["router_augmented_sample_count"]
-            != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+            != recipe["target_sample_count"]
             - clean["natural_sample_count"]
             or clean["router_augmented_sample_count"] <= 0
             or clean["natural_sample_count"]
@@ -448,7 +505,7 @@ def validate_zero_route_recovery(
         clean["natural_sample_count"] != 0
         or clean["router_augmented_sample_count"] != 0
         or clean["identity_calibration_count"]
-        != ZERO_ROUTE_RECOVERY_TARGET_SAMPLE_COUNT
+        != recipe["target_sample_count"]
         or observed != 0
         or selected != 0
         or candidate_gap is not None
@@ -871,4 +928,5 @@ __all__ = [
     "validate_zero_route_recovery_authorization",
     "write_exl3_error_ledger",
     "zero_route_recovery_enabled",
+    "zero_route_recovery_recipe",
 ]

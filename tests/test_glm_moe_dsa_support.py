@@ -11,6 +11,7 @@ from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCau
 
 from gptqmodel.models import auto
 from gptqmodel.models.definitions.glm_moe_dsa import GlmMoeDsaQModel
+from gptqmodel.models.definitions.deepseek_v4 import DeepSeekV4MTPQuantizationModel
 from gptqmodel.utils.structure import LazyTurtle, alias_from_turtle_for_submodule
 
 
@@ -147,6 +148,37 @@ def test_glm_moe_dsa_module_tree_expands_dense_and_sparse_paths():
     assert "mlp.shared_experts.gate_proj" in flat_modules
     assert "mlp.shared_experts.up_proj" in flat_modules
     assert "mlp.shared_experts.down_proj" in flat_modules
+
+
+def test_glm_moe_dsa_preserves_checkpoint_only_mtp_and_delegates_recovery(
+    monkeypatch,
+):
+    assert GlmMoeDsaQModel.out_of_model_tensors == {
+        "prefixes": ["model.layers.78"]
+    }
+    sentinel = object()
+    observed = {}
+
+    def fake_recovery(self, **kwargs):
+        observed["self"] = self
+        observed.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        DeepSeekV4MTPQuantizationModel,
+        "zero_route_recovery_context",
+        fake_recovery,
+    )
+    model_def = GlmMoeDsaQModel.__new__(GlmMoeDsaQModel)
+    kwargs = {
+        "looper": object(),
+        "processor": object(),
+        "layer_module": torch.nn.Module(),
+        "subset": {},
+        "task_names": (),
+    }
+    assert model_def.zero_route_recovery_context(**kwargs) is sentinel
+    assert observed == {"self": model_def, **kwargs}
 
 
 def test_glm_moe_dsa_tiny_model_matches_definition():

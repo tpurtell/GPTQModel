@@ -31,6 +31,7 @@ from gptqmodel.utils.exl3_error_ledger import (
     derive_family_records,
     routed_expert_identity,
     write_exl3_error_ledger,
+    zero_route_recovery_recipe,
 )
 from gptqmodel.looper.exllamav3_processor import EXL3Processor
 
@@ -187,6 +188,24 @@ def _zero_route_recovery(
     }
 
 
+def _glm_recovery_recipe() -> dict:
+    return {
+        "trigger": "natural-route-count-below-1024",
+        "sample_source": "same-fixed-calibration-selection",
+        "capture_method": (
+            "direct-expert-router-ranks-9-16-then-identity-residual"
+        ),
+        "selection_policy": "rank-ascending-then-fixed-replay-order-v1",
+        "candidate_rank_min": 9,
+        "candidate_rank_max": 16,
+        "selection_cap": 1024,
+        "target_sample_count": 1024,
+        "identity_calibration_policy": (
+            "normalized-2i-residual-to-effective-count-1024-v2"
+        ),
+    }
+
+
 def _record(
     projection: str,
     scale: float = 1.0,
@@ -224,6 +243,33 @@ def test_routed_expert_identity_covers_base_and_mtp_namespaces():
         "projection": "w2",
     }
     assert routed_expert_identity("model.layers.7.mlp.shared_experts.up_proj") is None
+
+
+def test_zero_route_recovery_recipe_keeps_deepseek_default_and_binds_glm_window():
+    default = zero_route_recovery_recipe(None)
+    assert default["candidate_rank_min"] == 7
+    assert default["candidate_rank_max"] == 12
+    assert default["capture_method"] == ZERO_ROUTE_RECOVERY_CAPTURE_METHOD
+
+    glm_recipe = _glm_recovery_recipe()
+    assert zero_route_recovery_recipe(
+        {"zero_route_recovery_recipe": glm_recipe}
+    ) == glm_recipe
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"candidate_rank_min": 0},
+        {"candidate_rank_min": 17, "candidate_rank_max": 16},
+        {"selection_cap": 1025},
+        {"capture_method": ""},
+    ],
+)
+def test_zero_route_recovery_recipe_rejects_invalid_model_binding(mutation):
+    recipe = {**_glm_recovery_recipe(), **mutation}
+    with pytest.raises(ValueError, match="recovery recipe is invalid"):
+        zero_route_recovery_recipe({"zero_route_recovery_recipe": recipe})
 
 
 def test_family_join_aggregates_raw_terms_only_for_exact_provenance():
