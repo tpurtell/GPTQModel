@@ -104,11 +104,15 @@ from ..utils.exl3_remote import (
     remote_client_from_provenance,
     validate_exl3_hessian_metrics,
 )
+from ..utils.exl3_router_candidates import (
+    ROUTER_CANDIDATE_CAPTURE_PAYLOAD_CONTRACT,
+    learned_router_ranked_choices,
+)
 from ..utils.exllamav3 import create_exllamav3_module
 from ..utils.logger import setup_logger
 from ..utils.model import recurse_setattr
 from ..utils.module_locks import parent_module_lock
-from ..utils.offload import offload_to_disk
+from ..utils.offload import offload_to_disk, offload_to_safetensors_reference
 
 HOST_RSS_LIMIT_ENV = "GPTQMODEL_EXL3_HOST_RSS_LIMIT_BYTES"
 CUDA_ALLOCATION_LIMIT_ENV = "GPTQMODEL_EXL3_CUDA_ALLOCATION_LIMIT_BYTES"
@@ -345,8 +349,6 @@ class _EXL3NaturalRouteCapture:
                 raise RuntimeError(
                     "EXL3 router capture has no calibration batch index"
                 )
-            correction = getattr(self.router, "e_score_correction_bias", None)
-            score_fn = getattr(self.router, "score_fn", None)
             candidate_rank_min = self.recovery_recipe["candidate_rank_min"]
             candidate_rank_max = self.recovery_recipe["candidate_rank_max"]
             router_top_k = int(indices.shape[-1])
@@ -356,40 +358,20 @@ class _EXL3NaturalRouteCapture:
                     f"router top-k: top_k={router_top_k} "
                     f"candidate_rank_min={candidate_rank_min}"
                 )
-            if (
-                isinstance(correction, torch.Tensor)
-                and callable(score_fn)
-                and logits.shape[-1] >= candidate_rank_max
-            ):
-                choice_scores = score_fn(logits.float()) + correction.float()
-                ranked_scores, ranked_indices = torch.topk(
-                    choice_scores,
-                    candidate_rank_max,
-                    dim=-1,
-                    largest=True,
-                    sorted=True,
-                )
-                candidate_indices = ranked_indices[
-                    :, candidate_rank_min - 1 : candidate_rank_max
-                ]
-                candidate_score_gaps = (
-                    ranked_scores[:, router_top_k - 1 : router_top_k]
-                    - ranked_scores[
-                        :, candidate_rank_min - 1 : candidate_rank_max
-                    ]
-                ).float()
-                del choice_scores, ranked_scores, ranked_indices
-            else:
-                candidate_indices = torch.empty(
-                    (indices.shape[0], 0),
-                    dtype=torch.int64,
-                    device=indices.device,
-                )
-                candidate_score_gaps = torch.empty(
-                    (indices.shape[0], 0),
-                    dtype=torch.float32,
-                    device=indices.device,
-                )
+            ranked_scores, ranked_indices = learned_router_ranked_choices(
+                self.router,
+                logits,
+                rank_max=candidate_rank_max,
+                selected_indices=indices,
+            )
+            candidate_indices = ranked_indices[
+                :, candidate_rank_min - 1 : candidate_rank_max
+            ]
+            candidate_score_gaps = (
+                ranked_scores[:, router_top_k - 1 : router_top_k]
+                - ranked_scores[:, candidate_rank_min - 1 : candidate_rank_max]
+            ).float()
+            del ranked_scores, ranked_indices
             with self._lock:
                 if batch_index in self._batch_payloads:
                     raise RuntimeError("EXL3 router ran twice for one capture batch")
@@ -891,6 +873,7 @@ class EXL3Processor(LoopProcessor):
             subset_index=subset_index,
             subset_total=subset_total,
             expected_batches=expected_batches,
+            payload_contract=ROUTER_CANDIDATE_CAPTURE_PAYLOAD_CONTRACT,
             phase=phase,
             module_names=sorted(
                 named.full_name for named in subset.values()
@@ -2933,6 +2916,7 @@ class EXL3Processor(LoopProcessor):
                     device="meta",
                 )
             bias = getattr(source_module, "bias", None)
+            checkpoint_includes_bias = "bias" in tensors
             if bias is not None:
                 if getattr(bias, "is_meta", False):
                     raise RuntimeError(
@@ -2955,14 +2939,27 @@ class EXL3Processor(LoopProcessor):
                 tensors=tensors,
             )
             if materialize_device is None:
-                # Preserve scalar multiplier values before Accelerate turns
-                # every packed buffer into a META tensor.
+                # Preserve scalar multiplier values before replacing every
+                # packed buffer with META storage. The saver streams directly
+                # from the already authenticated projection checkpoint, so a
+                # complete run does not create a second packed-weight copy.
                 packed.tensor_storage = packed.tensor_storage_entry()
-                offload_to_disk(
-                    model=model.model,
-                    module=packed,
-                    disk_path=offload_path,
-                )
+                if bias is None or checkpoint_includes_bias:
+                    offload_to_safetensors_reference(
+                        model=model.model,
+                        module=packed,
+                        source_path=checkpoint_store.committed_tensor_path(
+                            request_sha256
+                        ),
+                        disk_path=offload_path,
+                        module_name=module_name,
+                    )
+                else:
+                    offload_to_disk(
+                        model=model.model,
+                        module=packed,
+                        disk_path=offload_path,
+                    )
             else:
                 target_device = torch.device(materialize_device)
                 if target_device.type == "cpu":
@@ -3119,6 +3116,12 @@ class EXL3Processor(LoopProcessor):
             raise RuntimeError(
                 f"EXL3 restored layer {layer_index} contains no projections"
             )
+        checkpoint_root = checkpoint_root_from_provenance(
+            self._ledger_provenance()
+        )
+        if checkpoint_root is None:
+            raise RuntimeError("EXL3 layer restore requires projection checkpoints")
+        checkpoint_store = EXL3ProjectionCheckpointStore(checkpoint_root)
         for entry in entries:
             module_name = entry["module"]
             packed = model.model.get_submodule(module_name)
@@ -3127,11 +3130,22 @@ class EXL3Processor(LoopProcessor):
                     f"EXL3 restored layer target is not packed: `{module_name}`"
                 )
             packed.tensor_storage = packed.tensor_storage_entry()
-            offload_to_disk(
-                model=model.model,
-                module=packed,
-                disk_path=offload_path,
-            )
+            if getattr(packed, "bias", None) is None:
+                offload_to_safetensors_reference(
+                    model=model.model,
+                    module=packed,
+                    source_path=checkpoint_store.committed_tensor_path(
+                        entry["request_sha256"]
+                    ),
+                    disk_path=offload_path,
+                    module_name=module_name,
+                )
+            else:
+                offload_to_disk(
+                    model=model.model,
+                    module=packed,
+                    disk_path=offload_path,
+                )
 
     def finalize(self, model: BaseQModel, **kwargs):
         """Marks the model as EXL3-quantized and runs shared finalization logic."""

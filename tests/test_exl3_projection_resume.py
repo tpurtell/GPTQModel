@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
-import threading
 
 import pytest
 import torch
@@ -593,10 +594,18 @@ def test_restore_completed_layer_installs_packed_modules_without_hessian(
         for entry in entries
     ]
     assert all(isinstance(module, ExllamaV3Linear) for module in restored)
-    assert all(hasattr(module, "_hf_hook") for module in restored)
+    assert all(module.trellis.device.type == "meta" for module in restored)
+    assert all(not hasattr(module, "_hf_hook") for module in restored)
     assert len(processor.log) == 6
     assert all(stat["exl3_layer_boundary_restore"] for stat in processor.log)
-    assert len(list(offload_root.rglob("module.safetensors"))) == 6
+    assert len(list(offload_root.rglob("index.json"))) == 6
+    assert not list(offload_root.rglob("module.safetensors"))
+    for index_path in offload_root.rglob("index.json"):
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        assert all(
+            Path(entry["safetensors_file"]).is_relative_to(checkpoint_root)
+            for entry in index.values()
+        )
 
     # A metadata-only EXL3 shell is a deferred target, not a live duplicate.
     # Publication may materialize it again from the same checkpoints.

@@ -256,6 +256,14 @@ class EXL3ProjectionCheckpointStore:
             prefix / f"{request_sha256}.safetensors",
         )
 
+    def committed_tensor_path(self, request_sha256: str) -> Path:
+        """Return the regular tensor path for an already-validated checkpoint."""
+
+        _manifest_path, tensor_path = self._paths(request_sha256)
+        if not tensor_path.is_file() or tensor_path.is_symlink():
+            raise ValueError("EXL3 checkpoint tensor path is not a regular file")
+        return tensor_path.resolve(strict=True)
+
     def inspect_committed_manifests(
         self,
     ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:

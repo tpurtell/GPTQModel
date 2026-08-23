@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import collections
 import functools
+import hashlib
 import json
 import math
 import operator
@@ -192,6 +193,7 @@ class OffloadTensorRef:
     format: str  # 'dat' or 'safetensors'
     weight_name: Optional[str] = None
     data_offsets: Optional[Tuple[int, int]] = None
+    sha256: Optional[str] = None
 
     @property
     def num_bytes(self) -> int:
@@ -1670,6 +1672,7 @@ def _resolve_offload_entry(
             format="safetensors",
             weight_name=entry.get("weight_name", leaf),
             data_offsets=offsets,
+            sha256=entry.get("sha256"),
         )
 
     filename = entry.get("filename")
@@ -1679,7 +1682,7 @@ def _resolve_offload_entry(
         end = start + (_torch_dtype_num_bytes(resolved_dtype) * math.prod(shape or (1,)))
         return OffloadTensorRef(
             path=os.path.abspath(path),
-            dtype=resolved_dtype,
+            torch_dtype=resolved_dtype,
             shape=shape,
             format="dat",
             weight_name=None,
@@ -1805,7 +1808,13 @@ def get_state_dict_for_save(
     for name, entry in state_dict.items():
         source = entry.source
         if isinstance(source, OffloadTensorRef):
-            key = ("offload", source.path, source.weight_name or name, source.data_offsets)
+            key = (
+                "offload",
+                source.path,
+                source.weight_name or name,
+                source.data_offsets,
+                source.sha256,
+            )
         elif isinstance(source, torch.Tensor):
             tensor = source
             if getattr(tensor, "is_meta", False) or tensor.device.type == "meta":
@@ -1929,7 +1938,20 @@ _STREAM_BUFFER_SIZE = 32 * 1024 * 1024
 _STREAM_BUFFER = memoryview(bytearray(_STREAM_BUFFER_SIZE))
 _STREAM_BUFFER_LOCK = threading.Lock()
 
-def _copy_file_stream(src_path: str, dst_fh, length: int, *, offset: int = 0) -> None:
+def _copy_file_stream(
+    src_path: str,
+    dst_fh,
+    length: int,
+    *,
+    offset: int = 0,
+    expected_sha256: str | None = None,
+) -> None:
+    if expected_sha256 is not None and (
+        len(expected_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha256)
+    ):
+        raise ValueError(f"Invalid source tensor SHA-256 for {src_path}")
+    digest = hashlib.sha256() if expected_sha256 is not None else None
     with ctx(open(src_path, "rb", buffering=0), _STREAM_BUFFER_LOCK) as (src, _):
         if offset:
             src.seek(offset)
@@ -1940,7 +1962,11 @@ def _copy_file_stream(src_path: str, dst_fh, length: int, *, offset: int = 0) ->
             if not read:
                 raise IOError(f"Unexpected EOF while copying from {src_path}")
             dst_fh.write(_STREAM_BUFFER[:read])
+            if digest is not None:
+                digest.update(_STREAM_BUFFER[:read])
             remaining -= read
+    if digest is not None and digest.hexdigest() != expected_sha256:
+        raise IOError(f"Source tensor content digest differs for {src_path}")
 
 
 def _write_tensor_bytes(out, tensor: torch.Tensor, dtype: torch.dtype) -> None:
@@ -1991,11 +2017,23 @@ def _write_shard_file(path: str, entries: List[TensorSource], metadata: Dict[str
                     start = 0
                     if source.data_offsets is not None:
                         start = source.data_offsets[0]
-                    _copy_file_stream(source.path, out, entry.num_bytes, offset=start)
+                    _copy_file_stream(
+                        source.path,
+                        out,
+                        entry.num_bytes,
+                        offset=start,
+                        expected_sha256=source.sha256,
+                    )
                 elif source.format == "safetensors" and source.data_offsets is not None:
                     # print("offload tensor io buffered transfer SAFETENSOR stream")
                     start, end = source.data_offsets
-                    _copy_file_stream(source.path, out, end - start, offset=start)
+                    _copy_file_stream(
+                        source.path,
+                        out,
+                        end - start,
+                        offset=start,
+                        expected_sha256=source.sha256,
+                    )
                 else:
                     # print("offload tensor slow tensor read")
                     with safe_open(source.path, framework="pt", device="cpu") as handler:

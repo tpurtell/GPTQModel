@@ -106,6 +106,7 @@ class EXL3CaptureBatchSpool:
         subset_index: int,
         subset_total: int,
         expected_batches: int,
+        payload_contract: str,
         phase: str,
         module_names: list[str],
         provenance: dict[str, Any],
@@ -115,6 +116,8 @@ class EXL3CaptureBatchSpool:
             layer_index < 0
             or not 0 <= subset_index < subset_total
             or expected_batches <= 0
+            or not isinstance(payload_contract, str)
+            or not payload_contract
             or phase not in {"gate-up", "down"}
             or not module_names
             or len(module_names) != len(set(module_names))
@@ -129,6 +132,7 @@ class EXL3CaptureBatchSpool:
             "subset_index": int(subset_index),
             "subset_total": int(subset_total),
             "expected_batches": int(expected_batches),
+            "payload_contract": payload_contract,
             "phase": phase,
             "module_names": sorted(module_names),
             "provenance": json.loads(json.dumps(provenance, sort_keys=True)),
@@ -148,6 +152,7 @@ class EXL3CaptureBatchSpool:
         if self.directory.is_symlink():
             raise EXL3CaptureBatchSpoolError("capture spool entry is a symlink")
         self._restore()
+        self._prune_obsolete_identities()
 
     @property
     def phase(self) -> str:
@@ -247,6 +252,29 @@ class EXL3CaptureBatchSpool:
             changed = True
         if changed:
             _fsync_directory(self.directory)
+
+    def _prune_obsolete_identities(self) -> None:
+        """Drop scratch records that cannot satisfy the active capture key."""
+
+        changed = False
+        for path in self.root.iterdir():
+            match = _DIRECTORY.fullmatch(path.name)
+            if match is None or path == self.directory:
+                continue
+            if (
+                int(match.group("layer")) != self.key["layer_index"]
+                or int(match.group("subset")) != self.key["subset_index"]
+                or int(match.group("total")) != self.key["subset_total"]
+            ):
+                continue
+            if not path.is_dir() or path.is_symlink():
+                raise EXL3CaptureBatchSpoolError(
+                    "obsolete capture spool identity is unsafe"
+                )
+            shutil.rmtree(path)
+            changed = True
+        if changed:
+            _fsync_directory(self.root)
 
     def commit(
         self,

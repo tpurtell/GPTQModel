@@ -19,6 +19,7 @@ def _open(tmp_path):
         subset_index=0,
         subset_total=2,
         expected_batches=3,
+        payload_contract="test.exl3-capture-payload-v1",
         phase="gate-up",
         module_names=["model.layers.4.mlp.experts.0.gate_proj"],
         provenance={"plan_sha256": "a" * 64},
@@ -81,3 +82,23 @@ def test_capture_batch_spool_rejects_identity_drift(tmp_path) -> None:
     progress_path.write_text(json.dumps(progress))
     with pytest.raises(EXL3CaptureBatchSpoolError, match="identity differs"):
         _open(tmp_path)
+
+
+def test_capture_batch_spool_payload_contract_changes_storage_identity(tmp_path) -> None:
+    original = _open(tmp_path)
+    replacement = EXL3CaptureBatchSpool(
+        tmp_path / "spool",
+        layer_index=4,
+        subset_index=0,
+        subset_total=2,
+        expected_batches=3,
+        payload_contract="test.exl3-capture-payload-v2",
+        phase="gate-up",
+        module_names=["model.layers.4.mlp.experts.0.gate_proj"],
+        provenance={"plan_sha256": "a" * 64},
+        ownership={"0": "cuda:0"},
+    )
+
+    assert replacement.directory != original.directory
+    assert replacement.committed_indices == frozenset()
+    assert not original.directory.exists()

@@ -3969,6 +3969,38 @@ class EXL3Config(PreProcessorConfig):
         out["calibration"] = self.calibration
         out["module_include"] = self.module_include
 
+    def to_dict(self):
+        """Serialize portable EXL3 checkpoint metadata.
+
+        Quantization-time offload paths, placement policy, and worker-lifecycle
+        controls describe the machine that produced the checkpoint; they are
+        neither needed nor safe to replay when the checkpoint is loaded
+        elsewhere.  Keep method and calibration provenance in ``meta`` while
+        removing those execution-only values from the saved artifact.
+        """
+
+        out = super().to_dict()
+        meta_payload = out.get(META_FIELD)
+        if isinstance(meta_payload, dict):
+            for key in (
+                "offload_to_disk",
+                "offload_to_disk_path",
+                "pack_impl",
+                "gc_mode",
+                "wait_for_submodule_finalizers",
+                "auto_forward_data_parallel",
+                "dense_vram_strategy",
+                "dense_vram_strategy_devices",
+                "moe_vram_strategy",
+                "moe_vram_strategy_devices",
+                "weight_only",
+            ):
+                meta_payload.pop(key, None)
+            if not meta_payload:
+                out.pop(META_FIELD, None)
+
+        return out
+
     def module_is_included(self, module_name: str) -> bool:
         """Return whether a module passes the positive EXL3 allowlist."""
 

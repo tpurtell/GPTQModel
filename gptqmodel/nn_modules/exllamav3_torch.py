@@ -281,9 +281,9 @@ class ExllamaV3TorchLinear(nn.Module):
         self._inner_weight_fp32 = None
         self._weight_fp32 = None
 
-    def _apply(self, fn):
+    def _apply(self, fn, recurse=True):
         self._drop_cache()
-        return super()._apply(fn)
+        return super()._apply(fn, recurse=recurse)
 
     def post_init(self) -> None:
         self._drop_cache()

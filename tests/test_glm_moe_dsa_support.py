@@ -7,11 +7,14 @@ import torch
 from defuser import convert_model
 from safetensors.torch import save_file
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
-from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
+from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+    GlmMoeDsaForCausalLM,
+)
 
 from gptqmodel.models import auto
 from gptqmodel.models.definitions.glm_moe_dsa import GlmMoeDsaQModel
 from gptqmodel.models.definitions.deepseek_v4 import DeepSeekV4MTPQuantizationModel
+from gptqmodel.utils.exl3_router_candidates import learned_router_ranked_choices
 from gptqmodel.utils.structure import LazyTurtle, alias_from_turtle_for_submodule
 
 
@@ -206,6 +209,31 @@ def test_glm_moe_dsa_tiny_model_matches_definition():
     assert hasattr(expert0, "gate_proj")
     assert hasattr(expert0, "up_proj")
     assert hasattr(expert0, "down_proj")
+
+
+def test_glm_moe_dsa_binds_exact_router_recovery_ranking():
+    config = _tiny_glm_moe_dsa_config()
+    model = GlmMoeDsaForCausalLM(config).eval()
+    model_def = GlmMoeDsaQModel.__new__(GlmMoeDsaQModel)
+    assert model_def.after_model_load(model) is model
+
+    router = model.model.layers[3].mlp.gate
+    hidden = torch.randn(11, config.hidden_size)
+    with torch.no_grad():
+        logits, _weights, indices = router(hidden)
+        ranked_scores, ranked_indices = learned_router_ranked_choices(
+            router,
+            logits,
+            rank_max=config.n_routed_experts,
+            selected_indices=indices,
+        )
+
+    assert ranked_scores.shape == (11, config.n_routed_experts)
+    assert ranked_indices.shape == (11, config.n_routed_experts)
+    assert torch.equal(
+        torch.sort(ranked_indices[:, : config.num_experts_per_tok], dim=-1).values,
+        torch.sort(indices, dim=-1).values,
+    )
 
 
 def test_glm_moe_dsa_replay_propagates_topk_indices_to_shared_indexer_layer():

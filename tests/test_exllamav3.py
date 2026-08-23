@@ -93,6 +93,48 @@ def test_exllamav3_integer_and_dynamic_bits_round_trip():
     )
 
 
+def test_exllamav3_config_serialization_omits_machine_local_execution_state():
+    provenance = {
+        "family_join": {
+            "schema_version": 1,
+            "inventory_sha256": "a" * 64,
+        }
+    }
+    cfg = EXL3Config(
+        bits=3.0,
+        offload_to_disk=True,
+        offload_to_disk_path="/private/quant/offload",
+        pack_impl="gpu",
+        wait_for_submodule_finalizers=True,
+        auto_forward_data_parallel=False,
+        dense_vram_strategy="balanced",
+        dense_vram_strategy_devices=["cuda:0", "cuda:1"],
+        moe_vram_strategy="balanced",
+        moe_vram_strategy_devices=["cuda:0", "cuda:1"],
+        meta={
+            "ds4rt_error_ledger": provenance,
+            "quantizer": "gptqmodel-pinned",
+        },
+    )
+
+    payload = cfg.to_dict()
+    assert payload["meta"]["ds4rt_error_ledger"] == provenance
+    assert payload["meta"]["quantizer"] == "gptqmodel-pinned"
+    assert not {
+        "offload_to_disk",
+        "offload_to_disk_path",
+        "pack_impl",
+        "gc_mode",
+        "wait_for_submodule_finalizers",
+        "auto_forward_data_parallel",
+        "dense_vram_strategy",
+        "dense_vram_strategy_devices",
+        "moe_vram_strategy",
+        "moe_vram_strategy_devices",
+        "weight_only",
+    }.intersection(payload["meta"])
+
+
 def test_exllamav3_config_accepts_and_round_trips_auto_module_decoder():
     cfg = EXL3Config(
         bits=2.0,
@@ -196,6 +238,26 @@ def test_replace_exllamav3_placeholders_supports_torch_reference_kernel():
 
     assert isinstance(model.proj, ExllamaV3TorchLinear)
     assert build_exllamav3_tensor_storage(model)["proj"]["quant_format"] == "exl3"
+
+
+@pytest.mark.parametrize("module_cls", [ExllamaV3Linear, ExllamaV3TorchLinear])
+def test_exllamav3_modules_support_recursive_to_empty(module_cls):
+    module = module_cls.from_tensors(
+        in_features=16,
+        out_features=16,
+        name="proj",
+        tensors={
+            "trellis": torch.zeros((1, 1, 32), dtype=torch.int16),
+            "suh": torch.zeros(16, dtype=torch.float16),
+            "svh": torch.zeros(16, dtype=torch.float16),
+        },
+    )
+
+    module.to_empty(device=torch.device("meta"), recurse=True)
+
+    assert module.trellis.device.type == "meta"
+    assert module.suh.device.type == "meta"
+    assert module.svh.device.type == "meta"
 
 
 def test_detect_format_identifies_exllamav3(tmp_path):

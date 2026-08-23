@@ -155,9 +155,9 @@ class ExllamaV3Linear(nn.Module):
         if getattr(self, "trellis", None) is not None and self.trellis.device.type != "meta":
             self._ensure_inner()
 
-    def _apply(self, fn):
+    def _apply(self, fn, recurse=True):
         self._drop_inner()
-        return super()._apply(fn)
+        return super()._apply(fn, recurse=recurse)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         inner = self._ensure_inner()

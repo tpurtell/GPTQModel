@@ -25,6 +25,7 @@ from ...utils.exl3_error_ledger import (
     ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
     zero_route_recovery_recipe,
 )
+from ...utils.exl3_router_candidates import learned_router_ranked_choices
 
 
 MTP_BLOCK_COUNT = 3
@@ -2457,19 +2458,18 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             if keep_mask is not None:
                 expert_input = expert_input[keep_mask]
                 logits = logits[keep_mask]
-            correction = getattr(router, "e_score_correction_bias", None)
-            if not isinstance(correction, torch.Tensor):
+            selected_indices = output[2]
+            if not isinstance(selected_indices, torch.Tensor):
                 raise RuntimeError(
-                    "DeepSeek V4 recovery requires the learned-router correction bias"
+                    "DeepSeek V4 recovery router indices are invalid"
                 )
-            scores = router.score_fn(logits.float())
-            choice_scores = scores + correction.float()
-            ranked_scores, ranked_indices = torch.topk(
-                choice_scores,
-                candidate_rank_max,
-                dim=-1,
-                largest=True,
-                sorted=True,
+            if keep_mask is not None:
+                selected_indices = selected_indices[keep_mask]
+            ranked_scores, ranked_indices = learned_router_ranked_choices(
+                router,
+                logits,
+                rank_max=candidate_rank_max,
+                selected_indices=selected_indices,
             )
             boundary = ranked_scores[:, router_top_k - 1]
             for expert_index in sorted(targets):
@@ -2509,7 +2509,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     retained_by_rank[expert_index][rank] += int(
                         row_indices.numel()
                     )
-            del ranked_scores, ranked_indices, boundary, choice_scores, scores
+            del ranked_scores, ranked_indices, boundary
 
         def finish_router_candidates() -> None:
             if pending_ffn_input is not None or pending_keep_mask is not None:

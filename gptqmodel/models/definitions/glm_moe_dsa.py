@@ -8,8 +8,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from ..base import BaseQModel
 from ..moe_lifecycle import GateUpDownMoELifecycleHooks
+from ...utils.exl3_router_candidates import bind_sigmoid_grouped_router_recovery
 from ...utils.model import move_to
 
 
@@ -64,6 +67,34 @@ class GlmMoeDsaQModel(BaseQModel):
             },
         },
     ]
+
+    def after_model_load(self, model, load_quantized_model=False):
+        """Bind GLM's exact learned-router ranking for EXL3 recovery."""
+
+        del load_quantized_model
+        expected_layers = int(getattr(model.config, "num_hidden_layers", 0))
+        first_routed = int(getattr(model.config, "first_k_dense_replace", 0))
+        expected_routers = expected_layers - first_routed
+        if expected_layers <= 0 or not 0 < expected_routers <= expected_layers:
+            raise RuntimeError("GLM learned-router coverage geometry is invalid")
+
+        patched = 0
+        for name, module in model.named_modules():
+            if not name.endswith(".mlp.gate"):
+                continue
+            correction = getattr(module, "e_score_correction_bias", None)
+            if not isinstance(correction, torch.Tensor):
+                continue
+            if int(getattr(module, "top_k", 0)) <= 0:
+                raise RuntimeError(f"GLM learned router `{name}` has no top-k")
+            bind_sigmoid_grouped_router_recovery(module)
+            patched += 1
+        if patched != expected_routers:
+            raise RuntimeError(
+                "GLM learned-router recovery coverage mismatch: "
+                f"patched={patched} expected={expected_routers}"
+            )
+        return model
 
     def configure_base_replay_store(
         self,
