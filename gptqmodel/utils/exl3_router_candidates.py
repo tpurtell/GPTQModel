@@ -15,7 +15,7 @@ RECOVERY_SCORE_FN_ATTR = "_gptqmodel_recovery_score_fn"
 RECOVERY_GROUP_POLICY_ATTR = "_gptqmodel_recovery_group_policy"
 RECOVERY_GROUP_POLICY_CONTRACT = "gptqmodel.learned-router-group-policy-v1"
 ROUTER_CANDIDATE_CAPTURE_PAYLOAD_CONTRACT = (
-    "gptqmodel.exl3-router-candidate-capture-v2"
+    "gptqmodel.exl3-router-candidate-capture-v3"
 )
 
 
