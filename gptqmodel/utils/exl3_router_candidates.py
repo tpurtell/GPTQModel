@@ -112,21 +112,6 @@ def learned_router_ranked_choices(
         router,
         scores + correction,
     )
-    ranked_scores, ranked_indices = torch.topk(
-        choice_scores,
-        rank_max,
-        dim=-1,
-        largest=True,
-        sorted=True,
-    )
-    if not bool(
-        (scores_are_finite & torch.isfinite(ranked_scores[:, -1]).all()).item()
-    ):
-        raise RuntimeError(
-            "EXL3 learned-router scores are non-finite or the group policy "
-            "exposes fewer experts than rank_max"
-        )
-
     if selected_indices is not None:
         if (
             not isinstance(selected_indices, torch.Tensor)
@@ -138,18 +123,79 @@ def learned_router_ranked_choices(
             raise RuntimeError(
                 "EXL3 learned-router selected indices have invalid geometry"
             )
+        selected_indices = selected_indices.to(device=choice_scores.device)
+        selected_count = selected_indices.shape[1]
         expected = torch.sort(
-            ranked_indices[:, : selected_indices.shape[1]].to(torch.int64),
+            torch.topk(
+                choice_scores,
+                selected_count,
+                dim=-1,
+                largest=True,
+                sorted=False,
+            ).indices.to(torch.int64),
             dim=-1,
         ).values
         actual = torch.sort(
-            selected_indices.to(device=expected.device),
+            selected_indices,
             dim=-1,
         ).values
         if not torch.equal(expected, actual):
             raise RuntimeError(
                 "EXL3 recovery ranking does not reproduce the live router top-k"
             )
+
+        # ``torch.topk`` does not promise nested selections when ``k`` changes
+        # at a tied boundary. The live router's exact top-k is authoritative;
+        # rank only the remaining experts to obtain adjacent recovery choices.
+        # Sorting the selected prefix is harmless because recovery starts at
+        # top_k + 1, while its final score supplies the live selection boundary.
+        selected_scores = choice_scores.gather(1, selected_indices)
+        selected_scores, selected_order = torch.sort(
+            selected_scores,
+            dim=-1,
+            descending=True,
+        )
+        selected_indices = selected_indices.gather(1, selected_order)
+        candidate_count = rank_max - selected_count
+        if candidate_count:
+            remaining_scores = choice_scores.clone()
+            remaining_scores.scatter_(
+                1,
+                selected_indices,
+                float("-inf"),
+            )
+            candidate_scores, candidate_indices = torch.topk(
+                remaining_scores,
+                candidate_count,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            )
+            ranked_scores = torch.cat(
+                (selected_scores, candidate_scores), dim=-1
+            )
+            ranked_indices = torch.cat(
+                (selected_indices, candidate_indices), dim=-1
+            )
+        else:
+            ranked_scores = selected_scores
+            ranked_indices = selected_indices
+    else:
+        ranked_scores, ranked_indices = torch.topk(
+            choice_scores,
+            rank_max,
+            dim=-1,
+            largest=True,
+            sorted=True,
+        )
+
+    if not bool(
+        (scores_are_finite & torch.isfinite(ranked_scores[:, -1]).all()).item()
+    ):
+        raise RuntimeError(
+            "EXL3 learned-router scores are non-finite or the group policy "
+            "exposes fewer experts than rank_max"
+        )
 
     return ranked_scores, ranked_indices
 

@@ -9,9 +9,15 @@ from gptqmodel.utils.exl3_router_candidates import (
 
 
 class _Router(nn.Module):
-    def __init__(self, *, groups: int = 1, topk_groups: int = 1) -> None:
+    def __init__(
+        self,
+        *,
+        experts: int = 8,
+        groups: int = 1,
+        topk_groups: int = 1,
+    ) -> None:
         super().__init__()
-        self.register_buffer("e_score_correction_bias", torch.zeros(8))
+        self.register_buffer("e_score_correction_bias", torch.zeros(experts))
         self.num_group = groups
         self.topk_group = topk_groups
 
@@ -89,3 +95,27 @@ def test_learned_router_ranking_rejects_non_integer_live_indices() -> None:
             rank_max=8,
             selected_indices=torch.tensor([[6.0, 7.0]]),
         )
+
+
+def test_live_topk_is_authoritative_across_tied_candidate_widths() -> None:
+    router = _Router(experts=256)
+    bind_sigmoid_grouped_router_recovery(router)
+    logits = torch.zeros((1, 256), dtype=torch.float32)
+    live = torch.topk(
+        torch.sigmoid(logits),
+        k=2,
+        dim=-1,
+        sorted=False,
+    ).indices
+
+    _scores, indices = learned_router_ranked_choices(
+        router,
+        logits,
+        rank_max=4,
+        selected_indices=live,
+    )
+
+    assert set(indices[0, :2].tolist()) == set(live[0].tolist())
+    assert not set(indices[0, :2].tolist()).intersection(
+        indices[0, 2:].tolist()
+    )
