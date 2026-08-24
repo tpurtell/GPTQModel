@@ -53,6 +53,9 @@ ZERO_ROUTE_RECOVERY_AUTHORIZATION_KINDS = {
     "content-bound-execution-upgrade",
 }
 ZERO_ROUTE_RECOVERY_RECIPE_KEY = "zero_route_recovery_recipe"
+PROJECTION_PROVENANCE_COMPACTION_CONTRACT = (
+    "gptqmodel.exl3-projection-provenance-compaction-v1"
+)
 
 _BASE_EXPERT = re.compile(
     r"^(?:model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\."
@@ -101,6 +104,90 @@ def _canonical_json_bytes(value: Any) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def compact_projection_provenance(
+    provenance: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Replace repeated recovery inventories with their content identities.
+
+    A resumed run can carry a complete seed-file inventory in its run
+    provenance. Repeating that inventory in every projection record is
+    quadratic publication metadata, even though ``inventory_sha256`` already
+    binds the exact list. Keep the auditable counts, byte total, source root,
+    and digests while removing only the repeated list and duplicate family
+    join. Older checkpoint records remain valid and can be normalized only
+    when they are emitted into the final artifact ledger.
+    """
+
+    if provenance is None:
+        return None
+    clean = _finite_json_value(provenance, "provenance")
+    if not isinstance(clean, dict):
+        raise TypeError("EXL3 projection provenance must be a mapping")
+    run = clean.get("run")
+    if not isinstance(run, dict):
+        return clean
+    seed = run.get("projection_checkpoint_seed")
+    if not isinstance(seed, dict):
+        return clean
+    if (
+        seed.get("provenance_compaction_contract")
+        == PROJECTION_PROVENANCE_COMPACTION_CONTRACT
+    ):
+        return clean
+
+    files = seed.get("files")
+    seed_family_join = seed.get("family_join")
+    if files is None and seed_family_join is None:
+        return clean
+    summary = {
+        key: deepcopy(seed[key])
+        for key in (
+            "contract",
+            "root",
+            "checkpoint_count",
+            "total_bytes",
+            "inventory_sha256",
+        )
+        if key in seed
+    }
+    summary["provenance_compaction_contract"] = (
+        PROJECTION_PROVENANCE_COMPACTION_CONTRACT
+    )
+    if files is not None:
+        files_sha256 = hashlib.sha256(_canonical_json_bytes(files)).hexdigest()
+        inventory_sha256 = seed.get("inventory_sha256")
+        if inventory_sha256 is not None and inventory_sha256 != files_sha256:
+            raise ValueError(
+                "EXL3 projection checkpoint seed inventory digest differs"
+            )
+        summary["files_sha256"] = files_sha256
+    if seed_family_join is not None:
+        family_join = clean.get("family_join")
+        if family_join is not None and seed_family_join != family_join:
+            raise ValueError(
+                "EXL3 projection checkpoint seed family join differs"
+            )
+        summary["family_join_sha256"] = hashlib.sha256(
+            _canonical_json_bytes(seed_family_join)
+        ).hexdigest()
+    run["projection_checkpoint_seed"] = summary
+    return clean
+
+
+def compact_projection_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return one unbound projection record with compact run provenance."""
+
+    if not isinstance(record, dict):
+        raise TypeError("EXL3 projection record must be a mapping")
+    clean = dict(record)
+    clean.pop("record_sha256", None)
+    if "provenance" in clean:
+        clean["provenance"] = compact_projection_provenance(
+            clean.get("provenance")
+        )
+    return _finite_json_value(clean)
 
 
 def routed_expert_identity(module_full_name: str) -> dict[str, Any] | None:
@@ -528,6 +615,7 @@ def build_projection_record(
     provenance: dict[str, Any] | None,
     route_evidence: dict[str, Any] | None = None,
     zero_route_recovery: dict[str, Any] | None = None,
+    compact_provenance: bool = True,
 ) -> dict[str, Any]:
     """Construct one projection record without discarding raw error terms."""
 
@@ -544,7 +632,11 @@ def build_projection_record(
         "encoded_bytes": int(encoded_bytes),
         "devices": [str(device) for device in device_names],
         "quantizer_metrics": deepcopy(quantizer_metrics),
-        "provenance": deepcopy(provenance) if provenance is not None else None,
+        "provenance": (
+            compact_projection_provenance(provenance)
+            if compact_provenance
+            else deepcopy(provenance) if provenance is not None else None
+        ),
     }
     identity = routed_expert_identity(module_full_name)
     if identity is not None:
@@ -858,7 +950,7 @@ def write_exl3_error_ledger(
     """Atomically persist projections, family joins, and a digest manifest."""
 
     projections = [
-        _finite_json_value(record)
+        compact_projection_record(record)
         for record in projection_records
         if record.get("record_kind") == "projection"
         and record.get("schema") == LEDGER_SCHEMA
@@ -868,17 +960,33 @@ def write_exl3_error_ledger(
         return None
 
     families = derive_family_records(projections)
-    records = [_bind_record(record) for record in projections + families]
+    records = projections + families
     records.sort(key=_record_sort_key)
-    ledger_payload = b"".join(
-        _canonical_json_bytes(record) + b"\n" for record in records
-    )
-    ledger_sha256 = hashlib.sha256(ledger_payload).hexdigest()
 
     save_path = Path(save_dir)
     ledger_path = save_path / LEDGER_FILENAME
     manifest_path = save_path / LEDGER_MANIFEST_FILENAME
-    _atomic_write(ledger_path, ledger_payload)
+    save_path.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{ledger_path.name}.", dir=save_path
+    )
+    ledger_digest = hashlib.sha256()
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            for record in records:
+                payload = _canonical_json_bytes(_bind_record(record)) + b"\n"
+                handle.write(payload)
+                ledger_digest.update(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, ledger_path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+    ledger_sha256 = ledger_digest.hexdigest()
 
     manifest = {
         "schema": LEDGER_SCHEMA,
@@ -899,6 +1007,7 @@ __all__ = [
     "LEDGER_MANIFEST_FILENAME",
     "LEDGER_SCHEMA",
     "LEDGER_SCHEMA_VERSION",
+    "PROJECTION_PROVENANCE_COMPACTION_CONTRACT",
     "ROUTE_EVIDENCE_SCHEMA",
     "ROUTE_EVIDENCE_SCHEMA_VERSION",
     "ZERO_ROUTE_RECOVERY_CAPTURE_METHOD",
@@ -920,6 +1029,8 @@ __all__ = [
     "ZERO_ROUTE_RECOVERY_TRIGGER",
     "append_exl3_error_journal",
     "build_projection_record",
+    "compact_projection_provenance",
+    "compact_projection_record",
     "derive_family_records",
     "route_evidence_required",
     "routed_expert_identity",

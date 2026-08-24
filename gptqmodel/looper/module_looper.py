@@ -1762,27 +1762,27 @@ class ModuleLooper():
                    .subtitle("")
         )
         process_finalize_pb.draw()
+        emit_finalize_records = os.getenv(
+            "GPTQMODEL_LOG_FINALIZE_RECORDS", "0"
+        ).strip().lower() not in {"", "0", "false", "no", "off"}
 
         try:
             for index, reverse_p in enumerate(reversed_processors, start=1):
                 # Finalize processors in reverse order
                 self._check_loop_stop()
-                if isinstance(reverse_p, GPTQProcessor):
-                    pass
-                elif isinstance(reverse_p, EoraProcessor):
-                    pass
-                elif isinstance(reverse_p, DequantizeProcessor):
-                    pass
-                else:
-                    log.info(f"{reverse_p.name()} summary:\n{reverse_p.log}")
-
                 processor_name = reverse_p.name()
+                log.info(
+                    "%s processor finalizing with %s module records",
+                    processor_name,
+                    len(reverse_p.log),
+                )
                 total_log[processor_name] = reverse_p.log
                 if processor_name in ["gptq", "gptq v2", "awq", "exl3"]:
                     self.gptq_model.quant_log = reverse_p.log
 
-                for module_log in reverse_p.log:
-                    log.info(module_log)
+                if emit_finalize_records:
+                    for module_log in reverse_p.log:
+                        log.info(module_log)
                 reverse_p.log_plotly()
 
                 finalize_start = time.perf_counter() if region_timer is not None else None

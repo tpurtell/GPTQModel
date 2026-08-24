@@ -11,6 +11,7 @@ from gptqmodel.utils import exl3_error_ledger as ledger_module
 from gptqmodel.utils.exl3_error_ledger import (
     LEDGER_FILENAME,
     LEDGER_MANIFEST_FILENAME,
+    PROJECTION_PROVENANCE_COMPACTION_CONTRACT,
     ROUTE_EVIDENCE_SCHEMA,
     ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
     ZERO_ROUTE_RECOVERY_CANDIDATE_RANK_MAX,
@@ -28,6 +29,8 @@ from gptqmodel.utils.exl3_error_ledger import (
     ZERO_ROUTE_RECOVERY_TRIGGER,
     append_exl3_error_journal,
     build_projection_record,
+    compact_projection_provenance,
+    compact_projection_record,
     derive_family_records,
     routed_expert_identity,
     write_exl3_error_ledger,
@@ -243,6 +246,97 @@ def test_routed_expert_identity_covers_base_and_mtp_namespaces():
         "projection": "w2",
     }
     assert routed_expert_identity("model.layers.7.mlp.shared_experts.up_proj") is None
+
+
+def _seeded_provenance() -> dict:
+    family_join = {"source_revision": "abc", "corpus_sha256": "def"}
+    files = [
+        {"path": "01/23/checkpoint.json", "sha256": "1" * 64},
+        {"path": "45/67/checkpoint.json", "sha256": "2" * 64},
+    ]
+    inventory_sha256 = hashlib.sha256(
+        json.dumps(
+            files,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "family_join": family_join,
+        "run": {
+            "projection_checkpoint": {"root": "/current", "contract": "v1"},
+            "projection_checkpoint_seed": {
+                "contract": "seed-v1",
+                "root": "/seed",
+                "checkpoint_count": 2,
+                "total_bytes": 1234,
+                "inventory_sha256": inventory_sha256,
+                "files": files,
+                "family_join": family_join,
+            },
+        },
+    }
+
+
+def test_projection_provenance_compacts_repeated_seed_inventory_by_digest():
+    provenance = _seeded_provenance()
+    compact = compact_projection_provenance(provenance)
+    seed = compact["run"]["projection_checkpoint_seed"]
+
+    assert "files" not in seed
+    assert "family_join" not in seed
+    assert seed["inventory_sha256"] == provenance["run"][
+        "projection_checkpoint_seed"
+    ]["inventory_sha256"]
+    assert seed["files_sha256"] == seed["inventory_sha256"]
+    assert seed["family_join_sha256"] == hashlib.sha256(
+        json.dumps(
+            provenance["family_join"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert (
+        seed["provenance_compaction_contract"]
+        == PROJECTION_PROVENANCE_COMPACTION_CONTRACT
+    )
+    assert provenance["run"]["projection_checkpoint_seed"]["files"]
+    assert compact_projection_provenance(compact) == compact
+
+
+def test_projection_provenance_rejects_seed_inventory_digest_drift():
+    provenance = _seeded_provenance()
+    provenance["run"]["projection_checkpoint_seed"]["inventory_sha256"] = (
+        "0" * 64
+    )
+    with pytest.raises(ValueError, match="inventory digest differs"):
+        compact_projection_provenance(provenance)
+
+
+def test_projection_record_keeps_legacy_checkpoint_compatibility():
+    provenance = _seeded_provenance()
+    compact = _record("gate_proj", provenance=provenance)
+    legacy = build_projection_record(
+        module_full_name="model.layers.7.mlp.experts.31.gate_proj",
+        layer_index=7,
+        bits=2,
+        codebook="mcg",
+        sample_count=1024,
+        duration_seconds=1.25,
+        encoded_bytes=128,
+        device_names=["cuda:0"],
+        quantizer_metrics=_metrics(1.0),
+        provenance=provenance,
+        compact_provenance=False,
+    )
+
+    assert "files" not in compact["provenance"]["run"][
+        "projection_checkpoint_seed"
+    ]
+    assert legacy["provenance"]["run"]["projection_checkpoint_seed"]["files"]
+    assert compact_projection_record(legacy) == compact
 
 
 def test_zero_route_recovery_recipe_keeps_deepseek_default_and_binds_glm_window():
@@ -658,6 +752,41 @@ def test_ledger_is_canonical_content_bound_and_contains_family_record(tmp_path):
             allow_nan=False,
         ).encode("utf-8")
         assert hashlib.sha256(canonical).hexdigest() == row["record_sha256"]
+
+
+def test_ledger_normalizes_legacy_seed_provenance_before_publication(tmp_path):
+    provenance = _seeded_provenance()
+    records = [
+        build_projection_record(
+            module_full_name=f"model.layers.7.mlp.experts.31.{projection}",
+            layer_index=7,
+            bits=2,
+            codebook="mcg",
+            sample_count=1024,
+            duration_seconds=float(index),
+            encoded_bytes=128,
+            device_names=["cuda:0"],
+            quantizer_metrics=_metrics(float(index)),
+            provenance=provenance,
+            compact_provenance=False,
+        )
+        for index, projection in enumerate(
+            ("gate_proj", "down_proj", "up_proj"), start=1
+        )
+    ]
+
+    write_exl3_error_ledger(tmp_path, records)
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / LEDGER_FILENAME).read_bytes().splitlines()
+    ]
+    for row in rows:
+        if row["record_kind"] != "projection":
+            continue
+        seed = row["provenance"]["run"]["projection_checkpoint_seed"]
+        assert "files" not in seed
+        assert "family_join" not in seed
+        assert seed["files_sha256"] == seed["inventory_sha256"]
 
 
 def test_projection_journal_fsyncs_individually_bound_records(tmp_path):

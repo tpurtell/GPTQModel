@@ -70,6 +70,7 @@ from ..utils.exl3_error_ledger import (
     ZERO_ROUTE_RECOVERY_TRIGGER,
     append_exl3_error_journal,
     build_projection_record,
+    compact_projection_record,
     route_evidence_required,
     routed_expert_identity,
     validate_route_evidence,
@@ -2655,7 +2656,25 @@ class EXL3Processor(LoopProcessor):
                 zero_route_recovery=task_entry.get("zero_route_recovery"),
             )
             if ledger_record != expected_ledger_record:
-                raise ValueError("EXL3 projection checkpoint ledger is inconsistent")
+                legacy_ledger_record = build_projection_record(
+                    module_full_name=module.full_name,
+                    layer_index=module.layer_index,
+                    bits=int(quant_args["K"]),
+                    codebook=module_qcfg.codebook,
+                    sample_count=capture.nsamples,
+                    duration_seconds=duration,
+                    encoded_bytes=encoded_bytes,
+                    device_names=device_names,
+                    quantizer_metrics=quantizer_metrics,
+                    provenance=projection_provenance,
+                    route_evidence=task_entry.get("route_evidence"),
+                    zero_route_recovery=task_entry.get("zero_route_recovery"),
+                    compact_provenance=False,
+                )
+                if ledger_record != legacy_ledger_record:
+                    raise ValueError(
+                        "EXL3 projection checkpoint ledger is inconsistent"
+                    )
             checkpoint_hit = True
 
         if execution_lease is not None and isinstance(execution_slot, RemoteEndpoint):
@@ -2671,6 +2690,7 @@ class EXL3Processor(LoopProcessor):
                 self.error_journal_path,
                 ledger_record,
             )
+        publication_ledger_record = compact_projection_record(ledger_record)
 
         stream_payload = dict(out_tensors)
         if module.bias is not None:
@@ -2708,7 +2728,7 @@ class EXL3Processor(LoopProcessor):
             PROCESS_LOG_FWD_TIME: self.formatted_fwd_time(),
             PROCESS_USED_MEMORY: self.device_memory_report(),
             QUANT_LOG_LOSS_KIND: quantizer_metrics["reported_metric_kind"],
-            "exl3_error_ledger_record": ledger_record,
+            "exl3_error_ledger_record": publication_ledger_record,
             "exl3_error_journal": self.error_journal_path,
             "exl3_error_record_sha256": ledger_record_sha256,
             "exl3_projection_checkpoint": (
@@ -2895,6 +2915,7 @@ class EXL3Processor(LoopProcessor):
             actual_record_sha256 = append_exl3_error_journal(
                 self.error_journal_path, ledger_record
             )
+            publication_ledger_record = compact_projection_record(ledger_record)
             try:
                 source_module = model.model.get_submodule(module_name)
             except AttributeError as error:
@@ -3000,7 +3021,7 @@ class EXL3Processor(LoopProcessor):
                     QUANT_LOG_LOSS_KIND: quantizer_metrics.get(
                         "reported_metric_kind", "unknown"
                     ),
-                    "exl3_error_ledger_record": ledger_record,
+                    "exl3_error_ledger_record": publication_ledger_record,
                     "exl3_error_journal": self.error_journal_path,
                     "exl3_error_record_sha256": actual_record_sha256,
                     "exl3_projection_checkpoint": request_sha256,
