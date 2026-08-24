@@ -10,6 +10,7 @@ import csv
 import json
 import os
 import shutil
+from contextlib import nullcontext
 from os.path import isfile, join
 from typing import Any, Dict, List, Optional, Union
 
@@ -941,13 +942,35 @@ def ModelWriter(cls):
 
         # Due to shell/turtle state, we need to sync the modules from turtle to shell
         if not self.load_quantized_model:
-            alias_all_from_turtle_if_meta(shell_model=self.model, turtle_model=self.turtle_model)
-            materialized_layers = _materialize_meta_layers_from_turtle(self.model, self.turtle_model)
-            if materialized_layers:
-                log.info("Model save: materialized %s meta layer modules from turtle source.", materialized_layers)
-            restored_meta = _materialize_remaining_meta_params_from_turtle(self.model, self.turtle_model)
-            if restored_meta:
-                log.info("Model save: materialized %s remaining meta params from turtle source.", restored_meta)
+            suspend_staging = getattr(
+                self.turtle_model, "suspend_active_source_staging", None
+            )
+            direct_source_scope = (
+                suspend_staging() if callable(suspend_staging) else nullcontext()
+            )
+            with direct_source_scope:
+                alias_all_from_turtle_if_meta(
+                    shell_model=self.model,
+                    turtle_model=self.turtle_model,
+                )
+                materialized_layers = _materialize_meta_layers_from_turtle(
+                    self.model,
+                    self.turtle_model,
+                )
+                if materialized_layers:
+                    log.info(
+                        "Model save: materialized %s meta layer modules from turtle source.",
+                        materialized_layers,
+                    )
+                restored_meta = _materialize_remaining_meta_params_from_turtle(
+                    self.model,
+                    self.turtle_model,
+                )
+                if restored_meta:
+                    log.info(
+                        "Model save: materialized %s remaining meta params from turtle source.",
+                        restored_meta,
+                    )
 
         offload_root = self.quantize_config.offload_to_disk_path if getattr(self.quantize_config, "offload_to_disk", False) else None
         state_dict = get_state_dict_for_save(self.model, offload_root=offload_root)

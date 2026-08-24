@@ -35,6 +35,7 @@ import re
 import shutil
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Dict, Iterable, Optional, Set, Tuple
@@ -870,6 +871,32 @@ class LazyTurtle:
                 raise ValueError("LazyTurtle active source provenance changed")
             self._active_source_root = root
             self._active_source_provenance = copy.deepcopy(provenance)
+
+    @contextmanager
+    def suspend_active_source_staging(self):
+        """Read the authoritative checkpoint directly for one bounded scope.
+
+        Active-source staging is useful while quantization repeatedly accesses
+        one decoder layer, but final serialization walks every retained native
+        tensor exactly once.  Copying each multi-gigabyte source shard into a
+        layer-scoped staging directory during that walk can consume nearly an
+        entire second model's worth of fast storage.  Suspending the cache is
+        safe because the configured checkpoint remains authoritative and the
+        staging tree contains no unique state.
+        """
+
+        with self._lock:
+            root = self._active_source_root
+            self._active_source_root = None
+        try:
+            yield
+        finally:
+            with self._lock:
+                if self._active_source_root is not None:
+                    raise RuntimeError(
+                        "LazyTurtle active source staging changed while suspended"
+                    )
+                self._active_source_root = root
 
     @staticmethod
     def _active_source_scope(module_path: Optional[str]) -> Optional[str]:
