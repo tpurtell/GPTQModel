@@ -930,6 +930,7 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         prefix=f".{path.name}.", dir=path.parent
     )
     try:
+        os.fchmod(descriptor, 0o644)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
@@ -972,6 +973,7 @@ def write_exl3_error_ledger(
     )
     ledger_digest = hashlib.sha256()
     try:
+        os.fchmod(descriptor, 0o644)
         with os.fdopen(descriptor, "wb") as handle:
             for record in records:
                 payload = _canonical_json_bytes(_bind_record(record)) + b"\n"

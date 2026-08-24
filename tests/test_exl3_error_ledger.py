@@ -734,6 +734,8 @@ def test_ledger_is_canonical_content_bound_and_contains_family_record(tmp_path):
     payload = (tmp_path / LEDGER_FILENAME).read_bytes()
     assert hashlib.sha256(payload).hexdigest() == manifest["ledger_sha256"]
     assert json.loads((tmp_path / LEDGER_MANIFEST_FILENAME).read_text()) == manifest
+    assert (tmp_path / LEDGER_FILENAME).stat().st_mode & 0o777 == 0o644
+    assert (tmp_path / LEDGER_MANIFEST_FILENAME).stat().st_mode & 0o777 == 0o644
 
     rows = [json.loads(line) for line in payload.splitlines()]
     assert [row.get("projection", "family") for row in rows] == [
