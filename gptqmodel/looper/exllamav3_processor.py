@@ -209,6 +209,51 @@ def prepare_exl3_hessian(
     return hessian
 
 
+def _router_recovery_candidates(
+    router: Module,
+    logits: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    candidate_rank_min: int,
+    candidate_rank_max: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return adjacent learned-router candidates, or none for hash routing."""
+
+    if hasattr(router, "tid2eid"):
+        rows = indices.shape[0]
+        return (
+            indices.new_empty((rows, 0), dtype=torch.int64),
+            logits.new_empty((rows, 0), dtype=torch.float32),
+        )
+    if not isinstance(
+        getattr(router, "e_score_correction_bias", None), torch.Tensor
+    ):
+        raise RuntimeError(
+            "EXL3 recovery candidate capture requires a learned top-k or hash router"
+        )
+    router_top_k = int(indices.shape[-1])
+    if candidate_rank_min != router_top_k + 1:
+        raise RuntimeError(
+            "EXL3 recovery candidates must start immediately after "
+            f"router top-k: top_k={router_top_k} "
+            f"candidate_rank_min={candidate_rank_min}"
+        )
+    ranked_scores, ranked_indices = learned_router_ranked_choices(
+        router,
+        logits,
+        rank_max=candidate_rank_max,
+        selected_indices=indices,
+    )
+    candidate_indices = ranked_indices[
+        :, candidate_rank_min - 1 : candidate_rank_max
+    ]
+    candidate_score_gaps = (
+        ranked_scores[:, router_top_k - 1 : router_top_k]
+        - ranked_scores[:, candidate_rank_min - 1 : candidate_rank_max]
+    ).float()
+    return candidate_indices, candidate_score_gaps
+
+
 class _EXL3NaturalRouteCapture:
     """Accumulate per-expert exposure during one native-router subset replay."""
 
@@ -357,27 +402,13 @@ class _EXL3NaturalRouteCapture:
                 )
             candidate_rank_min = self.recovery_recipe["candidate_rank_min"]
             candidate_rank_max = self.recovery_recipe["candidate_rank_max"]
-            router_top_k = int(indices.shape[-1])
-            if candidate_rank_min != router_top_k + 1:
-                raise RuntimeError(
-                    "EXL3 recovery candidates must start immediately after "
-                    f"router top-k: top_k={router_top_k} "
-                    f"candidate_rank_min={candidate_rank_min}"
-                )
-            ranked_scores, ranked_indices = learned_router_ranked_choices(
+            candidate_indices, candidate_score_gaps = _router_recovery_candidates(
                 self.router,
                 logits,
-                rank_max=candidate_rank_max,
-                selected_indices=indices,
+                indices,
+                candidate_rank_min=candidate_rank_min,
+                candidate_rank_max=candidate_rank_max,
             )
-            candidate_indices = ranked_indices[
-                :, candidate_rank_min - 1 : candidate_rank_max
-            ]
-            candidate_score_gaps = (
-                ranked_scores[:, router_top_k - 1 : router_top_k]
-                - ranked_scores[:, candidate_rank_min - 1 : candidate_rank_max]
-            ).float()
-            del ranked_scores, ranked_indices
             with self._lock:
                 if batch_index in self._batch_payloads:
                     raise RuntimeError("EXL3 router ran twice for one capture batch")

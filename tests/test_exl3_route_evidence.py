@@ -8,7 +8,10 @@ import pytest
 import torch
 from torch import nn
 
-from gptqmodel.looper.exllamav3_processor import EXL3Processor
+from gptqmodel.looper.exllamav3_processor import (
+    EXL3Processor,
+    _router_recovery_candidates,
+)
 from gptqmodel.quantization.gptq import GPTQ
 from gptqmodel.utils.exl3_error_ledger import ROUTE_EVIDENCE_SCHEMA
 from gptqmodel.utils.exl3_capture_batch_spool import CAPTURE_BATCH_SPOOL_ENV
@@ -31,6 +34,26 @@ class _Layer(nn.Module):
         super().__init__()
         self.mlp = nn.Module()
         self.mlp.gate = _Router()
+
+
+def test_hash_router_emits_no_learned_recovery_candidates() -> None:
+    router = nn.Module()
+    router.register_buffer("tid2eid", torch.arange(256))
+    logits = torch.randn(7, 256)
+    indices = torch.randint(0, 256, (7, 6), dtype=torch.int64)
+
+    candidate_indices, candidate_gaps = _router_recovery_candidates(
+        router,
+        logits,
+        indices,
+        candidate_rank_min=7,
+        candidate_rank_max=12,
+    )
+
+    assert candidate_indices.shape == (7, 0)
+    assert candidate_indices.dtype is torch.int64
+    assert candidate_gaps.shape == (7, 0)
+    assert candidate_gaps.dtype is torch.float32
 
 
 def _processor_and_subset():
@@ -120,6 +143,10 @@ def test_failed_subset_forward_removes_router_hook_without_committing_evidence()
 
 
 class _TwoExpertRouter(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("tid2eid", torch.arange(2))
+
     def forward(self, hidden_states):
         logits = hidden_states[:, :2].float()
         indices = logits.argmax(dim=-1, keepdim=True)
@@ -200,6 +227,9 @@ def test_capture_batch_resume_rebuilds_shared_hessians_and_route_state(
                 )
         processor.forward_batch_completed(layer_index=7, batch_index=0)
     processor._set_current_batch_index(None)
+    tensors, _metadata = processor._active_capture_batch_spool.load(0)
+    assert tensors["candidate_indices"].shape == (rows.shape[0], 0)
+    assert tensors["candidate_score_gaps"].shape == (rows.shape[0], 0)
 
     restored, restored_subset = _recoverable_processor_and_subset()
     restored_indices = restored.restore_subset_capture_batches(
