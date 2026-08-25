@@ -3,6 +3,7 @@
 
 import gc
 import json
+from pathlib import Path
 from types import SimpleNamespace
 import threading
 import weakref
@@ -255,10 +256,24 @@ class _Capture:
         return self.H.to(device=target_device).clone()
 
 
-def _processor(subset, *, captured: bool) -> EXL3Processor:
+def _processor(subset, *, captured: bool, inline_mixed: bool = False) -> EXL3Processor:
     processor = EXL3Processor.__new__(EXL3Processor)
+    meta = {"ds4rt_error_ledger": {"family_join": FAMILY_JOIN}}
+    if inline_mixed:
+        meta["ds4rt_inline_mixed"] = {
+            "schema": "gptqmodel.exl3-inline-mixed",
+            "schema_version": 1,
+            "namespace": "base",
+            "base_bits": 2,
+            "upgrade_bits": 3,
+            "extra_bits": {"numerator": 1, "denominator": 10},
+            "target_bpw": "21/10",
+            "projection_ratio": {"w1": 3, "w3": 5, "w2": 8},
+            "score_kind": "k2-hessian-weighted-relative-error-times-natural-gate-squared-mass-v1",
+            "tier_plan_root": str(Path.cwd() / "tier-plans"),
+        }
     processor.qcfg = SimpleNamespace(
-        meta={"ds4rt_error_ledger": {"family_join": FAMILY_JOIN}}
+        meta=meta
     )
     processor._stats_lock = threading.Lock()
     processor._natural_route_evidence_cache = {}
@@ -331,3 +346,38 @@ def test_processor_commits_and_restores_before_replay(tmp_path, monkeypatch) -> 
             "count": 32,
         }
     assert load_devices == ["cpu", "cpu"]
+
+
+def test_inline_commit_demotes_live_hessians_to_lazy_frontier(
+    tmp_path, monkeypatch
+) -> None:
+    subset = _subset()
+    root = tmp_path / "frontier"
+    monkeypatch.setenv("GPTQMODEL_EXL3_CAPTURE_FRONTIER", str(root))
+    captured = _processor(subset, captured=True, inline_mixed=True)
+    for task in captured.tasks.values():
+        capture = task["capture"]
+        capture._device_hessian_partials[torch.device("cpu")] = torch.eye(4)
+        capture._device_sample_counts[torch.device("cpu")] = 32
+
+    captured.commit_subset_capture_frontier(
+        layer_index=3,
+        subset_index=1,
+        subset_total=4,
+        subset=subset,
+    )
+
+    for task in captured.tasks.values():
+        capture = task["capture"]
+        assert capture.H is None
+        assert capture._device_hessian_partials == {}
+        assert capture._device_sample_counts == {}
+        assert capture.nsamples == 32
+        assert task["capture_frontier_record"].sample_count == 32
+        captured._hydrate_capture_frontier(
+            task_entry=task,
+            capture=capture,
+            target_device=torch.device("cpu"),
+        )
+        assert torch.equal(capture.H, torch.eye(4))
+        assert "capture_frontier_record" in task

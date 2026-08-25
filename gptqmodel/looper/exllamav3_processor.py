@@ -1245,6 +1245,30 @@ class EXL3Processor(LoopProcessor):
             for task_name, named_module in subset.items():
                 task = self.tasks[task_name]
                 task["capture_frontier_record"] = records[named_module.full_name]
+            # Commit completed every snapshot before this point. Drop the
+            # original live accumulators so candidate K2 jobs use the same
+            # one-Hessian-at-a-time path as an interrupted/resumed run. Gate
+            # and up may share one accumulator, hence the shared-state guard.
+            demoted_states: set[int] = set()
+            for task_name, named_module in subset.items():
+                task = self.tasks[task_name]
+                capture: GPTQ = task["capture"]
+                record = records[named_module.full_name]
+                state_id = id(getattr(capture, "_hessian_state", capture))
+                if state_id in demoted_states:
+                    continue
+                capture_lock = getattr(capture, "lock", None)
+                lock_context = (
+                    capture_lock if capture_lock is not None else nullcontext()
+                )
+                with lock_context:
+                    capture.H = None
+                    capture._device_hessian_partials.clear()
+                    capture._device_sample_counts.clear()
+                    capture.nsamples = record.sample_count
+                    capture._hessian_dirty = False
+                    capture._final_hessian_device_hint = None
+                demoted_states.add(state_id)
         batch_spool = getattr(self, "_active_capture_batch_spool", None)
         if batch_spool is not None:
             batch_spool.discard()
