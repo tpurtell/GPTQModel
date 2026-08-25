@@ -3961,8 +3961,12 @@ class EXL3Config(PreProcessorConfig):
         self.moe = _normalize_moe_config(self.moe)
 
     def _update_output_payload(self, out: Dict[str, Any]) -> None:
-        out["bits"] = float(self.bits)
-        out["head_bits"] = None if self.head_bits is None else float(self.head_bits)
+        # EXL3 matrices always have an integer trellis width. Keep that type in
+        # portable metadata as well: some standard HF consumers reject `2.0`.
+        # Artifact-average mixed BPW belongs in an explicit tier-plan extension,
+        # never in this standard per-matrix field.
+        out["bits"] = int(self.bits)
+        out["head_bits"] = None if self.head_bits is None else int(self.head_bits)
         out["out_scales"] = self.out_scales
         out["codebook"] = self.codebook
         out["tensor_storage"] = self.tensor_storage

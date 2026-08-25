@@ -415,6 +415,21 @@ def test_family_join_aggregates_raw_terms_only_for_exact_provenance():
     assert set(families[0]["provenance"]["projections"]) == {"w1", "w2", "w3"}
 
 
+def test_family_join_records_projection_mixed_k2_k3_tiers():
+    records = [
+        _record("gate_proj"),
+        _record("down_proj"),
+        _record("up_proj"),
+    ]
+    records[1]["bits"] = 3
+
+    family = derive_family_records(records)[0]
+
+    assert family["bits"] == 2
+    assert family["mixed_bits"] is True
+    assert family["projection_bits"] == {"w1": 2, "w2": 3, "w3": 2}
+
+
 def test_natural_route_evidence_is_required_and_shared_by_one_expert_family():
     provenance = {
         "family_join": {

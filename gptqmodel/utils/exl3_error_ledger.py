@@ -676,6 +676,9 @@ def build_projection_record(
 
 def _family_record(records: list[dict[str, Any]]) -> dict[str, Any]:
     first = records[0]
+    projection_bits = {
+        record["projection"]: int(record["bits"]) for record in records
+    }
     reconstructions = [
         record["quantizer_metrics"]["reconstruction"] for record in records
     ]
@@ -727,7 +730,12 @@ def _family_record(records: list[dict[str, Any]]) -> dict[str, Any]:
         "block_namespace": first["block_namespace"],
         "logical_layer": first["logical_layer"],
         "expert": first["expert"],
-        "bits": first["bits"],
+        # Keep the base tier in the legacy scalar while recording exact
+        # projection tiers explicitly. Uniform ledgers remain byte-compatible
+        # apart from this additive field.
+        "bits": min(projection_bits.values()),
+        "projection_bits": projection_bits,
+        "mixed_bits": len(set(projection_bits.values())) > 1,
         "codebook": first["codebook"],
         "projections": [record["projection"] for record in records],
         "projection_modules": [record["module"] for record in records],
@@ -789,7 +797,6 @@ def derive_family_records(
             record["block_namespace"],
             record["logical_layer"],
             record["expert"],
-            record["bits"],
             record["codebook"],
             _canonical_json_bytes(_family_join_provenance(record)),
         )

@@ -152,6 +152,17 @@ def test_exllamav3_config_accepts_and_round_trips_auto_module_decoder():
     assert reloaded.preprocessors[0].target_dtype is torch.bfloat16
 
 
+def test_exllamav3_serializes_standard_bits_as_json_integer():
+    cfg = EXL3Config(bits=2.0, head_bits=3.0)
+
+    payload = cfg.to_dict()
+
+    assert payload["bits"] == 2
+    assert type(payload["bits"]) is int
+    assert payload["head_bits"] == 3
+    assert type(payload["head_bits"]) is int
+
+
 def test_exllamav3_module_include_is_a_positive_allowlist_and_round_trips():
     routed_expert_pattern = (
         r"^model\.layers\.\d+\.mlp\.experts\.\d+\."

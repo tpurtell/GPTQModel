@@ -34,6 +34,41 @@ def _request(scale: float = 1.0) -> dict:
     )
 
 
+def _inline_request(role: str, *, candidate_request_sha256: str | None = None) -> dict:
+    inline = {
+        "role": role,
+        "policy_sha256": "a" * 64,
+        "base_bits": 2,
+        "upgrade_bits": 3,
+    }
+    bits = 2
+    if role == "selected_k3":
+        bits = 3
+        inline.update(
+            {
+                "candidate_request_sha256": candidate_request_sha256,
+                "tier_plan_sha256": "b" * 64,
+            }
+        )
+    return build_projection_request(
+        module_full_name="model.layers.7.mlp.experts.31.gate_proj",
+        layer_index=7,
+        input_weight=torch.arange(32, dtype=torch.float32).reshape(8, 4),
+        hessian=torch.eye(8, dtype=torch.float32),
+        sample_count=1024,
+        quantizer_contract={
+            "bits": bits,
+            "codebook": "mcg",
+            "apply_out_scales": None,
+            "sigma_reg": 0.025,
+            "seed": 787,
+            "inline_mixed": inline,
+        },
+        family_join={"source_revision": "abc", "corpus_sha256": "def"},
+        route_evidence={"expert_route_count": 1024},
+    )
+
+
 def _tensors() -> dict[str, torch.Tensor]:
     return {
         "trellis": torch.arange(32, dtype=torch.int16).reshape(1, 1, 32),
@@ -128,6 +163,24 @@ def test_projection_checkpoint_module_request_reservation_rejects_existing_drift
 
     with pytest.raises(ValueError, match="contains immutable module request drift"):
         EXL3ProjectionCheckpointStore(root).reserve_module_request(original)
+
+
+def test_projection_checkpoint_reserves_inline_k2_candidate_and_selected_k3(
+    tmp_path,
+) -> None:
+    store = EXL3ProjectionCheckpointStore(tmp_path / "checkpoints")
+    candidate = _inline_request("candidate_k2")
+    selected = _inline_request(
+        "selected_k3", candidate_request_sha256=candidate["request_sha256"]
+    )
+
+    store.reserve_module_request(candidate)
+    store.reserve_module_request(selected)
+    store.reserve_module_request(candidate)
+    store.reserve_module_request(selected)
+
+    with pytest.raises(ValueError, match="uniform and inline"):
+        store.reserve_module_request(_request())
 
 
 def test_projection_checkpoint_load_committed_rejects_stored_request_tampering(

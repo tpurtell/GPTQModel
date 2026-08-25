@@ -96,6 +96,11 @@ from ..utils.exl3_projection_checkpoint import (
     checkpoint_root_from_provenance,
     sha256_bytes,
 )
+from ..utils.exl3_inline_mixed import (
+    InlineMixedTierPlanStore,
+    build_layer_tier_plan,
+    inline_mixed_policy,
+)
 from ..utils.exl3_remote import (
     CoordinatorSlot,
     EXL3_HESSIAN_CAPTURE_CONTRACT,
@@ -688,6 +693,9 @@ class EXL3Processor(LoopProcessor):
         self.error_journal_path = os.getenv(JOURNAL_ENV) or str(
             Path(self.log_tmp_log_file_name).with_suffix(".exl3-error-ledger.jsonl")
         )
+        self.inline_mixed_candidate_journal_path = (
+            f"{self.error_journal_path}.k2-candidates"
+        )
 
     def set_calibration_dataset(self, calibration_dataset):
         """Rejects dataset replacement because EXL3 capture is fixed at construction."""
@@ -707,6 +715,11 @@ class EXL3Processor(LoopProcessor):
                 "EXL3 `meta.ds4rt_error_ledger` provenance must be a dictionary"
             )
         return provenance
+
+    def _inline_mixed_policy(self):
+        """Return the exact-rational layer-local mixed policy, if configured."""
+
+        return inline_mixed_policy(getattr(self.qcfg, "meta", None))
 
     def _remote_client_for_run(self, provenance: dict[str, Any] | None):
         """Construct the immutable remote-worker client at most once per run."""
@@ -1186,6 +1199,21 @@ class EXL3Processor(LoopProcessor):
                 full_name
             ].snapshot_hessian(target_device=torch.device("cpu")),
         )
+        if self._inline_mixed_policy() is not None:
+            # The same durable frontier is also the bounded-memory source for
+            # an inline K3 upgrade. Keep only lightweight descriptors in the
+            # tasks; selected jobs hydrate and release one Hessian apiece.
+            records = store.restore_index(
+                layer_index=layer_index,
+                subset_index=subset_index,
+                subset_total=subset_total,
+                subset=subset,
+            )
+            if records is None:
+                raise RuntimeError("EXL3 capture frontier disappeared after commit")
+            for task_name, named_module in subset.items():
+                task = self.tasks[task_name]
+                task["capture_frontier_record"] = records[named_module.full_name]
         batch_spool = getattr(self, "_active_capture_batch_spool", None)
         if batch_spool is not None:
             batch_spool.discard()
@@ -1244,7 +1272,10 @@ class EXL3Processor(LoopProcessor):
                 capture._final_hessian_device_hint = target_device
             elif capture.nsamples != record.sample_count:
                 raise RuntimeError("EXL3 shared lazy capture sample count differs")
-            task_entry.pop("capture_frontier_record", None)
+            if self._inline_mixed_policy() is None:
+                task_entry.pop("capture_frontier_record", None)
+            # Inline mixed mode does not consume the descriptor: its selected
+            # K3 pass reloads the same immutable Hessian exactly once.
 
     @staticmethod
     def _tensor_storage_summary(value: Any) -> dict[str, int]:
@@ -1516,10 +1547,12 @@ class EXL3Processor(LoopProcessor):
             return locks.setdefault(device_key, threading.Lock())
 
     @staticmethod
-    def _projection_assignment_key(module: NamedModule) -> str:
+    def _projection_assignment_key(
+        module: NamedModule, *, phase: str | None = None
+    ) -> str:
         """Return the durable scheduler identity for one independent projection."""
 
-        return module.full_name
+        return module.full_name if phase is None else f"{module.full_name}::{phase}"
 
     def subset_forward_capture_context(
         self,
@@ -2159,11 +2192,17 @@ class EXL3Processor(LoopProcessor):
         module: NamedModule,
         module_qcfg: EXL3Config,
         device: torch.device,
+        *,
+        bits_override: int | None = None,
     ) -> Dict[str, object]:
         """Builds the argument bundle passed into the EXL3 quantizer."""
 
         quant_args: Dict[str, object] = {
-            "K": self._target_bits(module, module_qcfg),
+            "K": (
+                self._target_bits(module, module_qcfg)
+                if bits_override is None
+                else int(bits_override)
+            ),
             "devices": [device],
             "apply_out_scales": _OUT_SCALES_TO_ARG.get(module_qcfg.out_scales, None),
             "sigma_reg": _EXL3_SIGMA_REG,
@@ -2301,6 +2340,223 @@ class EXL3Processor(LoopProcessor):
             del runtime_weight, restored_weight
         return target
 
+    def _publish_inline_candidate(self, task_entry: dict[str, Any]) -> None:
+        """Promote an unselected K2 candidate into the authoritative journal."""
+
+        stat = task_entry.get("inline_candidate_stat")
+        ledger_record = task_entry.get("inline_candidate_ledger_record")
+        if not isinstance(stat, dict) or not isinstance(ledger_record, dict):
+            raise RuntimeError("EXL3 inline-mixed candidate state is incomplete")
+        with self._stats_lock:
+            digest = append_exl3_error_journal(
+                self.error_journal_path, ledger_record
+            )
+            stat["exl3_error_journal"] = self.error_journal_path
+            stat["exl3_error_record_sha256"] = digest
+            duration = float(stat[PROCESS_LOG_TIME])
+            self.durations.append(duration)
+            try:
+                self.avg_losses.append(float(stat[QUANT_LOG_LOSS]))
+            except (TypeError, ValueError):
+                pass
+            self.module_names.append(
+                f"layer-{stat[PROCESS_LOG_LAYER]}-{stat[PROCESS_LOG_MODULE]}"
+            )
+            self.log.append(stat)
+
+    def _requantize_inline_selected(
+        self,
+        *,
+        model: BaseQModel,
+        module: NamedModule,
+        policy,
+        tier_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Reload one candidate's source/Hessian and replace it with K3."""
+
+        task_entry = self.tasks[module.name]
+        candidate_stat = task_entry.get("inline_candidate_stat")
+        candidate_record = task_entry.get("inline_candidate_ledger_record")
+        frontier = task_entry.get("capture_frontier_record")
+        old_capture = task_entry.get("capture")
+        if (
+            not isinstance(candidate_stat, dict)
+            or not isinstance(candidate_record, dict)
+            or not isinstance(frontier, EXL3CaptureRecord)
+            or not isinstance(old_capture, GPTQ)
+        ):
+            raise RuntimeError(
+                f"EXL3 selected K3 lost its bounded replay state for `{module.full_name}`"
+            )
+        candidate_request_sha256 = candidate_stat.get(
+            "exl3_projection_checkpoint"
+        )
+        if not isinstance(candidate_request_sha256, str):
+            raise RuntimeError("EXL3 selected K3 lacks its candidate checkpoint")
+
+        target_device = torch.device(
+            task_entry.get("inline_source_device", self.qcfg.device)
+        )
+        prepared = model.shell_module_materialize(
+            target_submodule=module.module,
+            device=target_device,
+            role="quant_source",
+            named_module=module,
+        )
+        if prepared is not module.module:
+            module.module = prepared
+
+        capture = GPTQ(module=module, qcfg=old_capture.qcfg)
+        capture.expected_nsamples = getattr(
+            self, "total_calibration_tokens", None
+        )
+        capture.quantizer.configure(perchannel=True)
+        task_entry["capture"] = capture
+
+        inline_context = {
+            "role": "selected_k3",
+            "policy_sha256": policy.policy_sha256,
+            "base_bits": policy.base_bits,
+            "upgrade_bits": policy.upgrade_bits,
+            "candidate_request_sha256": candidate_request_sha256,
+            "tier_plan_sha256": tier_plan["tier_plan_sha256"],
+        }
+        ledger_provenance = self._ledger_provenance()
+        remote_client = self._remote_client_for_run(ledger_provenance)
+        execution_lease = None
+        execution_slot = None
+        if remote_client is not None:
+            execution_lease = remote_client.acquire_slot(
+                self._projection_assignment_key(
+                    module, phase="inline-k3-selected"
+                )
+            )
+            execution_slot = execution_lease.slot
+        try:
+            final_stat = self._process_on_slot(
+                module=module,
+                device=target_device,
+                ledger_provenance=ledger_provenance,
+                remote_client=remote_client,
+                execution_slot=execution_slot,
+                execution_lease=execution_lease,
+                bits_override=policy.upgrade_bits,
+                inline_context=inline_context,
+                defer_stats=False,
+            )
+        finally:
+            if execution_lease is not None:
+                execution_lease.release()
+
+        # The public per-module row describes the final K3 result, while total
+        # processor duration includes both searches that this mixed choice cost.
+        candidate_duration = float(candidate_stat[PROCESS_LOG_TIME])
+        with self._stats_lock:
+            self.durations.append(candidate_duration)
+            final_stat[PROCESS_LOG_TIME] = (
+                f"{float(final_stat[PROCESS_LOG_TIME]) + candidate_duration:.3f}"
+            )
+        return final_stat
+
+    def prepare_layer_replay(
+        self,
+        *,
+        model: BaseQModel,
+        layer_module: Module,
+        layer_index: int,
+        layer_count: int,
+        processed_modules: Dict[str, NamedModule],
+        is_lm_head_module: bool,
+    ) -> None:
+        """Choose and execute K3 upgrades before the only propagation replay."""
+
+        del layer_module
+        policy = self._inline_mixed_policy()
+        if policy is None or is_lm_head_module:
+            return
+        candidates: list[tuple[NamedModule, dict[str, Any], dict[str, Any]]] = []
+        for module in processed_modules.values():
+            if not isinstance(module, NamedModule):
+                continue
+            identity = routed_expert_identity(module.full_name)
+            if identity is None or identity["block_namespace"] != policy.namespace:
+                continue
+            task_entry = self.tasks.get(module.name)
+            if not isinstance(task_entry, dict):
+                raise RuntimeError("EXL3 inline-mixed task disappeared")
+            record = task_entry.get("inline_candidate_ledger_record")
+            stat = task_entry.get("inline_candidate_stat")
+            if not isinstance(record, dict) or not isinstance(stat, dict):
+                raise RuntimeError(
+                    f"EXL3 inline K2 candidate is absent for `{module.full_name}`"
+                )
+            candidates.append((module, task_entry, record))
+        if not candidates:
+            return
+
+        logical_layers = {
+            routed_expert_identity(module.full_name)["logical_layer"]
+            for module, _task, _record in candidates
+        }
+        if len(logical_layers) != 1:
+            raise RuntimeError("EXL3 inline-mixed candidates crossed logical layers")
+        logical_layer = next(iter(logical_layers))
+        if logical_layer != layer_index and policy.namespace == "base":
+            raise RuntimeError("EXL3 inline-mixed base layer identity drifted")
+        plan = build_layer_tier_plan(
+            policy=policy,
+            layer_index=logical_layer,
+            layer_count=layer_count,
+            candidate_records=[record for _module, _task, record in candidates],
+        )
+        plan = InlineMixedTierPlanStore(policy).commit(plan)
+        selected = {entry["module"] for entry in plan["selected"]}
+        candidate_by_name = {
+            module.full_name: (module, task_entry)
+            for module, task_entry, _record in candidates
+        }
+        if not selected.issubset(candidate_by_name):
+            raise RuntimeError("EXL3 inline-mixed tier plan selected an unknown module")
+
+        for module_name, (_module, task_entry) in candidate_by_name.items():
+            if module_name not in selected:
+                self._publish_inline_candidate(task_entry)
+
+        # Reuse the normal per-device worker pool so coordinator GPUs and all
+        # remote slots stay dynamically fed. Only one immutable Hessian is
+        # hydrated per active worker; no layer-wide Hessian array is retained.
+        from .. import DEVICE_THREAD_POOL
+
+        futures = []
+        for module_name in sorted(selected):
+            module, task_entry = candidate_by_name[module_name]
+            target_device = torch.device(
+                task_entry.get("inline_source_device", self.qcfg.device)
+            )
+            futures.append(
+                DEVICE_THREAD_POOL.submit(
+                    target_device,
+                    self._requantize_inline_selected,
+                    model=model,
+                    module=module,
+                    policy=policy,
+                    tier_plan=plan,
+                )
+            )
+        for future in futures:
+            future.result()
+
+        log.info(
+            "EXL3 inline-mixed layer finalized: namespace=%s layer=%s "
+            "candidates=%s selected_k3=%s quotas=%s plan=%s",
+            policy.namespace,
+            logical_layer,
+            len(candidates),
+            len(selected),
+            plan["quotas"],
+            plan["tier_plan_sha256"],
+        )
+
     def process(
         self,
         module: NamedModule,
@@ -2315,6 +2571,35 @@ class EXL3Processor(LoopProcessor):
         del subset, previous_subset, subset_index, subset_total
 
         ledger_provenance = self._ledger_provenance()
+        policy = self._inline_mixed_policy()
+        identity = routed_expert_identity(module.full_name)
+        inline_context = None
+        bits_override = None
+        assignment_phase = None
+        if policy is not None and identity is not None:
+            if identity["block_namespace"] != policy.namespace:
+                raise ValueError(
+                    "EXL3 inline-mixed policy namespace disagrees with routed "
+                    f"projection `{module.full_name}`"
+                )
+            bits_override = policy.base_bits
+            assignment_phase = "inline-k2-candidate"
+            inline_context = {
+                "role": "candidate_k2",
+                "policy_sha256": policy.policy_sha256,
+                "base_bits": policy.base_bits,
+                "upgrade_bits": policy.upgrade_bits,
+            }
+            if (
+                self._projection_checkpoint_store_for_run(ledger_provenance)
+                is None
+                or self._capture_frontier_store_for_run(ledger_provenance)
+                is None
+            ):
+                raise ValueError(
+                    "EXL3 inline mixed quantization requires durable projection "
+                    "checkpoints and capture frontiers"
+                )
         remote_client = self._remote_client_for_run(ledger_provenance)
         execution_lease = None
         execution_slot = None
@@ -2324,7 +2609,9 @@ class EXL3Processor(LoopProcessor):
                     "EXL3 distributed dispatch only accepts routed-expert projections"
                 )
             execution_lease = remote_client.acquire_slot(
-                self._projection_assignment_key(module)
+                self._projection_assignment_key(
+                    module, phase=assignment_phase
+                )
             )
             execution_slot = execution_lease.slot
         try:
@@ -2335,6 +2622,9 @@ class EXL3Processor(LoopProcessor):
                 remote_client=remote_client,
                 execution_slot=execution_slot,
                 execution_lease=execution_lease,
+                bits_override=bits_override,
+                inline_context=inline_context,
+                defer_stats=inline_context is not None,
             )
         finally:
             if execution_lease is not None:
@@ -2349,6 +2639,9 @@ class EXL3Processor(LoopProcessor):
         remote_client,
         execution_slot,
         execution_lease: ExecutionSlotLease | None,
+        bits_override: int | None = None,
+        inline_context: dict[str, Any] | None = None,
+        defer_stats: bool = False,
     ):
         """Run one projection while its physical execution slot is exclusively held."""
 
@@ -2365,6 +2658,11 @@ class EXL3Processor(LoopProcessor):
         target_device = torch.device(target_device)
         if target_device.type != "cuda":
             raise ValueError("EXL3 quantization requires CUDA/HIP execution.")
+        if (
+            isinstance(inline_context, dict)
+            and inline_context.get("role") == "candidate_k2"
+        ):
+            task_entry["inline_source_device"] = str(target_device)
 
         restored_frontier = task_entry.get("capture_frontier_record") is not None
         accumulator_device = getattr(capture, "hessian_accumulator_device", None)
@@ -2400,7 +2698,12 @@ class EXL3Processor(LoopProcessor):
             execution_contract = remote_client.execution_contract(execution_slot)
             projection_provenance = copy.deepcopy(ledger_provenance)
             projection_provenance["execution"] = copy.deepcopy(execution_contract)
-        quant_args = self._build_quant_args(module, module_qcfg, target_device)
+        quant_args = self._build_quant_args(
+            module,
+            module_qcfg,
+            target_device,
+            bits_override=bits_override,
+        )
         input_weight = self._quant_input_weight(capture, staging_device)
         checkpoint_store = self._projection_checkpoint_store_for_run(
             ledger_provenance
@@ -2428,6 +2731,10 @@ class EXL3Processor(LoopProcessor):
                 "hessian_numerical": EXL3_HESSIAN_NUMERICAL_CONTRACT,
                 "hessian_symmetry": EXL3_HESSIAN_SYMMETRY_CONTRACT,
             }
+            if inline_context is not None:
+                quantizer_contract["inline_mixed"] = copy.deepcopy(
+                    inline_context
+                )
             hessian_ownership = task_entry.get("hessian_capture")
             if isinstance(hessian_ownership, dict):
                 quantizer_contract["hessian_ownership"] = copy.deepcopy(
@@ -2685,9 +2992,18 @@ class EXL3Processor(LoopProcessor):
         # The packed result and its exact ledger are now durable when the run
         # opted into projection checkpoints. The journal remains the ordered
         # coordinator commit barrier before tensors enter async save state.
+        candidate_pass = (
+            isinstance(inline_context, dict)
+            and inline_context.get("role") == "candidate_k2"
+        )
+        journal_path = (
+            self.inline_mixed_candidate_journal_path
+            if candidate_pass
+            else self.error_journal_path
+        )
         with self._stats_lock:
             ledger_record_sha256 = append_exl3_error_journal(
-                self.error_journal_path,
+                journal_path,
                 ledger_record,
             )
         publication_ledger_record = compact_projection_record(ledger_record)
@@ -2729,7 +3045,7 @@ class EXL3Processor(LoopProcessor):
             PROCESS_USED_MEMORY: self.device_memory_report(),
             QUANT_LOG_LOSS_KIND: quantizer_metrics["reported_metric_kind"],
             "exl3_error_ledger_record": publication_ledger_record,
-            "exl3_error_journal": self.error_journal_path,
+            "exl3_error_journal": journal_path,
             "exl3_error_record_sha256": ledger_record_sha256,
             "exl3_projection_checkpoint": (
                 checkpoint_request.get("request_sha256")
@@ -2739,6 +3055,7 @@ class EXL3Processor(LoopProcessor):
             "exl3_projection_checkpoint_hit": checkpoint_hit,
             "exl3_execution_contract": execution_contract,
             "exl3_execution_result": execution_result,
+            "exl3_inline_mixed": copy.deepcopy(inline_context),
         }
 
         if workspace_summary:
@@ -2767,16 +3084,23 @@ class EXL3Processor(LoopProcessor):
             stat["dynamic"] = self.qcfg.dynamic_get(layer_name=module.full_name)
 
         with self._stats_lock:
-            self.durations.append(duration)
-            if isinstance(proxy_err, (int, float)):
-                self.avg_losses.append(proxy_err)
-            self.module_names.append(f"layer-{module.layer_index}-{module.name}")
-            self.log.append(stat)
+            if defer_stats:
+                task_entry["inline_candidate_stat"] = stat
+                task_entry["inline_candidate_ledger_record"] = ledger_record
+            else:
+                self.durations.append(duration)
+                if isinstance(proxy_err, (int, float)):
+                    self.avg_losses.append(proxy_err)
+                self.module_names.append(
+                    f"layer-{module.layer_index}-{module.name}"
+                )
+                self.log.append(stat)
 
         self.log_new_row(stat)
 
         capture.free()
         del input_weight, out_tensors, stream_payload
+        return stat
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         """Builds and installs the ExLlamaV3 module from the staged tensors."""

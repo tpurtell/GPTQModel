@@ -960,6 +960,33 @@ class LoopProcessor:
 
         pass
 
+    def prepare_layer_replay(
+        self,
+        *,
+        model: BaseQModel,
+        layer_module: Module,
+        layer_index: int,
+        layer_count: int,
+        processed_modules: Dict[str, NamedModule],
+        is_lm_head_module: bool,
+    ) -> None:
+        """Finalize layer-wide processor decisions before authoritative replay.
+
+        Per-module quantization normally has no cross-module dependency. Mixed
+        bitrate selection is the exception: every K2 candidate in a layer must
+        be measured before a deterministic K3 quota can be assigned, while the
+        final mixed weights must be installed before the one propagation replay.
+        """
+
+        del (
+            model,
+            layer_module,
+            layer_index,
+            layer_count,
+            processed_modules,
+            is_lm_head_module,
+        )
+
     # last step, after all loop processor is called
     # submodule_finalize is called in reverse after all next sequential processes are called
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):

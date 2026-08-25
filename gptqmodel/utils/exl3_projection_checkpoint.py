@@ -182,7 +182,45 @@ class EXL3ProjectionCheckpointStore:
     def __init__(self, root: str | os.PathLike[str]) -> None:
         self.root = Path(root).expanduser().resolve()
         self._module_request_lock = threading.Lock()
-        self._module_requests: dict[str, str] | None = None
+        self._module_requests: dict[tuple[str, str], str] | None = None
+
+    @staticmethod
+    def _module_request_key(request: dict[str, Any]) -> tuple[str, str]:
+        """Return the immutable reservation key for uniform or inline tiers."""
+
+        module = request.get("module")
+        contract = request.get("quantizer_contract")
+        inline = contract.get("inline_mixed") if isinstance(contract, dict) else None
+        if inline is None:
+            return str(module), "uniform"
+        role = inline.get("role") if isinstance(inline, dict) else None
+        policy_sha256 = inline.get("policy_sha256") if isinstance(inline, dict) else None
+        if (
+            role not in {"candidate_k2", "selected_k3"}
+            or not isinstance(policy_sha256, str)
+            or len(policy_sha256) != 64
+        ):
+            raise ValueError("invalid EXL3 inline-mixed checkpoint role")
+        bits = contract.get("bits")
+        base_bits = inline.get("base_bits")
+        upgrade_bits = inline.get("upgrade_bits")
+        if (
+            not isinstance(base_bits, int)
+            or isinstance(base_bits, bool)
+            or not isinstance(upgrade_bits, int)
+            or isinstance(upgrade_bits, bool)
+            or upgrade_bits != base_bits + 1
+            or bits != (base_bits if role == "candidate_k2" else upgrade_bits)
+        ):
+            raise ValueError("EXL3 inline-mixed checkpoint tier is inconsistent")
+        if role == "selected_k3" and any(
+            not isinstance(inline.get(field), str) or len(inline[field]) != 64
+            for field in ("candidate_request_sha256", "tier_plan_sha256")
+        ):
+            raise ValueError(
+                "EXL3 selected K3 checkpoint lacks its K2/tier-plan binding"
+            )
+        return str(module), role
 
     def reserve_module_request(self, request: dict[str, Any]) -> None:
         """Fail before work when one immutable module acquires a new identity.
@@ -215,7 +253,8 @@ class EXL3ProjectionCheckpointStore:
 
         with self._module_request_lock:
             if self._module_requests is None:
-                module_requests: dict[str, str] = {}
+                module_requests: dict[tuple[str, str], str] = {}
+                module_modes: dict[str, str] = {}
                 for committed_request, _result in self.inspect_committed_manifests():
                     committed_module = committed_request.get("module")
                     committed_sha256 = committed_request.get("request_sha256")
@@ -227,9 +266,15 @@ class EXL3ProjectionCheckpointStore:
                         raise ValueError(
                             "EXL3 projection checkpoint has no module identity"
                         )
-                    previous = module_requests.setdefault(
-                        committed_module, committed_sha256
-                    )
+                    key = self._module_request_key(committed_request)
+                    mode = "uniform" if key[1] == "uniform" else "inline_mixed"
+                    previous_mode = module_modes.setdefault(committed_module, mode)
+                    if previous_mode != mode:
+                        raise ValueError(
+                            "EXL3 projection checkpoint mixes uniform and inline "
+                            f"requests for `{committed_module}`"
+                        )
+                    previous = module_requests.setdefault(key, committed_sha256)
                     if previous != committed_sha256:
                         raise ValueError(
                             "EXL3 projection checkpoint contains immutable module "
@@ -238,7 +283,27 @@ class EXL3ProjectionCheckpointStore:
                         )
                 self._module_requests = module_requests
 
-            previous = self._module_requests.setdefault(module, request_sha256)
+            key = self._module_request_key(request)
+            inline = request.get("quantizer_contract", {}).get("inline_mixed")
+            if key[1] == "selected_k3":
+                candidate_digest = inline["candidate_request_sha256"]
+                if self._module_requests.get((module, "candidate_k2")) != candidate_digest:
+                    raise ValueError(
+                        "EXL3 selected K3 is not bound to the reserved K2 "
+                        f"candidate for `{module}`"
+                    )
+            conflicting = [
+                existing
+                for existing in self._module_requests
+                if existing[0] == module
+                and ((existing[1] == "uniform") != (key[1] == "uniform"))
+            ]
+            if conflicting:
+                raise ValueError(
+                    "EXL3 projection checkpoint cannot mix uniform and inline "
+                    f"requests for `{module}`"
+                )
+            previous = self._module_requests.setdefault(key, request_sha256)
             if previous != request_sha256:
                 raise ValueError(
                     "EXL3 immutable module request drift for "

@@ -841,6 +841,20 @@ def run_layer_stage(
             layer_outputs: List[List[torch.Tensor]] = []
             replay_plan = last_subset_plan
 
+            # A processor may need one layer-wide decision after all individual
+            # modules have finished but before the only authoritative replay.
+            # Inline EXL3 mixed-bitrate selection uses this boundary to replace
+            # its highest-risk K2 projections with K3 without propagating K2
+            # activations into the next decoder layer.
+            processor.prepare_layer_replay(
+                model=looper.gptq_model,
+                layer_module=module,
+                layer_index=layer_index,
+                layer_count=layer_count,
+                processed_modules=processed_subset,
+                is_lm_head_module=is_lm_head_module,
+            )
+
             # When dynamic exclusions remove every tracked module from a layer,
             # no subset stage runs, so nothing materializes that layer's
             # outputs. Processors that enable post-process forward replay
