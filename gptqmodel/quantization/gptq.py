@@ -7,8 +7,6 @@
 
 import contextlib
 import math
-import os
-import sys
 import threading
 import time
 from typing import Dict, Optional, Tuple
@@ -51,7 +49,7 @@ def _log_hessian_verbose() -> bool:
     return env_flag("GPTQMODEL_LOG_HESSIAN")
 
 
-lock = threading.Lock()
+_WORKSPACE_LOCKS_GUARD = threading.Lock()
 
 
 class _HessianAccumulatorState:
@@ -95,6 +93,19 @@ def _workspace_cache_key(device: torch.device) -> Tuple[str, Optional[int]]:
     return _device_cache_key(device)
 
 
+def _workspace_lock(key: Tuple[str, Optional[int]]) -> threading.Lock:
+    lock = _WORKSPACE_LOCKS.get(key)
+    if lock is not None:
+        return lock
+
+    with _WORKSPACE_LOCKS_GUARD:
+        lock = _WORKSPACE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _WORKSPACE_LOCKS[key] = lock
+    return lock
+
+
 def _needs_workspace_resize(
     workspace: Optional[torch.Tensor],
     dtype: torch.dtype,
@@ -122,7 +133,7 @@ def _lease_workspace(
     required_rows: int,
 ) -> Tuple[torch.Tensor, bool]:
     key = _workspace_cache_key(device)
-    lock = _WORKSPACE_LOCKS.setdefault(key, threading.Lock())
+    lock = _workspace_lock(key)
     with lock:
         workspace = _WORKSPACE_CACHE.pop(key, None)
         reused = workspace is not None and not _needs_workspace_resize(
@@ -1157,14 +1168,6 @@ class GPTQ:
         if self.qcfg.mock_quantization:
             # Use simplified hessian inverse (identity matrix)
             self.hessian_inverse = self.mock_hessian_inverse
-
-        # if self.device.type not in ["mps", "cpu"]:
-        #     self.module.weight.data = self.module.weight.data.cpu()
-
-        # TODO: waiting for pytorch implementation of ops for MPS
-        if sys.platform == "darwin" and os.getenv("PYTORCH_ENABLE_MPS_FALLBACK") != "1":
-            raise RuntimeError(
-                "For MacOS you must set env `PYTORCH_ENABLE_MPS_FALLBACK=1` before running quantization.")
 
         if self.module_copy is None:
             # log.info("copy W to cuda_1")
