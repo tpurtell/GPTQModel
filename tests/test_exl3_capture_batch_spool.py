@@ -12,7 +12,7 @@ from gptqmodel.utils.exl3_capture_batch_spool import (
 )
 
 
-def _open(tmp_path):
+def _open(tmp_path, *, checkpoint_interval=1):
     return EXL3CaptureBatchSpool(
         tmp_path / "spool",
         layer_index=4,
@@ -24,6 +24,7 @@ def _open(tmp_path):
         module_names=["model.layers.4.mlp.experts.0.gate_proj"],
         provenance={"plan_sha256": "a" * 64},
         ownership={"0": "cuda:0"},
+        checkpoint_interval=checkpoint_interval,
     )
 
 
@@ -42,6 +43,51 @@ def test_capture_batch_spool_round_trip_and_resume(tmp_path) -> None:
     tensors, metadata = resumed.load(1)
     assert torch.equal(tensors["router_input"], torch.arange(12).reshape(3, 4))
     assert metadata == {"corpus_batch_sha256": "b" * 64}
+
+
+def test_capture_batch_spool_checkpoints_bounded_groups(tmp_path) -> None:
+    spool = _open(tmp_path, checkpoint_interval=2)
+    spool.commit(
+        0,
+        tensors={"router_input": torch.zeros(2, 4, dtype=torch.bfloat16)},
+        metadata={"batch": 0},
+    )
+    assert spool.committed_indices == frozenset()
+    assert spool.pending_indices == frozenset({0})
+
+    spool.commit(
+        1,
+        tensors={"router_input": torch.ones(2, 4, dtype=torch.bfloat16)},
+        metadata={"batch": 1},
+    )
+    assert spool.committed_indices == frozenset({0, 1})
+    assert spool.pending_indices == frozenset()
+
+    # The final short group is forced durable even though it does not fill the
+    # configured interval.
+    spool.commit(
+        2,
+        tensors={"router_input": torch.full((2, 4), 2, dtype=torch.bfloat16)},
+        metadata={"batch": 2},
+    )
+    assert spool.committed_indices == frozenset({0, 1, 2})
+    resumed = _open(tmp_path, checkpoint_interval=3)
+    assert resumed.committed_indices == frozenset({0, 1, 2})
+
+
+def test_capture_batch_spool_discards_uncheckpointed_group(tmp_path) -> None:
+    spool = _open(tmp_path, checkpoint_interval=3)
+    spool.commit(
+        0,
+        tensors={"router_input": torch.zeros(2, 4, dtype=torch.bfloat16)},
+        metadata={"batch": 0},
+    )
+    assert spool.pending_indices == frozenset({0})
+
+    resumed = _open(tmp_path, checkpoint_interval=3)
+    assert resumed.committed_indices == frozenset()
+    assert resumed.pending_indices == frozenset()
+    assert not (resumed.directory / "batch-000000000.safetensors").exists()
 
 
 def test_capture_batch_spool_drops_interrupted_temporary(tmp_path) -> None:

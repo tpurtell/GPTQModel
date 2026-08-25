@@ -17,11 +17,14 @@ from typing import Any
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file as save_safetensors_file
+from safetensors.torch import save as serialize_safetensors
 import xxhash
 
 
 CAPTURE_BATCH_SPOOL_ENV = "GPTQMODEL_EXL3_CAPTURE_BATCH_SPOOL"
+CAPTURE_BATCH_CHECKPOINT_INTERVAL_ENV = (
+    "GPTQMODEL_EXL3_CAPTURE_BATCH_CHECKPOINT_INTERVAL"
+)
 CAPTURE_BATCH_SPOOL_SCHEMA = "ds4rt.exl3-capture-batch-spool"
 CAPTURE_BATCH_SPOOL_SCHEMA_VERSION = 1
 CAPTURE_BATCH_SPOOL_CONTRACT = (
@@ -111,6 +114,7 @@ class EXL3CaptureBatchSpool:
         module_names: list[str],
         provenance: dict[str, Any],
         ownership: dict[str, str],
+        checkpoint_interval: int = 1,
     ) -> None:
         if (
             layer_index < 0
@@ -124,6 +128,9 @@ class EXL3CaptureBatchSpool:
             or not isinstance(provenance, dict)
             or not provenance
             or not isinstance(ownership, dict)
+            or isinstance(checkpoint_interval, bool)
+            or not isinstance(checkpoint_interval, int)
+            or checkpoint_interval <= 0
         ):
             raise EXL3CaptureBatchSpoolError("capture batch identity is invalid")
         self.root = Path(root).expanduser().resolve()
@@ -139,11 +146,16 @@ class EXL3CaptureBatchSpool:
             "ownership": dict(sorted(ownership.items())),
         }
         self.key_sha256 = _sha256(self.key)
+        # Durability cadence is an execution property rather than capture
+        # identity. A different cadence may safely resume the same committed
+        # batch set without changing any Hessian or route evidence.
+        self.checkpoint_interval = int(checkpoint_interval)
         self.directory = self.root / (
             f"layer-{layer_index:06d}-subset-{subset_index:04d}-"
             f"of-{subset_total:04d}-{self.key_sha256[:16]}"
         )
         self._records: dict[int, dict[str, Any]] = {}
+        self._pending_records: dict[int, dict[str, Any]] = {}
         self._lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         if self.root.is_symlink():
@@ -162,6 +174,13 @@ class EXL3CaptureBatchSpool:
     def committed_indices(self) -> frozenset[int]:
         with self._lock:
             return frozenset(self._records)
+
+    @property
+    def pending_indices(self) -> frozenset[int]:
+        """Return batches written since the latest durable checkpoint."""
+
+        with self._lock:
+            return frozenset(self._pending_records)
 
     def _progress_body(self) -> dict[str, Any]:
         return {
@@ -286,6 +305,8 @@ class EXL3CaptureBatchSpool:
         with self._lock:
             if batch_index in self._records:
                 return self._records[batch_index]
+            if batch_index in self._pending_records:
+                return self._pending_records[batch_index]
             if (
                 isinstance(batch_index, bool)
                 or not isinstance(batch_index, int)
@@ -304,6 +325,7 @@ class EXL3CaptureBatchSpool:
                 name: tensor.detach().to(device="cpu").contiguous()
                 for name, tensor in tensors.items()
             }
+            payload = serialize_safetensors(host)
             filename = f"batch-{batch_index:09d}.safetensors"
             destination = self.directory / filename
             descriptor, temporary_name = tempfile.mkstemp(
@@ -312,29 +334,28 @@ class EXL3CaptureBatchSpool:
             os.close(descriptor)
             temporary = Path(temporary_name)
             try:
-                save_safetensors_file(host, temporary)
-                with temporary.open("rb") as source:
-                    os.fsync(source.fileno())
+                with temporary.open("wb") as target:
+                    target.write(payload)
+                    target.flush()
                 os.replace(temporary, destination)
                 record = {
                     "batch_index": batch_index,
                     "file": filename,
-                    "bytes": destination.stat().st_size,
-                    "xxh3_128": _xxh3_128_file(destination),
+                    "bytes": len(payload),
+                    "xxh3_128": xxhash.xxh3_128_hexdigest(payload),
                     "tensors": {
                         name: _tensor_spec(tensor)
                         for name, tensor in sorted(host.items())
                     },
                     "metadata": json.loads(json.dumps(metadata, sort_keys=True)),
                 }
-                self._records[batch_index] = record
-                try:
-                    _atomic_json(
-                        self.directory / "progress.json", self._progress_body()
-                    )
-                except BaseException:
-                    self._records.pop(batch_index, None)
-                    raise
+                self._pending_records[batch_index] = record
+                if (
+                    len(self._pending_records) >= self.checkpoint_interval
+                    or len(self._records) + len(self._pending_records)
+                    == self.key["expected_batches"]
+                ):
+                    self.checkpoint()
                 return record
             except BaseException:
                 if temporary.exists():
@@ -343,9 +364,47 @@ class EXL3CaptureBatchSpool:
                     destination.unlink()
                 raise
 
+    def checkpoint(self) -> None:
+        """Durably publish the bounded group of newly written batch files."""
+
+        with self._lock:
+            if not self._pending_records:
+                return
+            pending = [
+                self._pending_records[index]
+                for index in sorted(self._pending_records)
+            ]
+            # The payloads were written and renamed before this point. Flush
+            # the bounded group before publishing any of it in progress.json;
+            # an interruption before the manifest commit simply causes the
+            # unmanifested files to be discarded and those batches replayed.
+            for record in pending:
+                descriptor = os.open(
+                    self.directory / record["file"],
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                )
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            _fsync_directory(self.directory)
+
+            previous = dict(self._records)
+            self._records.update(self._pending_records)
+            try:
+                _atomic_json(
+                    self.directory / "progress.json", self._progress_body()
+                )
+            except BaseException:
+                self._records = previous
+                raise
+            self._pending_records.clear()
+
     def load(self, batch_index: int) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         with self._lock:
-            record = self._records.get(batch_index)
+            record = self._records.get(batch_index) or self._pending_records.get(
+                batch_index
+            )
             if record is None:
                 raise KeyError(batch_index)
             path = self.directory / record["file"]
@@ -368,11 +427,13 @@ class EXL3CaptureBatchSpool:
                 shutil.rmtree(self.directory)
                 _fsync_directory(self.root)
             self._records.clear()
+            self._pending_records.clear()
 
 
 __all__ = [
     "CAPTURE_BATCH_SPOOL_CONTRACT",
     "CAPTURE_BATCH_SPOOL_ENV",
+    "CAPTURE_BATCH_CHECKPOINT_INTERVAL_ENV",
     "EXL3CaptureBatchSpool",
     "EXL3CaptureBatchSpoolError",
 ]

@@ -86,6 +86,7 @@ from ..utils.exl3_capture_frontier import (
     EXL3CaptureRecord,
 )
 from ..utils.exl3_capture_batch_spool import (
+    CAPTURE_BATCH_CHECKPOINT_INTERVAL_ENV,
     CAPTURE_BATCH_SPOOL_ENV,
     EXL3CaptureBatchSpool,
 )
@@ -895,6 +896,16 @@ class EXL3Processor(LoopProcessor):
             self._active_capture_batch_layer = None
             return frozenset()
         phase, identities = self._subset_capture_phase(subset)
+        try:
+            checkpoint_interval = int(
+                os.getenv(CAPTURE_BATCH_CHECKPOINT_INTERVAL_ENV, "1")
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                "EXL3 capture checkpoint interval is invalid"
+            ) from error
+        if checkpoint_interval <= 0:
+            raise RuntimeError("EXL3 capture checkpoint interval must be positive")
         family_ids = {
             (identity["block_namespace"], identity["logical_layer"])
             for identity in identities.values()
@@ -931,6 +942,7 @@ class EXL3Processor(LoopProcessor):
                 )
             },
             ownership=ownership,
+            checkpoint_interval=checkpoint_interval,
         )
         self._active_capture_batch_spool = spool
         self._active_capture_batch_layer = layer_index
