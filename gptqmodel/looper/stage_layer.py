@@ -846,14 +846,16 @@ def run_layer_stage(
             # Inline EXL3 mixed-bitrate selection uses this boundary to replace
             # its highest-risk K2 projections with K3 without propagating K2
             # activations into the next decoder layer.
-            processor.prepare_layer_replay(
-                model=looper.gptq_model,
-                layer_module=module,
-                layer_index=layer_index,
-                layer_count=layer_count,
-                processed_modules=processed_subset,
-                is_lm_head_module=is_lm_head_module,
-            )
+            prepare_layer_replay = getattr(processor, "prepare_layer_replay", None)
+            if callable(prepare_layer_replay):
+                prepare_layer_replay(
+                    model=looper.gptq_model,
+                    layer_module=module,
+                    layer_index=layer_index,
+                    layer_count=layer_count,
+                    processed_modules=processed_subset,
+                    is_lm_head_module=is_lm_head_module,
+                )
 
             # When dynamic exclusions remove every tracked module from a layer,
             # no subset stage runs, so nothing materializes that layer's
@@ -964,6 +966,18 @@ def run_layer_stage(
             # Finalize module after last processor
             if p_index == len(looper.processors) - 1:
                 torch_sync()
+
+                prepare_layer_post_quantize = getattr(
+                    processor, "prepare_layer_post_quantize", None
+                )
+                if callable(prepare_layer_post_quantize):
+                    prepare_layer_post_quantize(
+                        model=looper.gptq_model,
+                        layer_module=module,
+                        layer_index=layer_index,
+                        processed_modules=processed_subset,
+                        is_lm_head_module=is_lm_head_module,
+                    )
 
                 if not is_lm_head_module:
                     layers[layer_index] = looper.gptq_model.post_quantize(module)

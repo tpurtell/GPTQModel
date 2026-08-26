@@ -34,6 +34,8 @@ from gptqmodel.models.definitions.deepseek_v4 import (
     validate_deepseek_v4_mtp_checkpoint_keys,
 )
 from gptqmodel.quantization.config import AutoModuleDecoderConfig, EXL3Config
+from gptqmodel.looper.exllamav3_processor import EXL3Processor
+from gptqmodel.looper.named_module import NamedModule
 from gptqmodel.looper.stage_inputs_capture import StageInputsCapture
 from gptqmodel.utils.exl3_capture_frontier import (
     EXL3CaptureFrontierStore,
@@ -464,6 +466,58 @@ def test_deepseek_v4_mtp_post_quantize_preserves_lazy_terminal_passthroughs() ->
         if name not in passthrough
         for tensor in (*child.parameters(), *child.buffers())
     )
+
+
+def test_deepseek_v4_mtp_terminal_deferred_exl3_weight_can_finalize() -> None:
+    config = _tiny_v4_config()
+    shell = DeepSeekV4MTPAuxiliaryShell(config, device="cpu")
+    auxiliary = DeepSeekV4MTPAuxiliary(
+        model=shell,
+        turtle_model=SimpleNamespace(),
+        checkpoint_contract={"test": True},
+    )
+    adapter = DeepSeekV4MTPQuantizationModel.from_auxiliary(
+        auxiliary=auxiliary,
+        embedding_weight=torch.randn(
+            config.vocab_size, config.hidden_size, dtype=torch.bfloat16
+        ),
+        quantize_config=EXL3Config(bits=3.0, device="cpu"),
+        model_local_path="/tmp/deepseek-v4-test",
+    )
+    terminal = shell.mtp[-1]
+    for name in ("hc_head", "norm", "markov_head", "confidence_head"):
+        terminal._modules[name].to(device="meta")
+
+    linear = terminal.mlp.experts[0].gate_proj
+    named = NamedModule(
+        linear,
+        "mlp.experts.0.gate_proj",
+        "mtp.2.mlp.experts.0.gate_proj",
+        2,
+    )
+    processor = EXL3Processor.__new__(EXL3Processor)
+    packed = {
+        "trellis": torch.zeros(1),
+        "suh": torch.zeros(1),
+        "svh": torch.zeros(1),
+    }
+    named.state.update(packed)
+    processor._stage_runtime_weight(
+        module=named,
+        out_tensors=packed,
+        target_device=torch.device("cpu"),
+    )
+    processor.prepare_layer_post_quantize(
+        model=adapter,
+        layer_module=terminal,
+        layer_index=2,
+        processed_modules={named.name: named},
+        is_lm_head_module=False,
+    )
+
+    assert adapter.post_quantize(terminal) is terminal
+    assert linear.weight.device.type == "cpu"
+    assert linear.weight.numel() == 0
 
 
 def test_deepseek_v4_mtp_post_quantize_rejects_meta_block_body() -> None:

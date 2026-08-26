@@ -431,6 +431,63 @@ def test_runtime_reconstruction_is_deferred_and_shares_the_device_trellis_lock(
     assert "quant_source_module" not in module.state
 
 
+def test_terminal_layer_finalization_does_not_reconstruct_deferred_weight(
+    monkeypatch,
+) -> None:
+    processor = EXL3Processor.__new__(EXL3Processor)
+    processor._stats_lock = threading.Lock()
+    linear = nn.Linear(2, 3, bias=False, dtype=torch.bfloat16)
+    module = NamedModule(
+        linear,
+        "mlp.experts.0.gate_proj",
+        "model.layers.0.mlp.experts.0.gate_proj",
+        0,
+    )
+    packed = {
+        "trellis": torch.zeros(1),
+        "suh": torch.zeros(1),
+        "svh": torch.zeros(1),
+    }
+    module.state.update(packed)
+    processor._stage_runtime_weight(
+        module=module,
+        out_tensors=packed,
+        target_device=torch.device("cpu"),
+    )
+
+    assert module.module.weight.is_meta
+    processor.prepare_layer_post_quantize(
+        model=SimpleNamespace(),
+        layer_module=nn.Module(),
+        layer_index=0,
+        processed_modules={module.name: module},
+        is_lm_head_module=False,
+    )
+
+    assert module.module.weight.device.type == "cpu"
+    assert module.module.weight.numel() == 0
+    assert "exl3_deferred_runtime_weight" not in module.state
+    assert module.state["exl3_deferred_finalize_weight"] == {
+        "dtype": "torch.bfloat16",
+        "shape": [3, 2],
+        "requires_grad": True,
+    }
+
+    finalized = []
+
+    def create_packed(**kwargs):
+        finalized.append(kwargs)
+        return nn.Identity()
+
+    monkeypatch.setattr(processor_module, "create_exllamav3_module", create_packed)
+    processor.submodule_finalize(module, SimpleNamespace(model=nn.Module()))
+
+    assert len(finalized) == 1
+    assert set(finalized[0]["tensors"]) == set(packed)
+    assert "exl3_deferred_finalize_weight" not in module.state
+    assert not hasattr(module.module, "weight")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_runtime_reconstruction_retains_no_dense_weight_until_forward(
     monkeypatch,

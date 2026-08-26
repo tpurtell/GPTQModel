@@ -956,6 +956,32 @@ class LoopProcessor:
             is_lm_head_module,
         )
 
+    def prepare_layer_post_quantize(
+        self,
+        *,
+        model: BaseQModel,
+        layer_module: Module,
+        layer_index: int,
+        processed_modules: Dict[str, NamedModule],
+        is_lm_head_module: bool,
+    ) -> None:
+        """Prepare processor-owned state for the containing module offload.
+
+        Most processors leave ordinary materialized parameters behind, so the
+        default is intentionally empty. Processors that defer dense runtime
+        weights until propagation replay may use this boundary to make a final
+        layer safe for generic model offload without reconstructing weights
+        that will immediately be replaced by packed modules.
+        """
+
+        del (
+            model,
+            layer_module,
+            layer_index,
+            processed_modules,
+            is_lm_head_module,
+        )
+
     # last step, after all loop processor is called
     # submodule_finalize is called in reverse after all next sequential processes are called
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):

@@ -135,6 +135,7 @@ log = setup_logger()
 
 _EXL3_SIGMA_REG = 0.025
 _DEFERRED_RUNTIME_WEIGHT_STATE = "exl3_deferred_runtime_weight"
+_DEFERRED_FINALIZE_WEIGHT_STATE = "exl3_deferred_finalize_weight"
 _OUT_SCALES_TO_ARG = {
     "always": True,
     "never": False,
@@ -2407,6 +2408,58 @@ class EXL3Processor(LoopProcessor):
             del runtime_weight, restored_weight
         return target
 
+    def prepare_layer_post_quantize(
+        self,
+        *,
+        model: BaseQModel,
+        layer_module: Module,
+        layer_index: int,
+        processed_modules: Dict[str, NamedModule],
+        is_lm_head_module: bool,
+    ) -> None:
+        """Retire deferred META weights when a layer needs no final replay.
+
+        EXL3 drops each dense source weight after packing and reconstructs it
+        only for propagation replay. The terminal decoder layer has no next
+        layer, so reconstructing its complete dense expert family would waste
+        substantial memory and compute. Replace only those authenticated META
+        placeholders with zero-sized CPU sentinels; ``submodule_finalize``
+        immediately swaps each owner for its packed EXL3 module.
+        """
+
+        del model, layer_module, layer_index, is_lm_head_module
+        for module in processed_modules.values():
+            if not isinstance(module, NamedModule):
+                continue
+            marker = module.state.get(_DEFERRED_RUNTIME_WEIGHT_STATE)
+            if marker is None:
+                continue
+            if not isinstance(marker, dict):
+                raise RuntimeError(
+                    f"EXL3 deferred replay marker is malformed for `{module.full_name}`"
+                )
+            target = module.module
+            weight = getattr(target, "weight", None)
+            if not isinstance(weight, torch.Tensor) or not weight.is_meta:
+                raise RuntimeError(
+                    "EXL3 terminal finalization expected a deferred META weight for "
+                    f"`{module.full_name}`"
+                )
+            if marker.get("shape") != list(weight.shape) or marker.get(
+                "dtype"
+            ) != str(weight.dtype):
+                raise RuntimeError(
+                    f"EXL3 deferred replay geometry changed for `{module.full_name}`"
+                )
+            sentinel = torch.nn.Parameter(
+                torch.empty(0, dtype=weight.dtype, device="cpu"),
+                requires_grad=bool(marker.get("requires_grad", False)),
+            )
+            with parent_module_lock(module.full_name):
+                target.weight = sentinel
+                module.state[_DEFERRED_FINALIZE_WEIGHT_STATE] = marker
+                module.state.pop(_DEFERRED_RUNTIME_WEIGHT_STATE, None)
+
     def _publish_inline_candidate(self, task_entry: dict[str, Any]) -> None:
         """Promote an unselected K2 candidate into the authoritative journal."""
 
@@ -3175,6 +3228,21 @@ class EXL3Processor(LoopProcessor):
         del kwargs
 
         module.stream_sync()
+
+        finalize_marker = module.state.pop(_DEFERRED_FINALIZE_WEIGHT_STATE, None)
+        if finalize_marker is not None:
+            weight = getattr(module.module, "weight", None)
+            if (
+                not isinstance(finalize_marker, dict)
+                or not isinstance(weight, torch.Tensor)
+                or weight.device.type != "cpu"
+                or weight.numel() != 0
+                or str(weight.dtype) != finalize_marker.get("dtype")
+            ):
+                raise RuntimeError(
+                    "EXL3 terminal finalize sentinel is invalid for "
+                    f"`{module.full_name}`"
+                )
 
         tensors: Dict[str, torch.Tensor] = {}
         with self._stats_lock:
