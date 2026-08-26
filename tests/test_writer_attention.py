@@ -4,9 +4,12 @@
 import copy
 import csv
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
+
 from gptqmodel.models.writer import (
     PROCESS_LOG_LAYER,
     PROCESS_LOG_MODULE,
@@ -16,6 +19,7 @@ from gptqmodel.models.writer import (
     QUANT_LOG_LOSS_KIND,
     QUANT_LOG_NSAMPLES,
     ModelWriter,
+    _save_model_configs_without_weights,
 )
 from gptqmodel.quantization.config import FORMAT, METHOD
 from gptqmodel.utils.exl3_error_ledger import (
@@ -127,6 +131,16 @@ def test_save_quantized_strips_attention_before_serialization(tmp_path, monkeypa
 
     monkeypatch.setattr("gptqmodel.models.writer.get_model_files_size", lambda _: 1)
 
+    def stop_after_checks(model, _save_dir):
+        tracker["config_snapshot"] = dict(model.config.__dict__)
+        tracker["generation_snapshot"] = dict(model.generation_config.__dict__)
+        raise RuntimeError("stop after checks")
+
+    monkeypatch.setattr(
+        "gptqmodel.models.writer._save_model_configs_without_weights",
+        stop_after_checks,
+    )
+
     with pytest.raises(RuntimeError, match="stop after checks"):
         writer.save_quantized(save_dir=str(tmp_path))
 
@@ -180,6 +194,16 @@ def test_save_quantized_persists_exl3_ledger_and_unambiguous_csv(tmp_path, monke
     ]
     monkeypatch.setattr("gptqmodel.models.writer.get_model_files_size", lambda _: 1)
 
+    def stop_after_checks(model, _save_dir):
+        tracker["config_snapshot"] = dict(model.config.__dict__)
+        tracker["generation_snapshot"] = dict(model.generation_config.__dict__)
+        raise RuntimeError("stop after checks")
+
+    monkeypatch.setattr(
+        "gptqmodel.models.writer._save_model_configs_without_weights",
+        stop_after_checks,
+    )
+
     with pytest.raises(RuntimeError, match="stop after checks"):
         writer.save_quantized(save_dir=str(tmp_path))
 
@@ -200,3 +224,46 @@ def test_save_quantized_persists_exl3_ledger_and_unambiguous_csv(tmp_path, monke
             PROCESS_LOG_TIME: "1.000",
         }
     ]
+
+
+def test_config_only_save_preserves_existing_weight_shards(tmp_path):
+    class Config:
+        def save_pretrained(self, save_dir):
+            payload = {
+                "architectures": self.architectures,
+                "dtype": self.dtype,
+            }
+            (Path(save_dir) / "config.json").write_text(json.dumps(payload))
+
+    class GenerationConfig:
+        def save_pretrained(self, save_dir):
+            (Path(save_dir) / "generation_config.json").write_text(
+                json.dumps({"do_sample": False})
+            )
+
+    class ConfigOnlyModel:
+        config = Config()
+        generation_config = GenerationConfig()
+        dtype = torch.bfloat16
+
+        @staticmethod
+        def can_generate():
+            return True
+
+        def save_pretrained(self, *_args, **_kwargs):
+            raise AssertionError("config-only save must not call model.save_pretrained")
+
+    shard = tmp_path / "model-00011-of-00013.safetensors"
+    shard.write_bytes(b"authenticated-existing-shard")
+
+    _save_model_configs_without_weights(ConfigOnlyModel(), str(tmp_path))
+
+    assert shard.read_bytes() == b"authenticated-existing-shard"
+    saved_config = json.loads((tmp_path / "config.json").read_text())
+    assert saved_config == {
+        "architectures": ["ConfigOnlyModel"],
+        "dtype": "bfloat16",
+    }
+    assert json.loads((tmp_path / "generation_config.json").read_text()) == {
+        "do_sample": False
+    }

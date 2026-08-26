@@ -19,6 +19,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoConfig, PreTrainedTokenizerFast, ProcessorMixin
+from transformers.dynamic_module_utils import custom_object_save
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
 
 from ..adapter.adapter import HF_ADAPTER_FILE_NAME, HF_ADAPTER_WEIGHT_KEY_PREFIX, Lora
@@ -104,6 +105,36 @@ def _parse_split_by(value: Optional[str]) -> Optional[str]:
     if normalized not in SUPPORTED_SPLIT_BY:
         raise ValueError(f"Unsupported split_by value: {value}. Supported values: None, 'layer'.")
     return normalized
+
+
+def _save_model_configs_without_weights(model: torch.nn.Module, save_dir: str) -> None:
+    """Serialize HF model metadata without invoking weight-file cleanup.
+
+    ``PreTrainedModel.save_pretrained(state_dict={})`` is not a config-only
+    operation: Transformers treats the empty dictionary as the complete weight
+    set and removes pre-existing checkpoint shards. Quantized exports write
+    their weights separately below, so use the same metadata preparation as
+    Transformers and call the config serializers directly.
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+    config = model.config
+
+    dtype = getattr(model, "dtype", None)
+    if dtype is not None:
+        config.dtype = str(dtype).split(".")[-1]
+    config.architectures = [model.__class__.__name__.removeprefix("FSDP")]
+
+    is_remote_code = getattr(model, "is_remote_code", None)
+    if callable(is_remote_code) and is_remote_code():
+        custom_object_save(model, save_dir, config=config)
+
+    config.save_pretrained(save_dir)
+
+    can_generate = getattr(model, "can_generate", None)
+    generation_config = getattr(model, "generation_config", None)
+    if callable(can_generate) and can_generate() and generation_config is not None:
+        generation_config.save_pretrained(save_dir)
 
 
 def _materialize_remaining_meta_params_from_turtle(model: torch.nn.Module, turtle_model) -> int:
@@ -1102,9 +1133,11 @@ def ModelWriter(cls):
                 removed_generation_attention_attrs = strip_attention_impl_fields(generation_config)
             _normalize_legacy_tied_weights_keys(self.model)
 
-            # Save model config, including generation_config
-            # Use empty state_dict hack to bypass saving weights
-            self.model.save_pretrained(save_dir, state_dict={}, is_main_process=True)
+            # Save model metadata directly. Calling model.save_pretrained with
+            # an empty state_dict deletes resumable shards in recent
+            # Transformers releases because they are absent from the supplied
+            # (empty) checkpoint.
+            _save_model_configs_without_weights(self.model, save_dir)
         finally:
             for attr, value in removed_config_attention_attrs.items():
                 setattr(self.model.config, attr, value)
