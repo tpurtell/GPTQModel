@@ -37,9 +37,7 @@ MTP_REPLAY_MAIN_POSITION_IDS = "_gptqmodel_mtp_main_position_ids"
 MTP_REPLAY_MAIN_ATTENTION_MASK = "_gptqmodel_mtp_main_attention_mask"
 MTP_REPLAY_PROPOSAL_TOKEN_IDS = "_gptqmodel_mtp_proposal_token_ids"
 MTP_REPLAY_ATTENTION_MASK = "_gptqmodel_mtp_joint_attention_mask"
-MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS = (
-    "_gptqmodel_mtp_proposal_position_embeddings"
-)
+MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS = "_gptqmodel_mtp_proposal_position_embeddings"
 MTP_REPLAY_MAIN_POSITION_EMBEDDINGS = "_gptqmodel_mtp_main_position_embeddings"
 MTP_ROUTED_EXPERT_MODULE_PATTERN = (
     r"^mtp\.\d+\.mlp\.experts\.\d+\."
@@ -50,7 +48,9 @@ MTP_ROUTED_EXPERT_MODULE_PATTERN = (
 def deepseek_v4_mtp_target_layer_ids(config) -> tuple[int, ...]:
     """Return and validate the three target taps that seed integrated dSpark."""
 
-    target_ids = tuple(int(value) for value in (getattr(config, "dspark_target_layer_ids", None) or ()))
+    target_ids = tuple(
+        int(value) for value in (getattr(config, "dspark_target_layer_ids", None) or ())
+    )
     num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
     expected = tuple(range(num_hidden_layers - MTP_BLOCK_COUNT, num_hidden_layers))
     if num_hidden_layers < MTP_BLOCK_COUNT or target_ids != expected:
@@ -133,7 +133,9 @@ def validate_deepseek_v4_mtp_checkpoint_keys(config, keys: Iterable[str]) -> dic
             details.append(f"missing={len(missing)} sample={missing[:8]}")
         if unexpected:
             details.append(f"unexpected={len(unexpected)} sample={unexpected[:8]}")
-        raise RuntimeError("DeepSeek V4 MTP checkpoint namespace mismatch: " + "; ".join(details))
+        raise RuntimeError(
+            "DeepSeek V4 MTP checkpoint namespace mismatch: " + "; ".join(details)
+        )
     return {
         "block_count": MTP_BLOCK_COUNT,
         "target_layer_ids": list(deepseek_v4_mtp_target_layer_ids(config)),
@@ -205,14 +207,28 @@ def deepseek_v4_mtp_checkpoint_mapping_reversed():
         WeightRenaming(r"^mtp\.(\d+)\.hc_ffn_scale$", r"mtp.\1.ffn_hc.scale"),
         WeightRenaming(r"^mtp\.(\d+)\.attn\.", r"mtp.\1.self_attn."),
         WeightRenaming(r"^mtp\.(\d+)\.ffn\.", r"mtp.\1.mlp."),
-        WeightRenaming(r"^mtp\.(\d+)\.self_attn\.attn_sink$", r"mtp.\1.self_attn.sinks"),
-        WeightRenaming(r"^mtp\.(\d+)\.self_attn\.wq_a\.", r"mtp.\1.self_attn.q_a_proj."),
-        WeightRenaming(r"^mtp\.(\d+)\.self_attn\.wq_b\.", r"mtp.\1.self_attn.q_b_proj."),
+        WeightRenaming(
+            r"^mtp\.(\d+)\.self_attn\.attn_sink$", r"mtp.\1.self_attn.sinks"
+        ),
+        WeightRenaming(
+            r"^mtp\.(\d+)\.self_attn\.wq_a\.", r"mtp.\1.self_attn.q_a_proj."
+        ),
+        WeightRenaming(
+            r"^mtp\.(\d+)\.self_attn\.wq_b\.", r"mtp.\1.self_attn.q_b_proj."
+        ),
         WeightRenaming(r"^mtp\.(\d+)\.self_attn\.wkv\.", r"mtp.\1.self_attn.kv_proj."),
-        WeightRenaming(r"^mtp\.(\d+)\.self_attn\.wo_a\.", r"mtp.\1.self_attn.o_a_proj."),
-        WeightRenaming(r"^mtp\.(\d+)\.self_attn\.wo_b\.", r"mtp.\1.self_attn.o_b_proj."),
-        WeightRenaming(r"^mtp\.(\d+)\.self_attn\.q_norm\.", r"mtp.\1.self_attn.q_a_norm."),
-        WeightRenaming(r"^mtp\.(\d+)\.mlp\.gate\.bias$", r"mtp.\1.mlp.gate.e_score_correction_bias"),
+        WeightRenaming(
+            r"^mtp\.(\d+)\.self_attn\.wo_a\.", r"mtp.\1.self_attn.o_a_proj."
+        ),
+        WeightRenaming(
+            r"^mtp\.(\d+)\.self_attn\.wo_b\.", r"mtp.\1.self_attn.o_b_proj."
+        ),
+        WeightRenaming(
+            r"^mtp\.(\d+)\.self_attn\.q_norm\.", r"mtp.\1.self_attn.q_a_norm."
+        ),
+        WeightRenaming(
+            r"^mtp\.(\d+)\.mlp\.gate\.bias$", r"mtp.\1.mlp.gate.e_score_correction_bias"
+        ),
         WeightRenaming(
             r"^mtp\.(\d+)\.mlp\.shared_experts\.w1\.",
             r"mtp.\1.mlp.shared_experts.gate_proj.",
@@ -265,17 +281,26 @@ class DeepSeekV4MTPAuxiliaryShell(nn.Module):
         self.target_layer_ids = target_layer_ids
         self.config = copy.deepcopy(config)
         self.config.num_hidden_layers = self.base_num_hidden_layers + MTP_BLOCK_COUNT
-        self.config.layer_types = list(config.layer_types) + ["sliding_attention"] * MTP_BLOCK_COUNT
-        self.config.mlp_layer_types = list(config.mlp_layer_types) + ["moe"] * MTP_BLOCK_COUNT
+        self.config.layer_types = (
+            list(config.layer_types) + ["sliding_attention"] * MTP_BLOCK_COUNT
+        )
+        self.config.mlp_layer_types = (
+            list(config.mlp_layer_types) + ["moe"] * MTP_BLOCK_COUNT
+        )
 
         source_dtype = getattr(config, "dtype", None)
-        if not isinstance(source_dtype, torch.dtype) or not source_dtype.is_floating_point:
+        if (
+            not isinstance(source_dtype, torch.dtype)
+            or not source_dtype.is_floating_point
+        ):
             source_dtype = torch.bfloat16
         with local_torch_dtype(source_dtype, model_class_name=type(self).__name__):
             with torch.device(device):
                 self.mtp = nn.ModuleList(
                     [
-                        DeepseekV4DecoderLayer(self.config, self.base_num_hidden_layers + index)
+                        DeepseekV4DecoderLayer(
+                            self.config, self.base_num_hidden_layers + index
+                        )
                         for index in range(MTP_BLOCK_COUNT)
                     ]
                 )
@@ -295,7 +320,9 @@ class DeepSeekV4MTPAuxiliaryShell(nn.Module):
                 )
                 markov_rank = int(getattr(config, "dspark_markov_rank", 0))
                 if markov_rank <= 0:
-                    raise ValueError(f"DeepSeek V4 MTP requires dspark_markov_rank, got {markov_rank}")
+                    raise ValueError(
+                        f"DeepSeek V4 MTP requires dspark_markov_rank, got {markov_rank}"
+                    )
                 terminal.markov_head = _DeepSeekV4MTPMarkovHead(
                     vocab_size=int(config.vocab_size), rank=markov_rank
                 )
@@ -396,7 +423,9 @@ class DeepSeekV4MTPAuxiliary:
             raise IndexError(f"MTP block index {index} outside [0, {MTP_BLOCK_COUNT})")
         return self.model.mtp[index]
 
-    def checkpoint_tensors_for_submodule(self, target_submodule: nn.Module, *, recurse: bool = False):
+    def checkpoint_tensors_for_submodule(
+        self, target_submodule: nn.Module, *, recurse: bool = False
+    ):
         return self.turtle_model.checkpoint_tensors_for_submodule(
             target_model=self.model,
             target_submodule=target_submodule,
@@ -410,7 +439,9 @@ class DeepSeekV4MTPAuxiliary:
         device: torch.device | str,
         recurse: bool = True,
     ) -> nn.Module:
-        checkpoint_tensors = self.checkpoint_tensors_for_submodule(target_submodule, recurse=False)
+        checkpoint_tensors = self.checkpoint_tensors_for_submodule(
+            target_submodule, recurse=False
+        )
         weight = checkpoint_tensors.get("weight")
         if isinstance(weight, torch.Tensor) and (
             weight.dtype in {torch.uint8, torch.int8}
@@ -527,7 +558,9 @@ class DeepSeekV4TargetAnchorResolver:
             raise ValueError("DeepSeek V4 target anchor chunk sizes must be positive")
         weight = lm_head.weight
         if weight.ndim != 2 or not weight.dtype.is_floating_point:
-            raise ValueError("DeepSeek V4 target anchor weight must be a floating rank-2 tensor")
+            raise ValueError(
+                "DeepSeek V4 target anchor weight must be a floating rank-2 tensor"
+            )
         self.hc_head = hc_head
         self.norm = norm
         self.lm_head = lm_head
@@ -553,7 +586,10 @@ class DeepSeekV4TargetAnchorResolver:
             ("decode mask", decode_mask),
             ("position IDs", position_ids),
         ):
-            if not isinstance(value, torch.Tensor) or tuple(value.shape) != batch_sequence:
+            if (
+                not isinstance(value, torch.Tensor)
+                or tuple(value.shape) != batch_sequence
+            ):
                 raise ValueError(
                     f"DeepSeek V4 target anchor {name} must have shape {batch_sequence}"
                 )
@@ -570,13 +606,17 @@ class DeepSeekV4TargetAnchorResolver:
         ):
             parameters = tuple(module.parameters())
             if any(parameter.is_meta for parameter in parameters):
-                raise ValueError(f"DeepSeek V4 target anchor {module_name} is still meta")
+                raise ValueError(
+                    f"DeepSeek V4 target anchor {module_name} is still meta"
+                )
             if any(parameter.device != raw_hidden.device for parameter in parameters):
                 raise ValueError(
                     f"DeepSeek V4 target anchor {module_name} must share the residual device"
                 )
 
-        eligible = attention_mask.to(dtype=torch.bool) & decode_mask.to(dtype=torch.bool)
+        eligible = attention_mask.to(dtype=torch.bool) & decode_mask.to(
+            dtype=torch.bool
+        )
         anchors = torch.full(
             batch_sequence,
             -1,
@@ -585,7 +625,9 @@ class DeepSeekV4TargetAnchorResolver:
         )
         coordinates = torch.nonzero(eligible, as_tuple=False)
         vocab_size = int(self.lm_head.weight.shape[0])
-        for position_start in range(0, int(coordinates.shape[0]), self.position_chunk_size):
+        for position_start in range(
+            0, int(coordinates.shape[0]), self.position_chunk_size
+        ):
             coordinate_chunk = coordinates[
                 position_start : position_start + self.position_chunk_size
             ]
@@ -687,7 +729,9 @@ class DeepSeekV4MTPPrefixRuntime:
 
         weight = getattr(self.target_embedding, "weight", None)
         if not isinstance(weight, torch.Tensor):
-            raise RuntimeError("DeepSeek V4 target embedding has no materialized weight")
+            raise RuntimeError(
+                "DeepSeek V4 target embedding has no materialized weight"
+            )
         return DeepSeekV4MTPReplay(self.auxiliary, embedding_weight=weight)
 
 
@@ -709,7 +753,11 @@ class DeepSeekV4MTPReplay:
         embedding_weight: torch.Tensor,
         noise_token_id: int | None = None,
     ) -> None:
-        shell = auxiliary.model if isinstance(auxiliary, DeepSeekV4MTPAuxiliary) else auxiliary
+        shell = (
+            auxiliary.model
+            if isinstance(auxiliary, DeepSeekV4MTPAuxiliary)
+            else auxiliary
+        )
         if not isinstance(shell, DeepSeekV4MTPAuxiliaryShell):
             raise TypeError("DeepSeek V4 MTP replay requires an auxiliary shell")
         if not isinstance(embedding_weight, torch.Tensor) or embedding_weight.ndim != 2:
@@ -722,14 +770,18 @@ class DeepSeekV4MTPReplay:
                 f"actual={tuple(embedding_weight.shape)} expected={(vocab_size, hidden_size)}"
             )
         configured_noise = int(getattr(shell.config, "dspark_noise_token_id", -1))
-        self.noise_token_id = configured_noise if noise_token_id is None else int(noise_token_id)
+        self.noise_token_id = (
+            configured_noise if noise_token_id is None else int(noise_token_id)
+        )
         if not 0 <= self.noise_token_id < vocab_size:
             raise ValueError(
                 f"DeepSeek V4 MTP replay noise token {self.noise_token_id} outside [0, {vocab_size})"
             )
         block_size = int(getattr(shell.config, "dspark_block_size", 0))
         if block_size != 5:
-            raise ValueError(f"DeepSeek V4 MTP replay requires five proposal rows, got {block_size}")
+            raise ValueError(
+                f"DeepSeek V4 MTP replay requires five proposal rows, got {block_size}"
+            )
         self.shell = shell
         self.embedding_weight = embedding_weight
 
@@ -766,7 +818,9 @@ class DeepSeekV4MTPReplay:
             )
         batch_size, main_rows, hidden_size = map(int, first.shape)
         expected_hidden = int(self.shell.config.hidden_size)
-        if batch_size <= 0 or not 1 <= main_rows <= int(self.shell.config.sliding_window):
+        if batch_size <= 0 or not 1 <= main_rows <= int(
+            self.shell.config.sliding_window
+        ):
             raise ValueError(
                 "DeepSeek V4 MTP main window must contain 1.."
                 f"{int(self.shell.config.sliding_window)} rows"
@@ -777,17 +831,19 @@ class DeepSeekV4MTPReplay:
             )
         if batch.target_taps is not None:
             for index, tap in enumerate(batch.target_taps):
-                if not isinstance(tap, torch.Tensor) or tuple(tap.shape) != tuple(first.shape):
+                if not isinstance(tap, torch.Tensor) or tuple(tap.shape) != tuple(
+                    first.shape
+                ):
                     raise ValueError(
                         f"DeepSeek V4 MTP target tap {index} shape mismatch: "
                         f"actual={getattr(tap, 'shape', None)} expected={tuple(first.shape)}"
                     )
                 if tap.device != first.device or tap.dtype != first.dtype:
-                    raise ValueError("DeepSeek V4 MTP target taps must share dtype and device")
+                    raise ValueError(
+                        "DeepSeek V4 MTP target taps must share dtype and device"
+                    )
         if tuple(batch.anchor_token_ids.shape) != (batch_size,):
-            raise ValueError(
-                f"DeepSeek V4 MTP anchors must have shape {(batch_size,)}"
-            )
+            raise ValueError(f"DeepSeek V4 MTP anchors must have shape {(batch_size,)}")
         if batch.anchor_token_ids.device != first.device:
             raise ValueError("DeepSeek V4 MTP anchors must share the target-tap device")
         if batch.anchor_token_ids.dtype not in (torch.int32, torch.int64):
@@ -805,15 +861,22 @@ class DeepSeekV4MTPReplay:
             raise ValueError(
                 f"DeepSeek V4 MTP main mask must have shape {expected_main}"
             )
-        if batch.main_position_ids.device != first.device or batch.main_attention_mask.device != first.device:
-            raise ValueError("DeepSeek V4 MTP metadata must share the target-tap device")
+        if (
+            batch.main_position_ids.device != first.device
+            or batch.main_attention_mask.device != first.device
+        ):
+            raise ValueError(
+                "DeepSeek V4 MTP metadata must share the target-tap device"
+            )
         mask = batch.main_attention_mask.to(dtype=torch.bool)
         for row in range(batch_size):
             valid = torch.nonzero(mask[row], as_tuple=False).flatten()
             if valid.numel() == 0:
                 raise ValueError(f"DeepSeek V4 MTP batch row {row} has no main context")
             expected_start = main_rows - int(valid.numel())
-            expected_indices = torch.arange(expected_start, main_rows, device=valid.device)
+            expected_indices = torch.arange(
+                expected_start, main_rows, device=valid.device
+            )
             if not torch.equal(valid, expected_indices):
                 raise ValueError(
                     "DeepSeek V4 MTP main context must be a contiguous right-aligned suffix"
@@ -824,7 +887,9 @@ class DeepSeekV4MTPReplay:
             if positions.numel() > 1 and not torch.equal(
                 positions[1:], positions[:-1] + 1
             ):
-                raise ValueError("DeepSeek V4 MTP valid main positions must be contiguous")
+                raise ValueError(
+                    "DeepSeek V4 MTP valid main positions must be contiguous"
+                )
         return batch_size, main_rows, hidden_size
 
     def _proposal_metadata(
@@ -840,11 +905,17 @@ class DeepSeekV4MTPReplay:
         proposal_ids[:, 0].copy_(batch.anchor_token_ids)
         mask = batch.main_attention_mask.to(dtype=torch.bool)
         last_main = torch.stack(
-            [batch.main_position_ids[row, torch.nonzero(mask[row], as_tuple=False)[-1, 0]] for row in range(batch_size)]
+            [
+                batch.main_position_ids[
+                    row, torch.nonzero(mask[row], as_tuple=False)[-1, 0]
+                ]
+                for row in range(batch_size)
+            ]
         ).to(dtype=torch.long)
-        proposal_positions = last_main[:, None] + torch.arange(
-            1, 6, dtype=torch.long, device=last_main.device
-        )[None, :]
+        proposal_positions = (
+            last_main[:, None]
+            + torch.arange(1, 6, dtype=torch.long, device=last_main.device)[None, :]
+        )
         proposal_visible = torch.ones(
             (batch_size, 5), dtype=torch.bool, device=mask.device
         )
@@ -870,7 +941,9 @@ class DeepSeekV4MTPReplay:
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         from transformers.cache_utils import DynamicCache
-        from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+            apply_rotary_pos_emb,
+        )
 
         input_shape = projected_main.shape[:-1]
         hidden_shape = (*input_shape, -1, int(block.self_attn.head_dim))
@@ -912,9 +985,13 @@ class DeepSeekV4MTPReplay:
             else batch.target_taps[0]
         )
         if self.embedding_weight.device != first.device:
-            raise ValueError("DeepSeek V4 MTP embedding and target taps must share a device")
+            raise ValueError(
+                "DeepSeek V4 MTP embedding and target taps must share a device"
+            )
         if self.embedding_weight.dtype != first.dtype:
-            raise ValueError("DeepSeek V4 MTP embedding and target taps must share a dtype")
+            raise ValueError(
+                "DeepSeek V4 MTP embedding and target taps must share a dtype"
+            )
         if batch.projected_main is None:
             concatenated = torch.cat(batch.target_taps, dim=-1)
             projected_main = self.shell.mtp[0].main_norm(
@@ -926,9 +1003,11 @@ class DeepSeekV4MTPReplay:
             batch, dtype=first.dtype
         )
         proposal_embedding = F.embedding(proposal_ids, self.embedding_weight)
-        residual = proposal_embedding.unsqueeze(2).expand(
-            -1, -1, int(self.shell.config.hc_mult), -1
-        ).contiguous()
+        residual = (
+            proposal_embedding.unsqueeze(2)
+            .expand(-1, -1, int(self.shell.config.hc_mult), -1)
+            .contiguous()
+        )
         rotary = DeepseekV4RotaryEmbedding(self.shell.config).to(
             device=first.device, dtype=first.dtype
         )
@@ -1075,7 +1154,8 @@ class DeepSeekV4MTPReplay:
         self,
         batch: DeepSeekV4MTPReplayBatch,
         *,
-        prepare_ffn: Callable[[int, nn.Module, torch.Tensor, torch.Tensor], None] | None = None,
+        prepare_ffn: Callable[[int, nn.Module, torch.Tensor, torch.Tensor], None]
+        | None = None,
     ) -> DeepSeekV4MTPReplayResult:
         """Run all three blocks while preserving the joint five-row batch."""
         state = self.prepare_batch(batch)
@@ -1152,13 +1232,9 @@ def _deepseek_v4_mtp_quantization_block_forward(
         proposal_token_ids=kwargs[MTP_REPLAY_PROPOSAL_TOKEN_IDS],
         proposal_position_ids=proposal_positions,
         joint_attention_mask=kwargs[MTP_REPLAY_ATTENTION_MASK],
-        proposal_position_embeddings=kwargs[
-            MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS
-        ],
+        proposal_position_embeddings=kwargs[MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS],
         main_position_embeddings=kwargs[MTP_REPLAY_MAIN_POSITION_EMBEDDINGS],
-        prepare_ffn=getattr(
-            self, "_gptqmodel_mtp_zero_route_force", None
-        ),
+        prepare_ffn=getattr(self, "_gptqmodel_mtp_zero_route_force", None),
         mlp_capture_context=getattr(
             self, "_gptqmodel_mtp_normal_mlp_capture_context", None
         ),
@@ -1450,16 +1526,22 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         """Attach the completed disjoint MTP adapter for one atomic target save."""
 
         if not isinstance(adapter, DeepSeekV4MTPQuantizationModel):
-            raise TypeError("MTP save attachment requires DeepSeekV4MTPQuantizationModel")
+            raise TypeError(
+                "MTP save attachment requires DeepSeekV4MTPQuantizationModel"
+            )
         if getattr(self, "_mtp_quantization_model_for_save", None) is not None:
             raise RuntimeError("an MTP quantization adapter is already attached")
         if not adapter.quantized:
             raise RuntimeError("MTP quantization adapter is not complete")
         if adapter.model_local_path != self.model_local_path:
-            raise RuntimeError("MTP adapter and target model use different source snapshots")
+            raise RuntimeError(
+                "MTP adapter and target model use different source snapshots"
+            )
         expected = deepseek_v4_mtp_target_layer_ids(self.model.config)
         if len(adapter.model.mtp) != len(expected):
-            raise RuntimeError("MTP adapter block geometry differs from the target model")
+            raise RuntimeError(
+                "MTP adapter block geometry differs from the target model"
+            )
         expected_projection_count = (
             MTP_BLOCK_COUNT * int(self.model.config.n_routed_experts) * 3
         )
@@ -1508,9 +1590,7 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
             and name.startswith("mtp.")
             and ".mlp.experts." in name
         )
-        expected_count = (
-            MTP_BLOCK_COUNT * int(self.model.config.n_routed_experts) * 3
-        )
+        expected_count = MTP_BLOCK_COUNT * int(self.model.config.n_routed_experts) * 3
         if len(prefixes) != expected_count:
             raise RuntimeError(
                 "MTP EXL3 save overlay coverage mismatch: "
@@ -1531,7 +1611,9 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         precision = patch_deepseek_v4_checkpoint_precision(model)
         expected_layers = int(getattr(model.config, "num_hidden_layers", 0))
         if expected_layers <= 0:
-            raise RuntimeError("DeepSeek V4 source-precision patch has no target layers")
+            raise RuntimeError(
+                "DeepSeek V4 source-precision patch has no target layers"
+            )
         layer_types = tuple(getattr(model.config, "layer_types", ()) or ())
         if len(layer_types) != expected_layers:
             raise RuntimeError(
@@ -1644,9 +1726,7 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
             )
             decode_mask = torch.zeros_like(input_ids, dtype=torch.bool)
             decode_mask[:, :-1] = (
-                (effective_labels[:, 1:] != -100)
-                & valid[:, :-1]
-                & valid[:, 1:]
+                (effective_labels[:, 1:] != -100) & valid[:, :-1] & valid[:, 1:]
             )
             metadata[MTP_CAPTURE_DECODE_MASK] = decode_mask.detach().to(
                 device=batch_device
@@ -1742,7 +1822,9 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
     ) -> None:
         sink = getattr(self, "_mtp_target_tap_sink", None)
         if not callable(sink):
-            raise RuntimeError("DeepSeek V4 MTP target-tap output has no installed sink")
+            raise RuntimeError(
+                "DeepSeek V4 MTP target-tap output has no installed sink"
+            )
         if int(layer_index) not in deepseek_v4_mtp_target_layer_ids(self.model.config):
             raise RuntimeError(
                 f"DeepSeek V4 received an unexpected target-tap layer {layer_index}"
@@ -1791,7 +1873,9 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
 
         model_local_path = getattr(self, "model_local_path", None)
         if not model_local_path:
-            raise RuntimeError("DeepSeek V4 MTP auxiliary loading requires a local checkpoint snapshot")
+            raise RuntimeError(
+                "DeepSeek V4 MTP auxiliary loading requires a local checkpoint snapshot"
+            )
         return DeepSeekV4MTPAuxiliary.from_checkpoint(
             config=self.model.config,
             model_local_path=model_local_path,
@@ -1809,7 +1893,9 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
 
         if not isinstance(auxiliary, DeepSeekV4MTPAuxiliary):
             raise TypeError("auxiliary must be a DeepSeekV4MTPAuxiliary")
-        checkpoint_tensors = auxiliary.checkpoint_tensors_for_submodule(target_submodule)
+        checkpoint_tensors = auxiliary.checkpoint_tensors_for_submodule(
+            target_submodule
+        )
         if not isinstance(checkpoint_tensors.get("weight"), torch.Tensor):
             raise RuntimeError("MTP quant source module has no checkpoint weight")
         if target_dtype is None:
@@ -1851,7 +1937,10 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
             )
         replay_device = torch.device(device)
         source_dtype = getattr(self.model.config, "dtype", None)
-        if not isinstance(source_dtype, torch.dtype) or not source_dtype.is_floating_point:
+        if (
+            not isinstance(source_dtype, torch.dtype)
+            or not source_dtype.is_floating_point
+        ):
             raise RuntimeError(
                 f"DeepSeek V4 MTP prefix runtime has invalid source dtype {source_dtype!r}"
             )
@@ -1895,7 +1984,9 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
                 raise RuntimeError(
                     f"DeepSeek V4 MTP prefix module {path} remained on the meta device"
                 )
-            if any(tensor.device != replay_device for tensor in (*parameters, *buffers)):
+            if any(
+                tensor.device != replay_device for tensor in (*parameters, *buffers)
+            ):
                 raise RuntimeError(
                     f"DeepSeek V4 MTP prefix module {path} was materialized on the wrong device"
                 )
@@ -1937,7 +2028,9 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
                 for tensor in (*module.parameters(), *module.buffers())
                 if tensor.is_floating_point()
             )
-            if not floating or any(tensor.dtype is not source_dtype for tensor in floating):
+            if not floating or any(
+                tensor.dtype is not source_dtype for tensor in floating
+            ):
                 raise RuntimeError(
                     f"DeepSeek V4 MTP prefix module {path} did not retain {source_dtype}"
                 )
@@ -2028,7 +2121,9 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         ).to(device=device)
         decoded_parameters = dict(decoded.named_parameters(recurse=False))
         if "weight" not in decoded_parameters:
-            raise RuntimeError("decoded MTP replay module did not expose a direct weight")
+            raise RuntimeError(
+                "decoded MTP replay module did not expose a direct weight"
+            )
         for name, parameter in decoded_parameters.items():
             if name not in target_submodule._parameters:
                 raise RuntimeError(
@@ -2174,6 +2269,15 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         0: ("main_proj", "main_norm"),
         2: ("hc_head", "norm", "markov_head", "confidence_head"),
     }
+    _PASSTHROUGH_TENSORS = (
+        "self_attn.sinks",
+        "attn_hc.fn",
+        "attn_hc.base",
+        "attn_hc.scale",
+        "ffn_hc.fn",
+        "ffn_hc.base",
+        "ffn_hc.scale",
+    )
 
     def after_model_load(self, model, load_quantized_model=False):
         del load_quantized_model
@@ -2277,9 +2381,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         ledger_provenance = getattr(processor, "_ledger_provenance", None)
         provenance = ledger_provenance() if callable(ledger_provenance) else None
         family_join = (
-            provenance.get("family_join")
-            if isinstance(provenance, dict)
-            else None
+            provenance.get("family_join") if isinstance(provenance, dict) else None
         )
         recovery_recipe = zero_route_recovery_recipe(family_join)
         candidate_rank_min = recovery_recipe["candidate_rank_min"]
@@ -2354,9 +2456,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             if (
                 isinstance(natural_count, bool)
                 or not isinstance(natural_count, int)
-                or not 0
-                <= natural_count
-                < target_sample_count
+                or not 0 <= natural_count < target_sample_count
             ):
                 raise RuntimeError(
                     f"DeepSeek V4 recovery target has invalid natural count: `{full_name}`"
@@ -2399,9 +2499,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             if pending_ffn_input is not None:
                 raise RuntimeError("DeepSeek V4 recovery router input was not consumed")
             expert_input = ffn_input.reshape(-1, ffn_input.shape[-1])
-            keep_mask = getattr(
-                getattr(processor, "_mask_tls", None), "value", None
-            )
+            keep_mask = getattr(getattr(processor, "_mask_tls", None), "value", None)
             if keep_mask is not None:
                 keep_mask = keep_mask.reshape(-1).to(
                     device=expert_input.device,
@@ -2465,9 +2563,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 logits = logits[keep_mask]
             selected_indices = output[2]
             if not isinstance(selected_indices, torch.Tensor):
-                raise RuntimeError(
-                    "DeepSeek V4 recovery router indices are invalid"
-                )
+                raise RuntimeError("DeepSeek V4 recovery router indices are invalid")
             if keep_mask is not None:
                 selected_indices = selected_indices[keep_mask]
             ranked_scores, ranked_indices = learned_router_ranked_choices(
@@ -2480,16 +2576,11 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             for expert_index in sorted(targets):
                 needed = needed_by_expert[expert_index]
                 candidate_indices = torch.nonzero(
-                    ranked_indices[:, router_top_k:candidate_rank_max]
-                    == expert_index,
+                    ranked_indices[:, router_top_k:candidate_rank_max] == expert_index,
                     as_tuple=False,
                 )
-                observed_by_expert[expert_index] += int(
-                    candidate_indices.shape[0]
-                )
-                for rank_offset in range(
-                    candidate_rank_max - router_top_k
-                ):
+                observed_by_expert[expert_index] += int(candidate_indices.shape[0])
+                for rank_offset in range(candidate_rank_max - router_top_k):
                     rank = rank_offset + candidate_rank_min
                     remaining = needed - retained_by_rank[expert_index][rank]
                     if remaining <= 0:
@@ -2511,14 +2602,14 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                         .float()
                         .cpu()
                     )
-                    retained_by_rank[expert_index][rank] += int(
-                        row_indices.numel()
-                    )
+                    retained_by_rank[expert_index][rank] += int(row_indices.numel())
             del ranked_scores, ranked_indices, boundary
 
         def finish_router_candidates() -> None:
             if pending_ffn_input is not None or pending_keep_mask is not None:
-                raise RuntimeError("DeepSeek V4 recovery ended with a pending router input")
+                raise RuntimeError(
+                    "DeepSeek V4 recovery ended with a pending router input"
+                )
             experts = layer_module.mlp.experts
             for expert_index in sorted(targets):
                 needed = needed_by_expert[expert_index]
@@ -2540,12 +2631,12 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                         break
                     if not candidate_rows[expert_index][rank]:
                         continue
-                    rank_rows = torch.cat(
-                        candidate_rows[expert_index][rank], dim=0
-                    )[:remaining]
-                    rank_gaps = torch.cat(
-                        candidate_gaps[expert_index][rank], dim=0
-                    )[:remaining]
+                    rank_rows = torch.cat(candidate_rows[expert_index][rank], dim=0)[
+                        :remaining
+                    ]
+                    rank_gaps = torch.cat(candidate_gaps[expert_index][rank], dim=0)[
+                        :remaining
+                    ]
                     selected_rows.append(rank_rows)
                     selected_gaps.append(rank_gaps)
                     count = int(rank_rows.shape[0])
@@ -2569,7 +2660,9 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     initialized_states: set[int] = set()
                     for task_name in task_names_by_expert[expert_index]:
                         task = processor.tasks.get(task_name)
-                        capture = task.get("capture") if isinstance(task, dict) else None
+                        capture = (
+                            task.get("capture") if isinstance(task, dict) else None
+                        )
                         state_id = id(getattr(capture, "_hessian_state", capture))
                         if state_id in initialized_states:
                             continue
@@ -2593,9 +2686,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                         columns = int(columns)
                         target_device = getattr(
                             capture, "hessian_accumulator_device", None
-                        ) or getattr(
-                            capture, "_final_hessian_device_hint", None
-                        )
+                        ) or getattr(capture, "_final_hessian_device_hint", None)
                         if target_device is None:
                             raise RuntimeError(
                                 "DeepSeek V4 identity recovery has no Hessian owner"
@@ -2617,9 +2708,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 else:
                     selected_candidate_count = needed - identity_residual_count
                     expert_input = (
-                        torch.cat(selected_rows, dim=0)
-                        if selected_rows
-                        else None
+                        torch.cat(selected_rows, dim=0) if selected_rows else None
                     )
                     if (
                         expert_input is not None
@@ -2668,13 +2757,9 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                         for task_name in task_names_by_expert[expert_index]:
                             task = processor.tasks.get(task_name)
                             capture = (
-                                task.get("capture")
-                                if isinstance(task, dict)
-                                else None
+                                task.get("capture") if isinstance(task, dict) else None
                             )
-                            state_id = id(
-                                getattr(capture, "_hessian_state", capture)
-                            )
+                            state_id = id(getattr(capture, "_hessian_state", capture))
                             if state_id in adjusted_states:
                                 continue
                             adjusted_states.add(state_id)
@@ -2739,20 +2824,15 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                                 ),
                             )[0]
                             partial = partials[partial_device]
-                            if (
-                                partial.dtype != torch.float32
-                                or tuple(partial.shape) != (columns, columns)
-                            ):
+                            if partial.dtype != torch.float32 or tuple(
+                                partial.shape
+                            ) != (columns, columns):
                                 raise RuntimeError(
                                     "DeepSeek V4 identity residual found an "
                                     "invalid raw Hessian"
                                 )
-                            partial.diagonal().add_(
-                                float(identity_residual_count)
-                            )
-                            sample_counts[partial_device] += (
-                                identity_residual_count
-                            )
+                            partial.diagonal().add_(float(identity_residual_count))
+                            sample_counts[partial_device] += identity_residual_count
                             capture.nsamples += identity_residual_count
                     if selected_gaps:
                         gap_values = torch.cat(selected_gaps, dim=0).double()
@@ -2782,9 +2862,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 for task_name in task_names_by_expert[expert_index]:
                     task = processor.tasks.get(task_name)
                     if not isinstance(task, dict):
-                        raise RuntimeError(
-                            "DeepSeek V4 recovery lost a processor task"
-                        )
+                        raise RuntimeError("DeepSeek V4 recovery lost a processor task")
                     task["zero_route_recovery_capture"] = copy.deepcopy(summary)
                 if not pure_identity_recovery and expert_input is not None:
                     del expert_input
@@ -2839,15 +2917,11 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     "DeepSeek V4 recovery spool belongs to another projection phase"
                 )
             expected_batches = int(capture_spool.key["expected_batches"])
-            if capture_spool.committed_indices != frozenset(
-                range(expected_batches)
-            ):
+            if capture_spool.committed_indices != frozenset(range(expected_batches)):
                 raise RuntimeError(
                     "DeepSeek V4 recovery requires every natural capture batch"
                 )
-            candidate_width = (
-                candidate_rank_max - candidate_rank_min + 1
-            )
+            candidate_width = candidate_rank_max - candidate_rank_min + 1
             for batch_index in range(expected_batches):
                 tensors, _metadata = capture_spool.load(batch_index)
                 expert_input = tensors.get("router_input")
@@ -2887,13 +2961,11 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                             expert_input.index_select(0, row_indices).clone()
                         )
                         candidate_gaps[expert_index][rank].append(
-                            candidate_score_gaps[
-                                row_indices, rank_offset
-                            ].float().clone()
+                            candidate_score_gaps[row_indices, rank_offset]
+                            .float()
+                            .clone()
                         )
-                        retained_by_rank[expert_index][rank] += int(
-                            row_indices.numel()
-                        )
+                        retained_by_rank[expert_index][rank] += int(row_indices.numel())
                 del tensors
 
             try:
@@ -3057,12 +3129,9 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             raise ValueError(
                 "MTP replay batches are already jointly batched; batch_size must be 1"
             )
-        if (
-            isinstance(calibration_dataset, Sequence)
-            and isinstance(
-                getattr(calibration_dataset, "gptqmodel_calibration_summary", None),
-                dict,
-            )
+        if isinstance(calibration_dataset, Sequence) and isinstance(
+            getattr(calibration_dataset, "gptqmodel_calibration_summary", None),
+            dict,
         ):
             return _DeepSeekV4MTPPreparedDataset(self, calibration_dataset)
         prepared = []
@@ -3130,9 +3199,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         provider = _DeepSeekV4MTPInputProvider(self, calibration_data)
         return InputCache(
             layer_inputs=_DeepSeekV4MTPInputView(provider, "layer_inputs"),
-            layer_input_kwargs=_DeepSeekV4MTPInputView(
-                provider, "layer_input_kwargs"
-            ),
+            layer_input_kwargs=_DeepSeekV4MTPInputView(provider, "layer_input_kwargs"),
             position_ids=_DeepSeekV4MTPInputView(provider, "position_ids"),
             attention_masks=_DeepSeekV4MTPInputView(provider, "attention_mask"),
         )
@@ -3154,9 +3221,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         missing = sorted(required - set(example))
         if missing:
             raise ValueError("MTP calibration example lacks " + ", ".join(missing))
-        has_projected = bool(
-            example["_gptqmodel_mtp_has_projected_main"].item()
-        )
+        has_projected = bool(example["_gptqmodel_mtp_has_projected_main"].item())
         stored_main = example[MTP_REPLAY_PROJECTED_MAIN]
         if has_projected:
             projected_main = stored_main
@@ -3188,9 +3253,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                 MTP_REPLAY_PROPOSAL_POSITION_EMBEDDINGS: (
                     state.proposal_position_embeddings
                 ),
-                MTP_REPLAY_MAIN_POSITION_EMBEDDINGS: (
-                    state.main_position_embeddings
-                ),
+                MTP_REPLAY_MAIN_POSITION_EMBEDDINGS: (state.main_position_embeddings),
             },
         )
 
@@ -3229,7 +3292,9 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             )
             materialized += 1
         if materialized == 0:
-            raise RuntimeError("MTP quantization block materialized no checkpoint leaves")
+            raise RuntimeError(
+                "MTP quantization block materialized no checkpoint leaves"
+            )
         return module
 
     def post_quantize(self, module: nn.Module) -> nn.Module:
@@ -3245,35 +3310,74 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         """
 
         block_index = next(
-            (
-                index
-                for index, block in enumerate(self.model.mtp)
-                if module is block
-            ),
+            (index for index, block in enumerate(self.model.mtp) if module is block),
             None,
         )
         if block_index is None:
             return super().post_quantize(module)
 
-        detached: list[tuple[str, nn.Module]] = []
-        for name in self._PASSTHROUGH_ROOTS_BY_BLOCK.get(block_index, ()):
+        passthrough_roots = self._PASSTHROUGH_ROOTS_BY_BLOCK.get(block_index, ())
+        unexpected_meta = sorted(
+            name
+            for name, tensor in (
+                tuple(module.named_parameters()) + tuple(module.named_buffers())
+            )
+            if tensor.is_meta
+            and name not in self._PASSTHROUGH_TENSORS
+            and not any(
+                name == root or name.startswith(f"{root}.")
+                for root in passthrough_roots
+            )
+        )
+        if unexpected_meta:
+            raise RuntimeError(
+                "MTP executable block body still contains unexpected meta tensors: "
+                + ", ".join(unexpected_meta[:16])
+            )
+
+        detached_roots: list[tuple[str, nn.Module]] = []
+        for name in passthrough_roots:
             child = module._modules.get(name)
             if child is None:
                 continue
             tensors = tuple(child.parameters()) + tuple(child.buffers())
             if tensors and any(tensor.is_meta for tensor in tensors):
-                detached.append((name, module._modules.pop(name)))
+                detached_roots.append((name, module._modules.pop(name)))
+
+        detached_tensors: list[tuple[nn.Module, str, str, torch.Tensor]] = []
+        for path in self._PASSTHROUGH_TENSORS:
+            owner_path, leaf = path.rsplit(".", 1)
+            owner = module.get_submodule(owner_path)
+            if leaf in owner._parameters:
+                kind = "parameter"
+                tensor = owner._parameters[leaf]
+                registry = owner._parameters
+            elif leaf in owner._buffers:
+                kind = "buffer"
+                tensor = owner._buffers[leaf]
+                registry = owner._buffers
+            else:
+                raise RuntimeError(f"MTP passthrough tensor {path!r} is absent")
+            if isinstance(tensor, torch.Tensor) and tensor.is_meta:
+                detached_tensors.append((owner, kind, leaf, tensor))
+                registry[leaf] = None
 
         try:
             return super().post_quantize(module)
         finally:
-            for name, child in detached:
+            for owner, kind, leaf, tensor in detached_tensors:
+                registry = owner._parameters if kind == "parameter" else owner._buffers
+                if registry.get(leaf) is not None:
+                    raise RuntimeError(
+                        f"MTP passthrough {kind} {leaf!r} was replaced during offload"
+                    )
+                registry[leaf] = tensor
+            for name, child in detached_roots:
                 if name in module._modules:
                     raise RuntimeError(
                         f"MTP passthrough root {name!r} was replaced during offload"
                     )
                 module.add_module(name, child)
-
 
 
 __all__ = [

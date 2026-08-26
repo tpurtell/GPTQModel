@@ -73,8 +73,14 @@ def _tiny_v4_config() -> DeepseekV4Config:
 def test_deepseek_v4_model_type_selects_definition(monkeypatch):
     fake_config = SimpleNamespace(model_type="deepseek_v4")
 
-    monkeypatch.setattr(auto, "resolve_trust_remote_code", lambda path, trust_remote_code=False: trust_remote_code)
-    monkeypatch.setattr(auto.AutoConfig, "from_pretrained", lambda *args, **kwargs: fake_config)
+    monkeypatch.setattr(
+        auto,
+        "resolve_trust_remote_code",
+        lambda path, trust_remote_code=False: trust_remote_code,
+    )
+    monkeypatch.setattr(
+        auto.AutoConfig, "from_pretrained", lambda *args, **kwargs: fake_config
+    )
 
     assert auto.check_and_get_model_definition("/tmp/deepseek-v4") is DeepSeekV4QModel
 
@@ -122,11 +128,14 @@ def test_deepseek_v4_target_input_capture_keeps_first_layer_lazy() -> None:
         model=SimpleNamespace(layers=nn.ModuleList([first, second]))
     )
 
-    assert harness.prepare_input_capture_layer(
-        first,
-        module_path="model.layers.0",
-        device=torch.device("cpu"),
-    ) is first
+    assert (
+        harness.prepare_input_capture_layer(
+            first,
+            module_path="model.layers.0",
+            device=torch.device("cpu"),
+        )
+        is first
+    )
     assert first.weight.device.type == "meta"
 
     try:
@@ -159,7 +168,9 @@ def test_deepseek_v4_pre_quantize_keeps_packed_target_layer_lazy(monkeypatch) ->
     assert first.weight.device.type == "meta"
 
 
-def test_auto_decoder_materializes_unquantized_linear_subclass_with_its_forward(monkeypatch) -> None:
+def test_auto_decoder_materializes_unquantized_linear_subclass_with_its_forward(
+    monkeypatch,
+) -> None:
     class GroupedLinear(nn.Linear):
         pass
 
@@ -211,7 +222,9 @@ def test_auto_decoder_materializes_unquantized_linear_subclass_with_its_forward(
     assert named.state["auto_module_decoder_forward_mode"] == "decode"
 
 
-def test_deepseek_v4_mtp_checkpoint_contract_is_exact_and_does_not_trust_nextn_count() -> None:
+def test_deepseek_v4_mtp_checkpoint_contract_is_exact_and_does_not_trust_nextn_count() -> (
+    None
+):
     config = _tiny_v4_config()
     assert config.num_nextn_predict_layers == 1
     keys = expected_deepseek_v4_mtp_checkpoint_keys(config)
@@ -281,7 +294,9 @@ def test_deepseek_v4_mtp_shell_is_defused_patched_and_fail_closed() -> None:
         raise AssertionError("generic MTP shell forward did not fail closed")
 
 
-def test_deepseek_v4_mtp_replay_keeps_five_rows_joint_and_uses_target_lane_means() -> None:
+def test_deepseek_v4_mtp_replay_keeps_five_rows_joint_and_uses_target_lane_means() -> (
+    None
+):
     torch.manual_seed(0xD54)
     config = _tiny_v4_config()
     shell = DeepSeekV4MTPAuxiliaryShell(config, device="cpu")
@@ -291,9 +306,7 @@ def test_deepseek_v4_mtp_replay_keeps_five_rows_joint_and_uses_target_lane_means
                 parameter.normal_(mean=0.0, std=0.02)
         for block in shell.mtp:
             block.mlp.gate.e_score_correction_bias.zero_()
-    embedding = torch.randn(
-        config.vocab_size, config.hidden_size, dtype=torch.bfloat16
-    )
+    embedding = torch.randn(config.vocab_size, config.hidden_size, dtype=torch.bfloat16)
     replay = DeepSeekV4MTPReplay(shell, embedding_weight=embedding)
 
     target_outputs = tuple(
@@ -410,9 +423,7 @@ def test_deepseek_v4_mtp_quantization_adapter_builds_without_target_model() -> N
         turtle_model=SimpleNamespace(),
         checkpoint_contract={"test": True},
     )
-    embedding = torch.randn(
-        config.vocab_size, config.hidden_size, dtype=torch.bfloat16
-    )
+    embedding = torch.randn(config.vocab_size, config.hidden_size, dtype=torch.bfloat16)
     qcfg = EXL3Config(bits=3.0, device="cpu")
 
     adapter = DeepSeekV4MTPQuantizationModel.from_auxiliary(
@@ -426,9 +437,7 @@ def test_deepseek_v4_mtp_quantization_adapter_builds_without_target_model() -> N
     assert adapter.model_local_path == "/tmp/deepseek-v4-test"
     assert adapter.quantize_config.bits == 3.0
     assert qcfg.module_include is None
-    assert adapter.quantize_config.module_is_included(
-        "mtp.1.mlp.experts.2.down_proj"
-    )
+    assert adapter.quantize_config.module_is_included("mtp.1.mlp.experts.2.down_proj")
     assert not adapter.quantize_config.module_is_included(
         "mtp.1.mlp.shared_experts.down_proj"
     )
@@ -455,16 +464,34 @@ def test_deepseek_v4_mtp_post_quantize_preserves_lazy_terminal_passthroughs() ->
         name: terminal._modules[name].to(device="meta")
         for name in ("hc_head", "norm", "markov_head", "confidence_head")
     }
+    tensor_passthrough = {}
+    for path in adapter._PASSTHROUGH_TENSORS:
+        owner_path, leaf = path.rsplit(".", 1)
+        owner = terminal.get_submodule(owner_path)
+        parameter = owner._parameters[leaf]
+        expected = nn.Parameter(
+            parameter.detach().to(device="meta"),
+            requires_grad=parameter.requires_grad,
+        )
+        owner._parameters[leaf] = expected
+        tensor_passthrough[path] = expected
 
     assert adapter.post_quantize(terminal) is terminal
     for name, expected in passthrough.items():
         assert terminal._modules[name] is expected
-        assert all(tensor.is_meta for tensor in (*expected.parameters(), *expected.buffers()))
+        assert all(
+            tensor.is_meta for tensor in (*expected.parameters(), *expected.buffers())
+        )
+    for path, expected in tensor_passthrough.items():
+        owner_path, leaf = path.rsplit(".", 1)
+        assert terminal.get_submodule(owner_path)._parameters[leaf] is expected
     assert all(
         tensor.device.type == "cpu"
-        for name, child in terminal._modules.items()
-        if name not in passthrough
-        for tensor in (*child.parameters(), *child.buffers())
+        for name, tensor in (
+            tuple(terminal.named_parameters()) + tuple(terminal.named_buffers())
+        )
+        if name not in tensor_passthrough
+        and not any(name == root or name.startswith(f"{root}.") for root in passthrough)
     )
 
 
@@ -537,12 +564,12 @@ def test_deepseek_v4_mtp_post_quantize_rejects_meta_block_body() -> None:
         model_local_path="/tmp/deepseek-v4-test",
     )
     terminal = shell.mtp[-1]
-    terminal.self_attn.sinks = nn.Parameter(
-        terminal.self_attn.sinks.detach().to(device="meta"),
+    terminal.self_attn.q_a_norm.weight = nn.Parameter(
+        terminal.self_attn.q_a_norm.weight.detach().to(device="meta"),
         requires_grad=False,
     )
 
-    with pytest.raises(NotImplementedError, match="still contains meta tensors"):
+    with pytest.raises(RuntimeError, match="unexpected meta tensors"):
         adapter.post_quantize(terminal)
 
 
@@ -561,9 +588,7 @@ def test_deepseek_v4_mtp_quantization_adapter_replays_one_exact_block() -> None:
         turtle_model=SimpleNamespace(),
         checkpoint_contract={"test": True},
     )
-    embedding = torch.randn(
-        config.vocab_size, config.hidden_size, dtype=torch.bfloat16
-    )
+    embedding = torch.randn(config.vocab_size, config.hidden_size, dtype=torch.bfloat16)
     target = object.__new__(DeepSeekV4QModel)
     nn.Module.__init__(target)
     target.quantize_config = EXL3Config(bits=2.0, device="cpu")
@@ -577,19 +602,17 @@ def test_deepseek_v4_mtp_quantization_adapter_replays_one_exact_block() -> None:
         embedding_weight=embedding,
     )
     assert target.quantize_config.module_include is None
-    assert adapter.quantize_config.module_is_included(
-        "mtp.2.mlp.experts.2.down_proj"
-    )
+    assert adapter.quantize_config.module_is_included("mtp.2.mlp.experts.2.down_proj")
     assert not adapter.quantize_config.module_is_included(
         "mtp.2.mlp.shared_experts.down_proj"
     )
     assert adapter.extract_layers_node() == ["mtp"]
     modules = {
-            name
-            for block in adapter.simple_layer_modules(
-                model_config=config,
-                quantize_config=adapter.quantize_config,
-            )
+        name
+        for block in adapter.simple_layer_modules(
+            model_config=config,
+            quantize_config=adapter.quantize_config,
+        )
         for name in block
     }
     assert "mlp.experts.2.gate_proj" in modules
@@ -605,9 +628,7 @@ def test_deepseek_v4_mtp_quantization_adapter_replays_one_exact_block() -> None:
         {
             "exl3_error_ledger_record": {
                 "block_namespace": "mtp",
-                "module": (
-                    f"mtp.{block}.mlp.experts.{expert}.{projection}"
-                ),
+                "module": (f"mtp.{block}.mlp.experts.{expert}.{projection}"),
             }
         }
         for block in range(3)
@@ -783,9 +804,7 @@ class _RecoveryMLP(nn.Module):
 def _recovery_processor(task_names: tuple[str, ...], natural_count: int):
     return SimpleNamespace(
         tasks={
-            task_name: {
-                "route_evidence": {"expert_route_count": natural_count}
-            }
+            task_name: {"route_evidence": {"expert_route_count": natural_count}}
             for task_name in task_names
         }
     )
@@ -819,7 +838,6 @@ def _capture_linear_input(capture):
 
 
 def test_deepseek_v4_recovery_uses_rank_seven_for_declared_expert_only() -> None:
-
     block = nn.Module()
     block.mlp = _RecoveryMLP()
     block._gptqmodel_mtp_block_index = 0
@@ -844,14 +862,15 @@ def test_deepseek_v4_recovery_uses_rank_seven_for_declared_expert_only() -> None
         for projection in ("gate_proj", "up_proj", "down_proj"):
             handles.append(
                 getattr(expert, projection).register_forward_hook(
-                    lambda _module, _args, _output, key=(expert_index, projection): calls.append(key)
+                    lambda _module,
+                    _args,
+                    _output,
+                    key=(expert_index, projection): calls.append(key)
                 )
             )
     pause_events = []
     looper = SimpleNamespace(
-        _set_processor_hooks_paused=lambda _processor, value: pause_events.append(
-            value
-        )
+        _set_processor_hooks_paused=lambda _processor, value: pause_events.append(value)
     )
     try:
         with adapter.zero_route_recovery_context(
@@ -909,9 +928,7 @@ def test_deepseek_v4_target_learned_router_uses_same_recovery_policy() -> None:
     }
     task_names = tuple(sorted(subset))
     processor = _recovery_processor(task_names, natural_count=1014)
-    processor._mask_tls = SimpleNamespace(
-        value=torch.tensor([True] * 10 + [False] * 2)
-    )
+    processor._mask_tls = SimpleNamespace(value=torch.tensor([True] * 10 + [False] * 2))
     calls = []
     handles = []
     expert = block.mlp.experts[6]
@@ -923,9 +940,7 @@ def test_deepseek_v4_target_learned_router_uses_same_recovery_policy() -> None:
         )
     pause_events = []
     looper = SimpleNamespace(
-        _set_processor_hooks_paused=lambda _processor, value: pause_events.append(
-            value
-        )
+        _set_processor_hooks_paused=lambda _processor, value: pause_events.append(value)
     )
     try:
         with adapter.zero_route_recovery_context(
@@ -999,8 +1014,8 @@ def test_deepseek_v4_recovery_replays_rank_rows_from_capture_spool() -> None:
         )
     )
     expert.up_proj = HookedLinear.from_linear(expert.up_proj)
-    expert.up_proj.forward_hook = (
-        lambda _module, _args, _output: calls.append("up_proj")
+    expert.up_proj.forward_hook = lambda _module, _args, _output: calls.append(
+        "up_proj"
     )
     expert.up_proj.forward_hook_last = True
     try:
@@ -1121,11 +1136,7 @@ def test_deepseek_v4_positive_route_without_near_rows_uses_identity_residual() -
     nn.Module.__init__(adapter)
     adapter.model = shell
     task_name = "mlp.experts.12.gate_proj"
-    subset = {
-        task_name: SimpleNamespace(
-            full_name="mtp.0.mlp.experts.12.gate_proj"
-        )
-    }
+    subset = {task_name: SimpleNamespace(full_name="mtp.0.mlp.experts.12.gate_proj")}
     natural_count = 13
     capture = _recovery_capture(4, natural_count)
     processor = _recovery_processor((task_name,), natural_count=natural_count)
@@ -1182,9 +1193,7 @@ def test_deepseek_v4_zero_route_down_recovery_uses_native_swiglu_input() -> None
     expert = block.mlp.experts[6]
     expected = torch.tanh(
         expert.gate_proj(expert_input.reshape(-1, 4)).clamp(max=0.25)
-    ) * expert.up_proj(expert_input.reshape(-1, 4)).clamp(
-        min=-0.25, max=0.25
-    )
+    ) * expert.up_proj(expert_input.reshape(-1, 4)).clamp(min=-0.25, max=0.25)
     observed = []
     handle = expert.down_proj.register_forward_pre_hook(
         lambda _module, args: observed.append(args[0].detach().clone())
@@ -1242,11 +1251,11 @@ def test_deepseek_v4_true_zero_without_near_rows_uses_identity_hessian() -> None
                 columns=columns[projection],
                 nsamples=0,
                 H=None,
-                    _device_hessian_partials={},
-                    _device_sample_counts={},
-                    _hessian_dirty=False,
-                    _final_hessian_device_hint=torch.device("cpu"),
-                ),
+                _device_hessian_partials={},
+                _device_sample_counts={},
+                _hessian_dirty=False,
+                _final_hessian_device_hint=torch.device("cpu"),
+            ),
         }
     looper = SimpleNamespace(
         _set_processor_hooks_paused=lambda _processor, _value: None
@@ -1309,16 +1318,12 @@ def test_deepseek_v4_target_anchor_resolver_matches_native_fp32_greedy_head() ->
         position_chunk_size=2,
         vocab_chunk_size=7,
     )
-    raw = torch.randn(
-        2, 4, config.hc_mult, config.hidden_size, dtype=torch.bfloat16
-    )
+    raw = torch.randn(2, 4, config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
     input_ids = torch.arange(8).reshape(2, 4)
     attention_mask = torch.tensor(
         [[False, True, True, True], [True, True, True, False]]
     )
-    decode_mask = torch.tensor(
-        [[False, True, False, True], [True, False, True, True]]
-    )
+    decode_mask = torch.tensor([[False, True, False, True], [True, False, True, True]])
     position_ids = torch.tensor([[0, 3, 4, 5], [8, 9, 10, 0]])
 
     anchors = resolver(
@@ -1451,7 +1456,9 @@ def test_deepseek_v4_target_tap_sink_rejects_uncollapsible_output() -> None:
         raise AssertionError("a rank-3 target boundary was accepted as a raw mHC tap")
 
 
-def test_deepseek_v4_preserves_original_token_mask_metadata_without_forwarding_it() -> None:
+def test_deepseek_v4_preserves_original_token_mask_metadata_without_forwarding_it() -> (
+    None
+):
     config = _tiny_v4_config()
     harness = object.__new__(DeepSeekV4QModel)
     harness.model = SimpleNamespace(config=config)
@@ -1508,9 +1515,7 @@ def test_deepseek_v4_raw_text_calibration_marks_causal_replay_positions() -> Non
     )
     harness.end_input_capture_example()
 
-    assert captured[MTP_CAPTURE_DECODE_MASK].tolist() == [
-        [True, True, False, False]
-    ]
+    assert captured[MTP_CAPTURE_DECODE_MASK].tolist() == [[True, True, False, False]]
 
 
 class _LearnedRouter(nn.Module):
@@ -1527,9 +1532,7 @@ class _LearnedRouter(nn.Module):
             ),
             requires_grad=False,
         )
-        self.register_buffer(
-            "e_score_correction_bias", torch.tensor([0.1, -0.2, 0.3])
-        )
+        self.register_buffer("e_score_correction_bias", torch.tensor([0.1, -0.2, 0.3]))
 
 
 class _HashRouter(_LearnedRouter):
@@ -1556,7 +1559,9 @@ class _RouterModel(nn.Module):
         super().__init__()
         self.config = SimpleNamespace(num_hidden_layers=2)
         self.model = nn.Module()
-        self.model.layers = nn.ModuleList([_Layer(_HashRouter()), _Layer(_LearnedRouter())])
+        self.model.layers = nn.ModuleList(
+            [_Layer(_HashRouter()), _Layer(_LearnedRouter())]
+        )
 
 
 def test_deepseek_v4_router_patch_uses_fp32_without_promoting_stored_weights() -> None:
@@ -1590,7 +1595,9 @@ def test_deepseek_v4_router_patch_uses_fp32_without_promoting_stored_weights() -
     assert hash_weights.dtype is torch.float32
 
 
-def test_deepseek_v4_after_load_preserves_source_fp32_and_requires_router_coverage() -> None:
+def test_deepseek_v4_after_load_preserves_source_fp32_and_requires_router_coverage() -> (
+    None
+):
     model = DeepseekV4ForCausalLM(_tiny_v4_config()).to(dtype=torch.bfloat16)
     harness = object.__new__(DeepSeekV4QModel)
     assert DeepSeekV4QModel.after_model_load(harness, model) is model
@@ -1678,8 +1685,7 @@ def test_deepseek_v4_prefix_runtime_owns_exact_projector_anchor_and_embedding(
     ]
 
     taps = tuple(
-        torch.randn(2, 3, config.hidden_size, dtype=torch.bfloat16)
-        for _ in range(3)
+        torch.randn(2, 3, config.hidden_size, dtype=torch.bfloat16) for _ in range(3)
     )
     expected = shell.mtp[0].main_norm(shell.mtp[0].main_proj(torch.cat(taps, -1)))
     torch.testing.assert_close(runtime.project_target_taps(taps), expected)
@@ -1697,9 +1703,7 @@ def test_deepseek_v4_prefix_runtime_owns_exact_projector_anchor_and_embedding(
     ):
         target.to(device="meta")
 
-    raw = torch.randn(
-        2, 3, config.hc_mult, config.hidden_size, dtype=torch.bfloat16
-    )
+    raw = torch.randn(2, 3, config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
     input_ids = torch.arange(6).reshape(2, 3)
     attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
     decode_mask = torch.tensor([[False, True, True], [True, False, True]])
