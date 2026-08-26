@@ -131,7 +131,7 @@ def test_save_quantized_strips_attention_before_serialization(tmp_path, monkeypa
 
     monkeypatch.setattr("gptqmodel.models.writer.get_model_files_size", lambda _: 1)
 
-    def stop_after_checks(model, _save_dir):
+    def stop_after_checks(model, _save_dir, _source_model_dir):
         tracker["config_snapshot"] = dict(model.config.__dict__)
         tracker["generation_snapshot"] = dict(model.generation_config.__dict__)
         raise RuntimeError("stop after checks")
@@ -194,7 +194,7 @@ def test_save_quantized_persists_exl3_ledger_and_unambiguous_csv(tmp_path, monke
     ]
     monkeypatch.setattr("gptqmodel.models.writer.get_model_files_size", lambda _: 1)
 
-    def stop_after_checks(model, _save_dir):
+    def stop_after_checks(model, _save_dir, _source_model_dir):
         tracker["config_snapshot"] = dict(model.config.__dict__)
         tracker["generation_snapshot"] = dict(model.generation_config.__dict__)
         raise RuntimeError("stop after checks")
@@ -255,14 +255,31 @@ def test_config_only_save_preserves_existing_weight_shards(tmp_path):
 
     shard = tmp_path / "model-00011-of-00013.safetensors"
     shard.write_bytes(b"authenticated-existing-shard")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["SourceModel"],
+                "dtype": "float16",
+                "num_hash_layers": 3,
+                "attn_implementation": "flash_attention_2",
+            }
+        )
+    )
 
-    _save_model_configs_without_weights(ConfigOnlyModel(), str(tmp_path))
+    _save_model_configs_without_weights(
+        ConfigOnlyModel(),
+        str(tmp_path),
+        str(source),
+    )
 
     assert shard.read_bytes() == b"authenticated-existing-shard"
     saved_config = json.loads((tmp_path / "config.json").read_text())
     assert saved_config == {
         "architectures": ["ConfigOnlyModel"],
         "dtype": "bfloat16",
+        "num_hash_layers": 3,
     }
     assert json.loads((tmp_path / "generation_config.json").read_text()) == {
         "do_sample": False

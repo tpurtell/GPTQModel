@@ -107,7 +107,11 @@ def _parse_split_by(value: Optional[str]) -> Optional[str]:
     return normalized
 
 
-def _save_model_configs_without_weights(model: torch.nn.Module, save_dir: str) -> None:
+def _save_model_configs_without_weights(
+        model: torch.nn.Module,
+        save_dir: str,
+        source_model_dir: Optional[str] = None,
+) -> None:
     """Serialize HF model metadata without invoking weight-file cleanup.
 
     ``PreTrainedModel.save_pretrained(state_dict={})`` is not a config-only
@@ -130,6 +134,28 @@ def _save_model_configs_without_weights(model: torch.nn.Module, save_dir: str) -
         custom_object_save(model, save_dir, config=config)
 
     config.save_pretrained(save_dir)
+
+    # Some remote model configurations contain runtime-significant extension
+    # fields that their registered Transformers config class does not declare.
+    # Loading and reserializing such a config silently drops those fields (for
+    # example DeepSeek V4's ``num_hash_layers``). Preserve source-only fields
+    # while allowing the live serialized config—including the new
+    # quantization_config—to override every field it knows about.
+    if source_model_dir is not None:
+        source_config_path = os.path.join(source_model_dir, "config.json")
+        saved_config_path = os.path.join(save_dir, "config.json")
+        if os.path.isfile(source_config_path):
+            with open(source_config_path, "r", encoding="utf-8") as handle:
+                source_config = json.load(handle)
+            with open(saved_config_path, "r", encoding="utf-8") as handle:
+                saved_config = json.load(handle)
+            if not isinstance(source_config, dict) or not isinstance(saved_config, dict):
+                raise ValueError("Model config.json must contain a JSON object.")
+            for key, value in source_config.items():
+                if key not in {"attn_implementation", "_attn_implementation"}:
+                    saved_config.setdefault(key, value)
+            with open(saved_config_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(saved_config, indent=2, sort_keys=True) + "\n")
 
     can_generate = getattr(model, "can_generate", None)
     generation_config = getattr(model, "generation_config", None)
@@ -1137,7 +1163,11 @@ def ModelWriter(cls):
             # an empty state_dict deletes resumable shards in recent
             # Transformers releases because they are absent from the supplied
             # (empty) checkpoint.
-            _save_model_configs_without_weights(self.model, save_dir)
+            _save_model_configs_without_weights(
+                self.model,
+                save_dir,
+                self.model_local_path,
+            )
         finally:
             for attr, value in removed_config_attention_attrs.items():
                 setattr(self.model.config, attr, value)
