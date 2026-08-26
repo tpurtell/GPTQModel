@@ -3,6 +3,7 @@
 
 import json
 import threading
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,12 @@ from gptqmodel.utils.exl3_projection_checkpoint import (
     CHECKPOINT_CONTRACT,
     EXL3ProjectionCheckpointStore,
     build_projection_request,
+)
+from gptqmodel.utils.exl3_inline_mixed import (
+    INLINE_MIXED_META_KEY,
+    InlineMixedPolicy,
+    InlineMixedTierPlanStore,
+    build_layer_tier_plan,
 )
 
 
@@ -675,3 +682,244 @@ def test_restore_completed_layer_installs_packed_modules_without_hessian(
         isinstance(root.get_submodule(entry["module"]), ExllamaV3Linear)
         for entry in entries
     )
+
+
+def _inline_mtp_restore_fixture(
+    tmp_path: Path,
+    *,
+    omit_module: str | None = None,
+):
+    checkpoint_root = tmp_path / "projection-checkpoints"
+    offload_root = tmp_path / "offload"
+    journal = tmp_path / "error-journal.jsonl"
+    tier_root = tmp_path / "tier-plans"
+    family_join = {"source_revision": "test-source", "corpus": "test-corpus"}
+    policy = InlineMixedPolicy(
+        namespace="mtp",
+        base_bits=2,
+        upgrade_bits=3,
+        extra_bits=Fraction(1, 6),
+        projection_ratio=(1, 1, 1),
+        tier_plan_root=tier_root,
+    )
+    store = EXL3ProjectionCheckpointStore(checkpoint_root)
+
+    class Expert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(2, 4, bias=False, dtype=torch.bfloat16)
+            self.up_proj = nn.Linear(2, 4, bias=False, dtype=torch.bfloat16)
+            self.down_proj = nn.Linear(4, 2, bias=False, dtype=torch.bfloat16)
+
+    root = nn.Module()
+    root.mtp = nn.ModuleList([nn.Module()])
+    root.mtp[0].mlp = nn.Module()
+    root.mtp[0].mlp.experts = nn.ModuleList([Expert(), Expert()])
+    projection_names = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+    candidate_records = []
+    candidates = {}
+    for expert in range(2):
+        for projection in ("w1", "w3", "w2"):
+            module = f"mtp.0.mlp.experts.{expert}.{projection_names[projection]}"
+            record = {
+                "schema": "ds4rt.exl3-error-ledger",
+                "schema_version": 1,
+                "record_kind": "projection",
+                "module": module,
+                "processor_layer_index": 0,
+                "block_namespace": "mtp",
+                "logical_layer": 0,
+                "expert": expert,
+                "projection": projection,
+                "bits": 2,
+                "codebook": "mcg",
+                "sample_count": 32,
+                "duration_seconds": 1.0,
+                "encoded_bytes": 1,
+                "quantizer_metrics": {
+                    "hessian_weighted_relative_error": float(expert + 1)
+                },
+                "route_evidence": {
+                    "expert_gate_squared_mass_fraction": 0.25
+                },
+                "provenance": {"family_join": family_join},
+            }
+            candidate_records.append(record)
+            request = build_projection_request(
+                module_full_name=module,
+                layer_index=0,
+                input_weight=torch.arange(8, dtype=torch.float32).reshape(4, 2),
+                hessian=torch.eye(4, dtype=torch.float32),
+                sample_count=32,
+                quantizer_contract={
+                    "bits": 2,
+                    "codebook": "mcg",
+                    "inline_mixed": {
+                        "base_bits": 2,
+                        "upgrade_bits": 3,
+                        "policy_sha256": policy.policy_sha256,
+                        "role": "candidate_k2",
+                    },
+                },
+                family_join=family_join,
+                route_evidence=None,
+            )
+            candidates[module] = (request, record)
+            if module != omit_module:
+                store.commit(
+                    request,
+                    {
+                        "trellis": torch.full((1, 1, 64), 2, dtype=torch.int16),
+                        "suh": torch.ones(4, dtype=torch.float16),
+                        "svh": torch.ones(4, dtype=torch.float16),
+                        "mcg": torch.tensor([123], dtype=torch.int32),
+                    },
+                    {
+                        "duration_seconds": 1.0,
+                        "proxy_error": 0.1,
+                        "device_names": ["cuda:0"],
+                        "quantizer_metrics": {
+                            "reported_metric_kind": "test",
+                        },
+                        "ledger_record": record,
+                        "execution_contract": None,
+                        "execution_result": {"kind": "test"},
+                    },
+                )
+
+    plan = build_layer_tier_plan(
+        policy=policy,
+        layer_index=0,
+        layer_count=1,
+        candidate_records=candidate_records,
+    )
+    InlineMixedTierPlanStore(policy).commit(plan)
+    selected_module = plan["selected"][0]["module"]
+    candidate_request, candidate_record = candidates[selected_module]
+    selected_record = {**candidate_record, "bits": 3, "encoded_bytes": 2}
+    selected_request = build_projection_request(
+        module_full_name=selected_module,
+        layer_index=0,
+        input_weight=torch.arange(8, dtype=torch.float32).reshape(4, 2),
+        hessian=torch.eye(4, dtype=torch.float32),
+        sample_count=32,
+        quantizer_contract={
+            "bits": 3,
+            "codebook": "mcg",
+            "inline_mixed": {
+                "base_bits": 2,
+                "upgrade_bits": 3,
+                "policy_sha256": policy.policy_sha256,
+                "role": "selected_k3",
+                "candidate_request_sha256": candidate_request["request_sha256"],
+                "tier_plan_sha256": plan["tier_plan_sha256"],
+            },
+        },
+        family_join=family_join,
+        route_evidence=None,
+    )
+    if selected_module != omit_module:
+        store.commit(
+            selected_request,
+            {
+                "trellis": torch.full((1, 1, 96), 3, dtype=torch.int16),
+                "suh": torch.ones(4, dtype=torch.float16),
+                "svh": torch.ones(4, dtype=torch.float16),
+                "mcg": torch.tensor([123], dtype=torch.int32),
+            },
+            {
+                "duration_seconds": 1.0,
+                "proxy_error": 0.05,
+                "device_names": ["cuda:0"],
+                "quantizer_metrics": {"reported_metric_kind": "test"},
+                "ledger_record": selected_record,
+                "execution_contract": None,
+                "execution_result": {"kind": "test"},
+            },
+        )
+
+    qcfg = SimpleNamespace(
+        bits=2,
+        meta={
+            INLINE_MIXED_META_KEY: {
+                **policy.policy_body,
+                "tier_plan_root": str(tier_root),
+            },
+            "ds4rt_error_ledger": {
+                "family_join": family_join,
+                "run": {
+                    "projection_checkpoint": {
+                        "contract": CHECKPOINT_CONTRACT,
+                        "root": str(checkpoint_root),
+                    }
+                },
+            },
+        },
+        offload_to_disk=True,
+        offload_to_disk_path=str(offload_root),
+        method=None,
+        format=None,
+    )
+    model = SimpleNamespace(
+        model=root,
+        quantize_config=qcfg,
+        quantized=False,
+        quant_log=[],
+        qlinear_kernel=None,
+    )
+    return model, policy, journal, selected_module
+
+
+def test_complete_inline_mixed_mtp_tree_restores_without_replay(tmp_path) -> None:
+    model, _policy, journal, selected_module = _inline_mtp_restore_fixture(tmp_path)
+    assert EXL3Processor.restore_completed_checkpoint_tree_if_complete(
+        model=model,
+        block_namespace="mtp",
+        layer_count=1,
+        experts_per_layer=2,
+        error_journal_path=journal,
+    )
+    assert model.quantized
+    assert len(model.quant_log) == 6
+    assert all(entry["exl3_layer_boundary_restore"] for entry in model.quant_log)
+    assert model.model.get_submodule(selected_module).trellis.shape[-1] == 96
+    assert all(
+        isinstance(module, ExllamaV3Linear)
+        for name, module in model.model.named_modules()
+        if name.endswith(("gate_proj", "up_proj", "down_proj"))
+    )
+
+
+def test_partial_inline_mixed_mtp_tree_does_not_mutate_model(tmp_path) -> None:
+    omitted = "mtp.0.mlp.experts.0.down_proj"
+    model, _policy, journal, _selected = _inline_mtp_restore_fixture(
+        tmp_path,
+        omit_module=omitted,
+    )
+    assert not EXL3Processor.restore_completed_checkpoint_tree_if_complete(
+        model=model,
+        block_namespace="mtp",
+        layer_count=1,
+        experts_per_layer=2,
+        error_journal_path=journal,
+    )
+    assert not model.quantized
+    assert model.quant_log == []
+    assert isinstance(model.model.get_submodule(omitted), nn.Linear)
+
+
+def test_corrupt_inline_mixed_tier_plan_is_not_replayed(tmp_path) -> None:
+    model, policy, journal, _selected = _inline_mtp_restore_fixture(tmp_path)
+    path = InlineMixedTierPlanStore(policy).path(0)
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    plan["selected"][0]["score"] += 1.0
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    with pytest.raises(ValueError, match="tier plan failed validation"):
+        EXL3Processor.restore_completed_checkpoint_tree_if_complete(
+            model=model,
+            block_namespace="mtp",
+            layer_count=1,
+            experts_per_layer=2,
+            error_journal_path=journal,
+        )
+    assert not model.quantized

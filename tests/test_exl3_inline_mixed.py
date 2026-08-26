@@ -134,3 +134,40 @@ def test_tier_plan_store_is_idempotent_and_rejects_drift(tmp_path):
     with pytest.raises(ValueError, match="invalid"):
         store.commit(changed)
 
+
+def test_tier_plan_store_load_authenticates_complete_contract(tmp_path):
+    policy = _policy(tmp_path, extra=(1, 6))
+    records = [
+        _record(expert, projection, error=float(expert + 1))
+        for expert in range(16)
+        for projection in ("w1", "w3", "w2")
+    ]
+    plan = build_layer_tier_plan(
+        policy=policy,
+        layer_index=0,
+        layer_count=1,
+        candidate_records=records,
+    )
+    store = InlineMixedTierPlanStore(policy)
+    assert store.load(
+        layer_index=0,
+        layer_count=1,
+        experts_per_layer=16,
+    ) is None
+    store.commit(plan)
+    assert store.load(
+        layer_index=0,
+        layer_count=1,
+        experts_per_layer=16,
+    ) == plan
+
+    path = store.path(0)
+    changed = json.loads(path.read_text(encoding="utf-8"))
+    changed["selected"][0]["score"] += 1.0
+    path.write_text(json.dumps(changed), encoding="utf-8")
+    with pytest.raises(ValueError, match="failed validation"):
+        store.load(
+            layer_index=0,
+            layer_count=1,
+            experts_per_layer=16,
+        )

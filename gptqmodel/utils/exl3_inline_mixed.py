@@ -319,6 +319,116 @@ class InlineMixedTierPlanStore:
             raise ValueError("EXL3 inline-mixed layer index is invalid")
         return self.root / self.policy.namespace / f"layer-{layer_index:06d}.json"
 
+    def load(
+        self,
+        *,
+        layer_index: int,
+        layer_count: int,
+        experts_per_layer: int,
+    ) -> dict[str, Any] | None:
+        """Authenticate one committed tier plan without trusting its filename.
+
+        Projection checkpoints are independently content addressed, but the
+        layer plan is the authority that chooses which K2 candidates acquire
+        a K3 replacement.  Recovery therefore validates the complete policy,
+        geometry, quota, selection, and digest contract before it uses any
+        selected checkpoint.  A missing plan is an incomplete layer; an
+        existing malformed plan is corruption and must never become a fresh
+        selection on resume.
+        """
+
+        path = self.path(layer_index)
+        if not path.exists():
+            return None
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("EXL3 inline-mixed tier plan is not a regular file")
+        try:
+            plan = json.loads(path.read_bytes())
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("EXL3 inline-mixed tier plan cannot be read") from error
+        if not isinstance(plan, dict):
+            raise ValueError("EXL3 inline-mixed tier plan is not an object")
+
+        expected_keys = {
+            *self.policy.policy_body,
+            "policy_sha256",
+            "layer_index",
+            "layer_count",
+            "experts_per_layer",
+            "quotas",
+            "selected",
+            "tier_plan_sha256",
+        }
+        body = {key: value for key, value in plan.items() if key != "tier_plan_sha256"}
+        quotas = self.policy.layer_quotas(
+            layer_index=layer_index,
+            layer_count=layer_count,
+            experts_per_layer=experts_per_layer,
+        )
+        if (
+            set(plan) != expected_keys
+            or any(
+                plan.get(key) != value
+                for key, value in self.policy.policy_body.items()
+            )
+            or plan.get("policy_sha256") != self.policy.policy_sha256
+            or plan.get("layer_index") != layer_index
+            or plan.get("layer_count") != layer_count
+            or plan.get("experts_per_layer") != experts_per_layer
+            or plan.get("quotas") != quotas
+            or not isinstance(plan.get("tier_plan_sha256"), str)
+            or sha256_json(body) != plan["tier_plan_sha256"]
+        ):
+            raise ValueError("EXL3 inline-mixed tier plan failed validation")
+
+        selected = plan.get("selected")
+        if not isinstance(selected, list) or len(selected) != sum(quotas.values()):
+            raise ValueError("EXL3 inline-mixed tier plan selection count is invalid")
+        observed = {projection: 0 for projection in PROJECTION_ORDER}
+        identities: set[tuple[int, str]] = set()
+        modules: set[str] = set()
+        normalized_order: list[tuple[int, int]] = []
+        hex_chars = frozenset("0123456789abcdef")
+        for entry in selected:
+            if not isinstance(entry, dict) or set(entry) != {
+                "module",
+                "expert",
+                "projection",
+                "score",
+                "candidate_record_sha256",
+            }:
+                raise ValueError("EXL3 inline-mixed tier selection is malformed")
+            module = entry.get("module")
+            expert = entry.get("expert")
+            projection = entry.get("projection")
+            score = entry.get("score")
+            candidate_digest = entry.get("candidate_record_sha256")
+            if (
+                not isinstance(module, str)
+                or not module
+                or isinstance(expert, bool)
+                or not isinstance(expert, int)
+                or not 0 <= expert < experts_per_layer
+                or projection not in observed
+                or isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or float(score) < 0
+                or not isinstance(candidate_digest, str)
+                or len(candidate_digest) != 64
+                or any(char not in hex_chars for char in candidate_digest)
+                or (expert, projection) in identities
+                or module in modules
+            ):
+                raise ValueError("EXL3 inline-mixed tier selection is invalid")
+            identities.add((expert, projection))
+            modules.add(module)
+            observed[projection] += 1
+            normalized_order.append((PROJECTION_ORDER.index(projection), expert))
+        if observed != quotas or normalized_order != sorted(normalized_order):
+            raise ValueError("EXL3 inline-mixed tier selection violates its quotas")
+        return plan
+
     def commit(self, plan: dict[str, Any]) -> dict[str, Any]:
         layer_index = plan.get("layer_index")
         digest = plan.get("tier_plan_sha256")

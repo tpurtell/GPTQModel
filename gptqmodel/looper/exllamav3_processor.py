@@ -99,8 +99,10 @@ from ..utils.exl3_projection_checkpoint import (
 )
 from ..utils.exl3_inline_mixed import (
     InlineMixedTierPlanStore,
+    PROJECTION_ORDER,
     build_layer_tier_plan,
     inline_mixed_policy,
+    projection_score,
 )
 from ..utils.exl3_remote import (
     CoordinatorSlot,
@@ -3307,6 +3309,305 @@ class EXL3Processor(LoopProcessor):
                     f"EXL3 layer {layer_index} has conflicting projection identities"
                 )
         return [entries[name] for name in sorted(entries)]
+
+    def _completed_checkpoint_tree_entries(
+        self,
+        *,
+        block_namespace: str,
+        layer_count: int,
+        experts_per_layer: int,
+    ) -> list[list[dict[str, str]]] | None:
+        """Discover an authoritative complete packed tree without tensor I/O.
+
+        The manifest scan is deliberately read-only.  Missing projections or
+        selected K3 replacements mean the tree is incomplete and the normal
+        quantization resume path must run.  Any committed identity, policy, or
+        tier-plan contradiction is corruption and raises instead of silently
+        rebuilding a different model.
+        """
+
+        if block_namespace not in {"base", "mtp"}:
+            raise ValueError("EXL3 checkpoint restore namespace is invalid")
+        if (
+            isinstance(layer_count, bool)
+            or not isinstance(layer_count, int)
+            or layer_count <= 0
+            or isinstance(experts_per_layer, bool)
+            or not isinstance(experts_per_layer, int)
+            or experts_per_layer <= 0
+        ):
+            raise ValueError("EXL3 checkpoint restore geometry is invalid")
+        provenance = self._ledger_provenance()
+        checkpoint_root = checkpoint_root_from_provenance(provenance)
+        if checkpoint_root is None:
+            return None
+        family_join = (
+            provenance.get("family_join")
+            if isinstance(provenance, dict)
+            else None
+        )
+        if not isinstance(family_join, dict):
+            raise ValueError("EXL3 checkpoint restore has no family join")
+        store = EXL3ProjectionCheckpointStore(checkpoint_root)
+        policy = self._inline_mixed_policy()
+        if policy is not None and policy.namespace != block_namespace:
+            raise ValueError("EXL3 checkpoint restore mixed-policy namespace differs")
+
+        projection_names = {
+            "w1": "gate_proj",
+            "w3": "up_proj",
+            "w2": "down_proj",
+        }
+        block_prefix = "model.layers" if block_namespace == "base" else "mtp"
+        expected: dict[str, dict[str, Any]] = {
+            (
+                f"{block_prefix}.{layer}.mlp.experts.{expert}."
+                f"{projection_names[projection]}"
+            ): {
+                "logical_layer": layer,
+                "expert": expert,
+                "projection": projection,
+            }
+            for layer in range(layer_count)
+            for expert in range(experts_per_layer)
+            for projection in PROJECTION_ORDER
+        }
+        inventory: dict[
+            str, dict[str, tuple[dict[str, Any], dict[str, Any], str]]
+        ] = {}
+        relevant_count = 0
+        for request, result in store.inspect_committed_manifests():
+            module = request.get("module")
+            if not isinstance(module, str):
+                raise ValueError("EXL3 checkpoint restore found no module identity")
+            identity = routed_expert_identity(module)
+            if identity is None:
+                if module.startswith(f"{block_prefix}."):
+                    raise ValueError(
+                        f"EXL3 checkpoint restore found malformed `{module}`"
+                    )
+                continue
+            if identity["block_namespace"] != block_namespace:
+                continue
+            relevant_count += 1
+            expected_identity = expected.get(module)
+            if expected_identity != {
+                key: identity[key]
+                for key in ("logical_layer", "expert", "projection")
+            }:
+                raise ValueError(
+                    f"EXL3 checkpoint restore found unexpected `{module}`"
+                )
+            layer_index = identity["logical_layer"]
+            contract = request.get("quantizer_contract")
+            ledger_record = result.get("ledger_record")
+            ledger_provenance = (
+                ledger_record.get("provenance")
+                if isinstance(ledger_record, dict)
+                else None
+            )
+            if (
+                request.get("processor_layer_index") != layer_index
+                or request.get("family_join") != family_join
+                or not isinstance(contract, dict)
+                or not isinstance(ledger_record, dict)
+                or ledger_record.get("module") != module
+                or ledger_record.get("processor_layer_index") != layer_index
+                or any(
+                    ledger_record.get(key) != value
+                    for key, value in {
+                        "block_namespace": block_namespace,
+                        **expected_identity,
+                    }.items()
+                )
+                or ledger_record.get("codebook") != contract.get("codebook")
+                or ledger_record.get("bits") != contract.get("bits")
+                or not isinstance(ledger_provenance, dict)
+                or ledger_provenance.get("family_join") != family_join
+            ):
+                raise ValueError(
+                    f"EXL3 checkpoint restore identity differs for `{module}`"
+                )
+            _module, role = store._module_request_key(request)
+            if _module != module:
+                raise ValueError("EXL3 checkpoint restore module key differs")
+            record_sha256 = sha256_bytes(canonical_json_bytes(ledger_record))
+            roles = inventory.setdefault(module, {})
+            if role in roles:
+                raise ValueError(
+                    f"EXL3 checkpoint restore has duplicate {role} for `{module}`"
+                )
+            roles[role] = (request, result, record_sha256)
+
+        if relevant_count == 0:
+            return None
+        if any(
+            "selected_k3" in roles and "candidate_k2" not in roles
+            for roles in inventory.values()
+        ):
+            raise ValueError("EXL3 selected checkpoint has no K2 candidate")
+        # Missing K2/uniform projections are ordinary partial-run state.  Do
+        # not install even one packed module until the complete tree is proven.
+        required_primary = "candidate_k2" if policy is not None else "uniform"
+        if any(required_primary not in inventory.get(module, {}) for module in expected):
+            return None
+
+        entries_by_layer: list[list[dict[str, str]]] = []
+        for layer_index in range(layer_count):
+            selected: dict[str, dict[str, Any]] = {}
+            tier_plan_sha256: str | None = None
+            if policy is not None:
+                tier_plan = InlineMixedTierPlanStore(policy).load(
+                    layer_index=layer_index,
+                    layer_count=layer_count,
+                    experts_per_layer=experts_per_layer,
+                )
+                if tier_plan is None:
+                    return None
+                tier_plan_sha256 = tier_plan["tier_plan_sha256"]
+                for selection in tier_plan["selected"]:
+                    module = selection["module"]
+                    expected_identity = expected.get(module)
+                    if (
+                        expected_identity is None
+                        or expected_identity["logical_layer"] != layer_index
+                        or selection["expert"] != expected_identity["expert"]
+                        or selection["projection"] != expected_identity["projection"]
+                        or module in selected
+                    ):
+                        raise ValueError(
+                            "EXL3 checkpoint restore tier selection differs from modules"
+                        )
+                    candidate = inventory[module]["candidate_k2"]
+                    candidate_record = candidate[1]["ledger_record"]
+                    if (
+                        selection["candidate_record_sha256"] != candidate[2]
+                        or float(selection["score"])
+                        != projection_score(candidate_record)
+                    ):
+                        raise ValueError(
+                            f"EXL3 checkpoint restore tier score differs for `{module}`"
+                        )
+                    selected[module] = selection
+
+            layer_entries: list[dict[str, str]] = []
+            for module, expected_identity in expected.items():
+                if expected_identity["logical_layer"] != layer_index:
+                    continue
+                roles = inventory[module]
+                if policy is None:
+                    if set(roles) != {"uniform"}:
+                        raise ValueError(
+                            f"EXL3 uniform checkpoint roles differ for `{module}`"
+                        )
+                    request, result, record_sha256 = roles["uniform"]
+                    if request["quantizer_contract"].get("bits") != self.qcfg.bits:
+                        raise ValueError(
+                            f"EXL3 uniform checkpoint bits differ for `{module}`"
+                        )
+                else:
+                    candidate_request = roles["candidate_k2"][0]
+                    candidate_inline = candidate_request["quantizer_contract"].get(
+                        "inline_mixed"
+                    )
+                    expected_candidate_inline = {
+                        "base_bits": policy.base_bits,
+                        "upgrade_bits": policy.upgrade_bits,
+                        "policy_sha256": policy.policy_sha256,
+                        "role": "candidate_k2",
+                    }
+                    if (
+                        candidate_inline != expected_candidate_inline
+                        or candidate_request["quantizer_contract"].get("bits")
+                        != policy.base_bits
+                    ):
+                        raise ValueError(
+                            f"EXL3 candidate checkpoint policy differs for `{module}`"
+                        )
+                    upgraded = module in selected
+                    expected_roles = {"candidate_k2"}
+                    if upgraded:
+                        expected_roles.add("selected_k3")
+                    if not expected_roles.issubset(roles):
+                        return None
+                    if set(roles) != expected_roles:
+                        raise ValueError(
+                            f"EXL3 selected checkpoint roles differ for `{module}`"
+                        )
+                    if upgraded:
+                        request, result, record_sha256 = roles["selected_k3"]
+                        expected_selected_inline = {
+                            **expected_candidate_inline,
+                            "role": "selected_k3",
+                            "candidate_request_sha256": candidate_request[
+                                "request_sha256"
+                            ],
+                            "tier_plan_sha256": tier_plan_sha256,
+                        }
+                        if (
+                            request["quantizer_contract"].get("inline_mixed")
+                            != expected_selected_inline
+                            or request["quantizer_contract"].get("bits")
+                            != policy.upgrade_bits
+                        ):
+                            raise ValueError(
+                                f"EXL3 selected checkpoint binding differs for `{module}`"
+                            )
+                    else:
+                        request, result, record_sha256 = roles["candidate_k2"]
+                layer_entries.append(
+                    {
+                        "module": module,
+                        "request_sha256": request["request_sha256"],
+                        "record_sha256": record_sha256,
+                    }
+                )
+            entries_by_layer.append(sorted(layer_entries, key=lambda item: item["module"]))
+        return entries_by_layer
+
+    @classmethod
+    def restore_completed_checkpoint_tree_if_complete(
+        cls,
+        *,
+        model: BaseQModel,
+        block_namespace: str,
+        layer_count: int,
+        experts_per_layer: int,
+        error_journal_path: str | os.PathLike[str] | None = None,
+    ) -> bool:
+        """Install a complete durable packed tree and skip corpus replay."""
+
+        processor = cls.__new__(cls)
+        processor.qcfg = model.quantize_config
+        processor.error_journal_path = os.fspath(
+            error_journal_path
+            or os.getenv(JOURNAL_ENV)
+            or Path("gptq_log") / "exl3-error-ledger.jsonl"
+        )
+        processor._stats_lock = threading.Lock()
+        processor.durations = []
+        processor.avg_losses = []
+        processor.module_names = []
+        processor.log = []
+        entries_by_layer = processor._completed_checkpoint_tree_entries(
+            block_namespace=block_namespace,
+            layer_count=layer_count,
+            experts_per_layer=experts_per_layer,
+        )
+        if entries_by_layer is None:
+            return False
+        for layer_index, entries in enumerate(entries_by_layer):
+            processor.restore_completed_layer_checkpoints(
+                model=model,
+                layer_index=layer_index,
+                projection_entries=entries,
+            )
+        model.quant_log = list(processor.log)
+        model.quantized = True
+        model.quantize_config.method = METHOD.EXL3
+        model.quantize_config.format = FORMAT.EXL3
+        model.qlinear_kernel = ExllamaV3Linear
+        return True
 
     def restore_completed_layer_checkpoints(
         self,
