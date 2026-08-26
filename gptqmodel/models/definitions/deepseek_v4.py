@@ -2170,6 +2170,11 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
     module_tree = deepseek_v4_mtp_module_tree()
     out_of_model_tensors = None
 
+    _PASSTHROUGH_ROOTS_BY_BLOCK = {
+        0: ("main_proj", "main_norm"),
+        2: ("hc_head", "norm", "markov_head", "confidence_head"),
+    }
+
     def after_model_load(self, model, load_quantized_model=False):
         del load_quantized_model
         if not isinstance(model, DeepSeekV4MTPAuxiliaryShell):
@@ -3226,6 +3231,48 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         if materialized == 0:
             raise RuntimeError("MTP quantization block materialized no checkpoint leaves")
         return module
+
+    def post_quantize(self, module: nn.Module) -> nn.Module:
+        """Offload the executable block body without touching lazy passthroughs.
+
+        The auxiliary shell deliberately leaves the native MTP projector and
+        terminal-head branches on ``meta`` unless calibration uses them. They
+        are not part of the EXL3 save overlay; the canonical writer retains
+        those checkpoint tensors from the source artifact. Generic recursive
+        offload must therefore ignore only these named lazy roots while still
+        failing closed if an executable attention/MoE tensor remains on
+        ``meta``.
+        """
+
+        block_index = next(
+            (
+                index
+                for index, block in enumerate(self.model.mtp)
+                if module is block
+            ),
+            None,
+        )
+        if block_index is None:
+            return super().post_quantize(module)
+
+        detached: list[tuple[str, nn.Module]] = []
+        for name in self._PASSTHROUGH_ROOTS_BY_BLOCK.get(block_index, ()):
+            child = module._modules.get(name)
+            if child is None:
+                continue
+            tensors = tuple(child.parameters()) + tuple(child.buffers())
+            if tensors and any(tensor.is_meta for tensor in tensors):
+                detached.append((name, module._modules.pop(name)))
+
+        try:
+            return super().post_quantize(module)
+        finally:
+            for name, child in detached:
+                if name in module._modules:
+                    raise RuntimeError(
+                        f"MTP passthrough root {name!r} was replaced during offload"
+                    )
+                module.add_module(name, child)
 
 
 

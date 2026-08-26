@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -429,6 +430,66 @@ def test_deepseek_v4_mtp_quantization_adapter_builds_without_target_model() -> N
     assert not adapter.quantize_config.module_is_included(
         "mtp.1.mlp.shared_experts.down_proj"
     )
+
+
+def test_deepseek_v4_mtp_post_quantize_preserves_lazy_terminal_passthroughs() -> None:
+    config = _tiny_v4_config()
+    shell = DeepSeekV4MTPAuxiliaryShell(config, device="cpu")
+    auxiliary = DeepSeekV4MTPAuxiliary(
+        model=shell,
+        turtle_model=SimpleNamespace(),
+        checkpoint_contract={"test": True},
+    )
+    adapter = DeepSeekV4MTPQuantizationModel.from_auxiliary(
+        auxiliary=auxiliary,
+        embedding_weight=torch.randn(
+            config.vocab_size, config.hidden_size, dtype=torch.bfloat16
+        ),
+        quantize_config=EXL3Config(bits=3.0, device="cpu"),
+        model_local_path="/tmp/deepseek-v4-test",
+    )
+    terminal = shell.mtp[-1]
+    passthrough = {
+        name: terminal._modules[name].to(device="meta")
+        for name in ("hc_head", "norm", "markov_head", "confidence_head")
+    }
+
+    assert adapter.post_quantize(terminal) is terminal
+    for name, expected in passthrough.items():
+        assert terminal._modules[name] is expected
+        assert all(tensor.is_meta for tensor in (*expected.parameters(), *expected.buffers()))
+    assert all(
+        tensor.device.type == "cpu"
+        for name, child in terminal._modules.items()
+        if name not in passthrough
+        for tensor in (*child.parameters(), *child.buffers())
+    )
+
+
+def test_deepseek_v4_mtp_post_quantize_rejects_meta_block_body() -> None:
+    config = _tiny_v4_config()
+    shell = DeepSeekV4MTPAuxiliaryShell(config, device="cpu")
+    auxiliary = DeepSeekV4MTPAuxiliary(
+        model=shell,
+        turtle_model=SimpleNamespace(),
+        checkpoint_contract={"test": True},
+    )
+    adapter = DeepSeekV4MTPQuantizationModel.from_auxiliary(
+        auxiliary=auxiliary,
+        embedding_weight=torch.randn(
+            config.vocab_size, config.hidden_size, dtype=torch.bfloat16
+        ),
+        quantize_config=EXL3Config(bits=3.0, device="cpu"),
+        model_local_path="/tmp/deepseek-v4-test",
+    )
+    terminal = shell.mtp[-1]
+    terminal.self_attn.sinks = nn.Parameter(
+        terminal.self_attn.sinks.detach().to(device="meta"),
+        requires_grad=False,
+    )
+
+    with pytest.raises(NotImplementedError, match="still contains meta tensors"):
+        adapter.post_quantize(terminal)
 
 
 def test_deepseek_v4_mtp_quantization_adapter_replays_one_exact_block() -> None:
