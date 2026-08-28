@@ -36,6 +36,18 @@ class _Layer(nn.Module):
         self.mlp.gate = _Router()
 
 
+class _MemorySpool:
+    phase = "gate-up"
+
+    def __init__(self):
+        self.committed_indices = set()
+        self.records = {}
+
+    def commit(self, batch_index, *, tensors, metadata):
+        self.records[batch_index] = (tensors, metadata)
+        self.committed_indices.add(batch_index)
+
+
 def test_hash_router_emits_no_learned_recovery_candidates() -> None:
     router = nn.Module()
     router.register_buffer("tid2eid", torch.arange(256))
@@ -140,6 +152,62 @@ def test_failed_subset_forward_removes_router_hook_without_committing_evidence()
 
     assert not layer.mlp.gate._forward_hooks
     assert all("route_evidence" not in task for task in processor.tasks.values())
+
+
+def test_masked_capture_verifies_raw_topk_major_expert_fanout():
+    processor = EXL3Processor.__new__(EXL3Processor)
+    processor.qcfg = SimpleNamespace(
+        meta={
+            "ds4rt_error_ledger": {
+                "family_join": {
+                    "route_evidence_contract": ROUTE_EVIDENCE_SCHEMA,
+                }
+            }
+        }
+    )
+    processor._mask_tls = threading.local()
+    processor._hooks_paused_tls = threading.local()
+    processor._batch_tls = threading.local()
+    processor._active_natural_route_capture = None
+    processor._restored_route_accumulators = {}
+    processor._natural_route_evidence_cache = {}
+    processor._active_capture_batch_spool = _MemorySpool()
+    processor._active_capture_batch_layer = 7
+    processor.tasks = {}
+    subset = {}
+    for expert in range(3):
+        task_name = f"mlp.experts.{expert}.gate_proj"
+        processor.tasks[task_name] = {}
+        subset[task_name] = SimpleNamespace(
+            full_name=f"model.layers.7.{task_name}"
+        )
+
+    layer = _Layer()
+    layer.mlp.gate.register_buffer("tid2eid", torch.arange(3))
+    rows = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    processor._mask_tls.value = torch.tensor([[True, False, True]])
+    processor._set_current_batch_index(0)
+    with processor.subset_forward_capture_context(
+        layer_module=layer,
+        subset=subset,
+    ) as capture:
+        _logits, _weights, indices = layer.mlp.gate(rows)
+        for expert in range(3):
+            # Match the reference fused-expert traversal: top-k slot first,
+            # then token index. This intentionally includes the masked row.
+            token_indices = torch.where(indices.transpose(0, 1).eq(expert))[1]
+            capture.capture_expert_input(
+                f"mlp.experts.{expert}.gate_proj",
+                rows.index_select(0, token_indices),
+            )
+        capture.commit_batch(0)
+    processor._set_current_batch_index(None)
+
+    tensors, metadata = processor._active_capture_batch_spool.records[0]
+    assert torch.equal(tensors["router_input"], rows[[0, 2]])
+    assert tensors["top_indices"].shape == (2, 2)
+    assert metadata["mask_mode"] == "filtered"
+    assert metadata["pre_fanout_gate_input_verified"] is True
 
 
 class _TwoExpertRouter(nn.Module):

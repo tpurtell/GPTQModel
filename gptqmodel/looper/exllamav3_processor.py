@@ -381,6 +381,12 @@ class _EXL3NaturalRouteCapture:
             )
 
         router_input = router_input.reshape(-1, router_input.shape[-1])
+        # Expert implementations fan out the router's complete token matrix,
+        # including padding rows.  Keep that raw view solely for proving the
+        # input observed by each expert hook; route evidence and recovery data
+        # below must continue to retain only calibration-valid rows.
+        verification_router_input = router_input
+        verification_top_indices = indices
         keep_mask = getattr(getattr(self.processor, "_mask_tls", None), "value", None)
         if keep_mask is None:
             mask_mode = "absent"
@@ -420,6 +426,12 @@ class _EXL3NaturalRouteCapture:
                     "router_input": router_input.detach(),
                     "top_weights": weights.detach(),
                     "top_indices": indices.detach(),
+                    "verification_router_input": (
+                        verification_router_input.detach()
+                    ),
+                    "verification_top_indices": (
+                        verification_top_indices.detach()
+                    ),
                     "candidate_indices": candidate_indices.detach(),
                     "candidate_score_gaps": candidate_score_gaps.detach(),
                     "num_experts": int(logits.shape[-1]),
@@ -504,16 +516,32 @@ class _EXL3NaturalRouteCapture:
             rows = value.detach().reshape(-1, value.shape[-1])
             expert = identity["expert"]
             if self.spool.phase == "gate-up":
-                expected_indices = torch.nonzero(
-                    payload["top_indices"].eq(expert), as_tuple=False
+                verification_indices = payload["verification_top_indices"]
+                verification_input = payload["verification_router_input"]
+                row_major = torch.nonzero(
+                    verification_indices.eq(expert), as_tuple=False
                 )[:, 0]
-                expected = payload["router_input"].index_select(
-                    0, expected_indices.to(payload["router_input"].device)
-                )
-                if (
-                    rows.shape != expected.shape
-                    or not torch.equal(rows, expected.to(device=rows.device))
-                ):
+                # Hugging Face's fused-expert reference implementations use
+                # one_hot(...).permute(expert, top_k, token) followed by
+                # torch.where(), which yields top-k-major token order.  Other
+                # implementations use the row-major order above.  Both are
+                # exact fan-outs of the same selected router rows.
+                topk_major = torch.where(
+                    verification_indices.transpose(0, 1).eq(expert)
+                )[1]
+                matches_router = False
+                for expected_indices in (row_major, topk_major):
+                    expected = verification_input.index_select(
+                        0,
+                        expected_indices.to(verification_input.device),
+                    )
+                    if rows.shape == expected.shape and torch.equal(
+                        rows,
+                        expected.to(device=rows.device),
+                    ):
+                        matches_router = True
+                        break
+                if not matches_router:
                     raise RuntimeError(
                         "EXL3 pre-fanout recovery rows differ from the gate hook"
                     )

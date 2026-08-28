@@ -2389,22 +2389,37 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         target_sample_count = recovery_recipe["target_sample_count"]
         router_top_k = candidate_rank_min - 1
 
-        mtp_blocks = tuple(getattr(self.model, "mtp", ()) or ())
-        target_blocks = tuple(
-            getattr(getattr(self.model, "model", None), "layers", ()) or ()
+        block_resolver = getattr(
+            self,
+            "zero_route_recovery_block_identity",
+            None,
         )
-        if layer_module in mtp_blocks:
-            block_namespace = "mtp"
-            block_index = mtp_blocks.index(layer_module)
-            prefix = f"mtp.{block_index}.mlp.experts."
-        elif layer_module in target_blocks:
-            block_namespace = "base"
-            block_index = target_blocks.index(layer_module)
-            prefix = f"model.layers.{block_index}.mlp.experts."
+        if callable(block_resolver):
+            block_namespace, block_index, prefix = block_resolver(layer_module)
+            if block_namespace not in {"base", "mtp"}:
+                raise RuntimeError("route recovery resolved an invalid replay mode")
+            if not isinstance(block_index, int) or block_index < 0:
+                raise RuntimeError("route recovery resolved an invalid block index")
+            if not isinstance(prefix, str) or not prefix:
+                raise RuntimeError("route recovery resolved an invalid module prefix")
         else:
-            raise RuntimeError(
-                "DeepSeek V4 route recovery requires one canonical target or MTP block"
+            mtp_blocks = tuple(getattr(self.model, "mtp", ()) or ())
+            target_blocks = tuple(
+                getattr(getattr(self.model, "model", None), "layers", ()) or ()
             )
+            if layer_module in mtp_blocks:
+                block_namespace = "mtp"
+                block_index = mtp_blocks.index(layer_module)
+                prefix = f"mtp.{block_index}.mlp.experts."
+            elif layer_module in target_blocks:
+                block_namespace = "base"
+                block_index = target_blocks.index(layer_module)
+                prefix = f"model.layers.{block_index}.mlp.experts."
+            else:
+                raise RuntimeError(
+                    "DeepSeek V4 route recovery requires one canonical target "
+                    "or MTP block"
+                )
         router = getattr(getattr(layer_module, "mlp", None), "gate", None)
         if (
             not isinstance(router, nn.Module)

@@ -65,6 +65,10 @@ _MTP_EXPERT = re.compile(
     r"^mtp\.(?P<layer>\d+)\.mlp\.experts\."
     r"(?P<expert>\d+)\.(?P<projection>gate_proj|up_proj|down_proj)$"
 )
+_GLM5_NEXT_EXPERT = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\."
+    r"(?P<expert>\d+)\.(?P<projection>gate_proj|up_proj|down_proj)$"
+)
 _PROJECTION_NAMES = {
     "gate_proj": "w1",
     "down_proj": "w2",
@@ -192,6 +196,16 @@ def compact_projection_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def routed_expert_identity(module_full_name: str) -> dict[str, Any] | None:
     """Map a GPTQModel routed projection name to its stable DS4 identity."""
+
+    glm5_next = _GLM5_NEXT_EXPERT.fullmatch(module_full_name)
+    if glm5_next is not None:
+        layer = int(glm5_next.group("layer"))
+        return {
+            "block_namespace": "mtp" if layer == 45 else "base",
+            "logical_layer": layer,
+            "expert": int(glm5_next.group("expert")),
+            "projection": _PROJECTION_NAMES[glm5_next.group("projection")],
+        }
 
     for namespace, pattern in (("base", _BASE_EXPERT), ("mtp", _MTP_EXPERT)):
         match = pattern.fullmatch(module_full_name)

@@ -162,6 +162,12 @@ def _maybe_print_module_tree(model) -> None:
 def _convert_model_with_defuser(cls, model, cleanup_original: bool) -> bool:
     converted = defuser.convert_model(model, cleanup_original=cleanup_original)
 
+    model_conversion_hook = getattr(cls, "convert_model_structure", None)
+    if callable(model_conversion_hook):
+        converted = bool(
+            model_conversion_hook(model, cleanup_original=cleanup_original)
+        ) or converted
+
     defuser_module_paths = getattr(cls, "defuser_module_paths", ())
     if defuser_module_paths:
         for module_path in defuser_module_paths:
