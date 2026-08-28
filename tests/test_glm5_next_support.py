@@ -9,6 +9,7 @@ from torch import nn
 from gptqmodel.models.definitions.glm5_next import (
     GLM5_NEXT_ROUTED_EXPERT_PATTERN,
     Glm5NextQModel,
+    _prune_glm5_next_replay_frontier,
 )
 
 
@@ -54,3 +55,21 @@ def test_route_recovery_resolves_nested_mtp_as_conventional_replay():
     )
     with pytest.raises(RuntimeError, match="canonical decoder block"):
         adapter.zero_route_recovery_block_identity(nn.Identity())
+
+
+def test_replay_frontier_prunes_only_older_exact_layer_directories(tmp_path):
+    old_complete = tmp_path / "layer-000003"
+    old_partial = tmp_path / ".layer-000004.partial"
+    current = tmp_path / "layer-000005"
+    future = tmp_path / "layer-000006"
+    unrelated = tmp_path / "layer-not-a-frontier"
+    for path in (old_complete, old_partial, current, future, unrelated):
+        path.mkdir()
+
+    _prune_glm5_next_replay_frontier(tmp_path, before_layer=5)
+
+    assert not old_complete.exists()
+    assert not old_partial.exists()
+    assert current.is_dir()
+    assert future.is_dir()
+    assert unrelated.is_dir()

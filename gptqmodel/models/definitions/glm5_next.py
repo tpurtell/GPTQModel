@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
 import weakref
 from pathlib import Path
 from typing import Any
@@ -293,6 +294,33 @@ def _attach_glm5_next_mtp(model: nn.Module) -> nn.Module:
     return model
 
 
+def _prune_glm5_next_replay_frontier(
+    root: str | os.PathLike[str],
+    *,
+    before_layer: int,
+) -> None:
+    """Retain only the current durable post-quant replay frontier."""
+
+    parent = Path(root).expanduser().resolve(strict=True)
+    for candidate in parent.iterdir():
+        name = candidate.name
+        if name.startswith("layer-"):
+            suffix = name.removeprefix("layer-")
+        elif name.startswith(".layer-") and name.endswith(".partial"):
+            suffix = name.removeprefix(".layer-").removesuffix(".partial")
+        else:
+            continue
+        if len(suffix) != 6 or not suffix.isdigit():
+            continue
+        if int(suffix) >= before_layer:
+            continue
+        if not candidate.is_dir() or candidate.is_symlink():
+            raise RuntimeError(
+                f"GLM-5.3 replay frontier is not a real directory: {candidate}"
+            )
+        shutil.rmtree(candidate)
+
+
 class Glm5NextQuantizationLoader:
     """Auto loader that exposes checkpoint-only MTP layer 45 to LazyTurtle."""
 
@@ -427,6 +455,10 @@ class Glm5NextQModel(BaseQModel):
                 "replay_contract": "glm5-next-target-mtp-post-quant-bf16-v1",
             },
             shard_batches=1,
+            on_finalize=lambda _sequence: _prune_glm5_next_replay_frontier(
+                root,
+                before_layer=layer_index,
+            ),
         )
 
     def zero_route_recovery_context(
@@ -502,4 +534,5 @@ __all__ = [
     "GLM5_NEXT_ROUTED_EXPERT_PATTERN",
     "Glm5NextMTPDecoderLayer",
     "Glm5NextQModel",
+    "_prune_glm5_next_replay_frontier",
 ]
