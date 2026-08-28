@@ -4,9 +4,11 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 from torch import nn
 
 from gptqmodel.models.definitions.glm5_next import (
+    GLM5_NEXT_CAPTURE_INPUT_IDS,
     GLM5_NEXT_ROUTED_EXPERT_PATTERN,
     Glm5NextQModel,
     _prune_glm5_next_replay_frontier,
@@ -73,3 +75,76 @@ def test_replay_frontier_prunes_only_older_exact_layer_directories(tmp_path):
     assert current.is_dir()
     assert future.is_dir()
     assert unrelated.is_dir()
+
+
+def test_capture_preserves_original_token_ids_for_mtp_replay():
+    adapter = Glm5NextQModel.__new__(Glm5NextQModel)
+    input_ids = torch.tensor([[11, 12, 13, 14]])
+
+    adapter.begin_input_capture_example(
+        {"input_ids": input_ids}, batch_device=torch.device("cpu")
+    )
+    captured = adapter.capture_first_layer_input_kwargs(
+        args=(),
+        kwargs={},
+        batch_device=torch.device("cpu"),
+        layer_input_kwargs={"ordinary": True},
+    )
+    adapter.end_input_capture_example()
+
+    assert captured["ordinary"] is True
+    assert torch.equal(captured[GLM5_NEXT_CAPTURE_INPUT_IDS], input_ids)
+    assert adapter._glm5_next_capture_input_ids is None
+
+
+def test_prepare_replay_exposes_shifted_tokens_only_to_mtp():
+    adapter = Glm5NextQModel.__new__(Glm5NextQModel)
+    input_ids = torch.tensor([[11, 12, 13, 14]])
+    common = {
+        GLM5_NEXT_CAPTURE_INPUT_IDS: input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "position_ids": torch.arange(4).unsqueeze(0),
+        "prev_topk_indices": torch.tensor([[2, 3]]),
+        "use_cache": False,
+    }
+
+    ordinary = adapter.prepare_layer_replay_kwargs(
+        layer=SimpleNamespace(layer_idx=44),
+        layer_input=[torch.empty(1, 4, 2, 8)],
+        additional_inputs=dict(common),
+        target_device=torch.device("cpu"),
+    )
+    assert GLM5_NEXT_CAPTURE_INPUT_IDS not in ordinary
+    assert "input_ids" not in ordinary
+    assert ordinary["attention_mask"].shape == (1, 4)
+
+    mtp = adapter.prepare_layer_replay_kwargs(
+        layer=SimpleNamespace(layer_idx=45),
+        layer_input=[torch.empty(1, 4, 2, 8)],
+        additional_inputs=dict(common),
+        target_device=torch.device("cpu"),
+    )
+    assert torch.equal(mtp["input_ids"], torch.tensor([[12, 13, 14]]))
+    assert torch.equal(mtp["attention_mask"], torch.ones(1, 3, dtype=torch.long))
+    assert torch.equal(mtp["position_ids"], torch.tensor([[1, 2, 3]]))
+    assert "prev_topk_indices" not in mtp
+    assert GLM5_NEXT_CAPTURE_INPUT_IDS not in mtp
+
+
+def test_target_terminal_layer_discards_router_state_without_slicing_tokens():
+    adapter = Glm5NextQModel.__new__(Glm5NextQModel)
+    input_ids = torch.tensor([[11, 12, 13, 14]])
+    kwargs = {
+        GLM5_NEXT_CAPTURE_INPUT_IDS: input_ids,
+        "prev_topk_indices": torch.tensor([[2, 3]]),
+    }
+
+    result = adapter.update_layer_replay_kwargs_from_output(
+        layer=SimpleNamespace(layer_idx=44),
+        layer_output=(torch.empty(1, 4, 2, 8), None),
+        layer_input_kwargs=kwargs,
+        target_device=torch.device("cpu"),
+    )
+
+    assert "prev_topk_indices" not in result
+    assert torch.equal(result[GLM5_NEXT_CAPTURE_INPUT_IDS], input_ids)

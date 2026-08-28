@@ -30,6 +30,7 @@ from ..moe_lifecycle import GateUpDownMoELifecycleHooks
 
 
 GLM5_NEXT_MTP_LAYER = 45
+GLM5_NEXT_CAPTURE_INPUT_IDS = "_gptqmodel_glm5_next_input_ids"
 GLM5_NEXT_ROUTED_EXPERT_PATTERN = (
     r"^model\.language_model\.layers\."
     r"(?:[3-9]|[1-3][0-9]|4[0-5])\.mlp\.experts\.\d+\."
@@ -504,6 +505,88 @@ class Glm5NextQModel(BaseQModel):
             f"model.language_model.layers.{block_index}.mlp.experts.",
         )
 
+    def begin_input_capture_example(
+        self,
+        example: dict[str, Any],
+        batch_device: torch.device,
+    ) -> None:
+        input_ids = example.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+            raise ValueError("GLM-5.3 calibration requires rank-2 input_ids")
+        self._glm5_next_capture_input_ids = input_ids.detach().to(
+            device=batch_device
+        )
+
+    def end_input_capture_example(self) -> None:
+        self._glm5_next_capture_input_ids = None
+
+    def capture_first_layer_input_kwargs(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        batch_device: torch.device,
+        layer_input_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = super().capture_first_layer_input_kwargs(
+            args=args,
+            kwargs=kwargs,
+            batch_device=batch_device,
+            layer_input_kwargs=layer_input_kwargs,
+        )
+        input_ids = getattr(self, "_glm5_next_capture_input_ids", None)
+        if not isinstance(input_ids, torch.Tensor):
+            raise RuntimeError("GLM-5.3 calibration token capture is unavailable")
+        result[GLM5_NEXT_CAPTURE_INPUT_IDS] = input_ids.detach().to(
+            device=batch_device
+        )
+        return result
+
+    def prepare_layer_replay_kwargs(
+        self,
+        layer: nn.Module,
+        layer_input: list[torch.Tensor],
+        additional_inputs: dict[str, Any],
+        target_device: torch.device,
+    ) -> dict[str, Any]:
+        result = super().prepare_layer_replay_kwargs(
+            layer=layer,
+            layer_input=layer_input,
+            additional_inputs=additional_inputs,
+            target_device=target_device,
+        )
+        input_ids = result.pop(GLM5_NEXT_CAPTURE_INPUT_IDS, None)
+        if getattr(layer, "layer_idx", None) != GLM5_NEXT_MTP_LAYER:
+            return result
+
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+            raise ValueError("GLM-5.3 MTP replay requires captured rank-2 input_ids")
+        if (
+            not layer_input
+            or not isinstance(layer_input[0], torch.Tensor)
+            or layer_input[0].ndim != 4
+        ):
+            raise ValueError(
+                "GLM-5.3 MTP replay requires a rank-4 target hidden-state frontier"
+            )
+        hidden_states = layer_input[0]
+        if tuple(hidden_states.shape[:2]) != tuple(input_ids.shape):
+            raise ValueError(
+                "GLM-5.3 MTP captured token shape does not match the target frontier"
+            )
+
+        result["input_ids"] = move_to(input_ids[:, 1:], device=target_device)
+        for name in ("attention_mask", "position_ids"):
+            value = result.get(name)
+            if not isinstance(value, torch.Tensor) or value.ndim != 2:
+                raise ValueError(f"GLM-5.3 MTP replay requires rank-2 {name}")
+            if tuple(value.shape) != tuple(input_ids.shape):
+                raise ValueError(
+                    f"GLM-5.3 MTP {name} shape does not match captured input_ids"
+                )
+            result[name] = move_to(value[:, 1:], device=target_device)
+        result.pop("prev_topk_indices", None)
+        return result
+
     def update_layer_replay_kwargs_from_output(
         self,
         layer,
@@ -521,15 +604,12 @@ class Glm5NextQModel(BaseQModel):
 
         layer_idx = getattr(layer, "layer_idx", None)
         if layer_idx == GLM5_NEXT_MTP_LAYER - 1:
-            for name in ("input_ids", "attention_mask", "position_ids"):
-                value = layer_input_kwargs.get(name)
-                if isinstance(value, torch.Tensor) and value.ndim >= 2:
-                    layer_input_kwargs[name] = value[:, 1:]
             layer_input_kwargs.pop("prev_topk_indices", None)
         return layer_input_kwargs
 
 
 __all__ = [
+    "GLM5_NEXT_CAPTURE_INPUT_IDS",
     "GLM5_NEXT_MTP_LAYER",
     "GLM5_NEXT_ROUTED_EXPERT_PATTERN",
     "Glm5NextMTPDecoderLayer",
