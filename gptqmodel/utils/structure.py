@@ -1260,14 +1260,27 @@ class LazyTurtle:
         progress.title(f"Syncing lazy checkpoint writes ({len(modules)} modules)")
         progress.subtitle("Preparing module writes")
         progress.draw(force=True)
+        # Large MoE shells can contain tens of thousands of leaf modules. A
+        # pair of logbar redraws for every leaf makes Docker JSON logging the
+        # dominant cost even though most packed shells have no native META
+        # tensor to restore. Keep roughly 200 visible checkpoints while still
+        # visiting and validating every module.
+        progress_interval = max(1, len(modules) // 200)
 
         try:
             with self._lock, torch.inference_mode():
                 for idx, (qname, shell_sub) in enumerate(modules):
                     module_label = qname or "<root>"
-                    progress.current_iter_step = idx
-                    progress.subtitle(f"Writing {module_label} ({idx + 1}/{len(modules)})")
-                    progress.draw()
+                    draw_progress = (
+                        idx % progress_interval == 0
+                        or idx + 1 == len(modules)
+                    )
+                    if draw_progress:
+                        progress.current_iter_step = idx
+                        progress.subtitle(
+                            f"Writing {module_label} ({idx + 1}/{len(modules)})"
+                        )
+                        progress.draw()
                     synced = self._materialize_direct_meta_tensors(
                         shell_sub=shell_sub,
                         module_path=qname,
@@ -1275,9 +1288,12 @@ class LazyTurtle:
                         buffer_cache=buffer_cache,
                     )
                     materialized += synced
-                    progress.current_iter_step = idx + 1
-                    progress.subtitle(f"Wrote {module_label} (+{synced}, total {materialized})")
-                    progress.draw()
+                    if draw_progress:
+                        progress.current_iter_step = idx + 1
+                        progress.subtitle(
+                            f"Wrote {module_label} (+{synced}, total {materialized})"
+                        )
+                        progress.draw()
         finally:
             progress.close()
 
