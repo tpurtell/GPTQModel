@@ -74,4 +74,3 @@ def test_invalid_hessian_owner_policy_fails_closed(policy) -> None:
             devices=DEVICES,
             policy=policy,
         )
-

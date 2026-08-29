@@ -51,6 +51,7 @@ from .grinmoe import GrinMoeQModel
 from .hrm_text import HrmTextQModel
 from .hunyuan_v1_dense import HunYuanDenseV1QModel
 from .hunyuan_v1_moe import HunYuanMoEV1QModel
+from .hunyuan_vl import HunYuanVLQModel
 from .hy_v3 import HYV3QModel
 from .hymba import HymbaQModel
 from .instella import InstellaQModel
@@ -109,6 +110,7 @@ from .zamba import ZambaQModel
 from .zamba2 import Zamba2QModel
 from .pangu_alpha import PanguAlphaQModel
 from .longcat_flash import LongCatFlashQModel
+from .locateanything import LocateAnythingQModel
 from .apertus import ApertusQModel
 from .axk2 import AXK2QModel
 from .klear import KlearQModel

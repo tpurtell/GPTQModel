@@ -119,6 +119,7 @@ from .definitions.grinmoe import GrinMoeQModel  # noqa: E402
 from .definitions.hrm_text import HrmTextQModel  # noqa: E402
 from .definitions.hunyuan_v1_dense import HunYuanDenseV1QModel  # noqa: E402
 from .definitions.hunyuan_v1_moe import HunYuanMoEV1QModel  # noqa: E402
+from .definitions.hunyuan_vl import HunYuanVLQModel  # noqa: E402
 from .definitions.hy_v3 import HYV3QModel  # noqa: E402
 from .definitions.hymba import HymbaQModel  # noqa: E402
 from .definitions.instella import InstellaQModel  # noqa: E402
@@ -139,6 +140,7 @@ from .definitions.llama import LlamaQModel  # noqa: E402
 from .definitions.llama4 import Llama4QModel, Llama4TextQModel  # noqa: E402
 from .definitions.llava_qwen2 import LlavaQwen2QModel  # noqa: E402
 from .definitions.longcat_flash import LongCatFlashQModel  # noqa: E402
+from .definitions.locateanything import LocateAnythingQModel  # noqa: E402
 from .definitions.mage_vl import MageVLQModel  # noqa: E402
 from .definitions.mimo import MimoQModel  # noqa: E402
 from .definitions.mimo_v2 import MimoV2QModel  # noqa: E402
@@ -259,6 +261,7 @@ MODEL_MAP = {
     "hrm_text": HrmTextQModel,
     "hunyuan_v1_dense": HunYuanDenseV1QModel,
     "hunyuan_v1_moe": HunYuanMoEV1QModel,
+    "hunyuan_vl": HunYuanVLQModel,
     "hy_v3": HYV3QModel,
     "qwen": QwenQModel,
     "mistral": LlamaQModel, # 100% llama clone
@@ -354,6 +357,7 @@ MODEL_MAP = {
     "solar_open2": SolarOpen2QModel,
     "gpt_oss": GPTOSSGPTQ,
     "longcat_flash": LongCatFlashQModel,
+    "locateanything": LocateAnythingQModel,
     "llava_qwen2": LlavaQwen2QModel,
     "nemotron_h": NemotronHQModel,
     "nemotron_h_puzzle": NemotronHPuzzleQModel,
