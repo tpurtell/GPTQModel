@@ -468,10 +468,6 @@ def forward_batch_worker(
         seq_len = inputs[0].shape[1] if (len(inputs) > 0 and inputs[0].dim() >= 2) else None
         keep_mask = normalize_seq_mask(attn_tensor, seq_len=seq_len)
 
-    mask_tls = getattr(processor, "_mask_tls", None)
-    if mask_tls is not None:
-        mask_tls.value = keep_mask
-
     if reuse_kv and prev_kv is not None:
         additional_inputs["kv_last_layer"] = nested_move_to(prev_kv, device=module_device)
 
@@ -484,6 +480,17 @@ def forward_batch_worker(
             additional_inputs=additional_inputs,
             target_device=module_device,
         )
+        keep_mask = gptq_model.prepare_layer_replay_keep_mask(
+            layer=module,
+            layer_input=inputs,
+            additional_inputs=additional_inputs,
+            keep_mask=keep_mask,
+            target_device=module_device,
+        )
+
+    mask_tls = getattr(processor, "_mask_tls", None)
+    if mask_tls is not None:
+        mask_tls.value = keep_mask
 
     module_output = None
     kv_next = None

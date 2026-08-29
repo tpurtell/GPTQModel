@@ -150,3 +150,27 @@ def test_target_terminal_layer_discards_router_state_without_slicing_tokens():
 
     assert "prev_topk_indices" not in result
     assert torch.equal(result[GLM5_NEXT_CAPTURE_INPUT_IDS], input_ids)
+
+
+def test_prepare_replay_slices_route_capture_mask_only_for_mtp():
+    adapter = Glm5NextQModel.__new__(Glm5NextQModel)
+    keep_mask = torch.tensor([[False, True, True, False]])
+    hidden = [torch.empty(1, 4, 2, 8)]
+
+    ordinary = adapter.prepare_layer_replay_keep_mask(
+        layer=SimpleNamespace(layer_idx=44),
+        layer_input=hidden,
+        additional_inputs={},
+        keep_mask=keep_mask,
+        target_device=torch.device("cpu"),
+    )
+    assert ordinary is keep_mask
+
+    mtp = adapter.prepare_layer_replay_keep_mask(
+        layer=SimpleNamespace(layer_idx=45),
+        layer_input=hidden,
+        additional_inputs={},
+        keep_mask=keep_mask,
+        target_device=torch.device("cpu"),
+    )
+    assert torch.equal(mtp, torch.tensor([[True, True, False]]))

@@ -338,7 +338,6 @@ class ForwardExecutor:
                     seq_len = layer_input[0].shape[1] if (len(layer_input) > 0 and layer_input[0].dim() >= 2) else None
                     keep_mask = normalize_seq_mask(attn_tensor, seq_len=seq_len)
 
-                self.looper._set_processor_mask(processor, keep_mask)
                 additional_inputs: Dict[str, Optional[torch.Tensor]] = {}
                 if self.looper.support_batch_quantize and attn_tensor is not None:
                     additional_inputs["attention_mask"] = attn_tensor
@@ -365,6 +364,14 @@ class ForwardExecutor:
                     additional_inputs=additional_inputs,
                     target_device=exec_device,
                 )
+                keep_mask = self.looper.gptq_model.prepare_layer_replay_keep_mask(
+                    layer=module,
+                    layer_input=layer_input,
+                    additional_inputs=additional_inputs,
+                    keep_mask=keep_mask,
+                    target_device=exec_device,
+                )
+                self.looper._set_processor_mask(processor, keep_mask)
 
                 if not preserve_module_devices:
                     rehome_module_to_device(module, cur_layer_device, move_parameters=True, move_buffers=True)

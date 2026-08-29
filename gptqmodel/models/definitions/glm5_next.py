@@ -611,6 +611,34 @@ class Glm5NextQModel(BaseQModel):
             layer_input_kwargs.pop("prev_topk_indices", None)
         return layer_input_kwargs
 
+    def prepare_layer_replay_keep_mask(
+        self,
+        layer: nn.Module,
+        layer_input: list[torch.Tensor],
+        additional_inputs: dict[str, Any],
+        keep_mask: torch.Tensor | None,
+        target_device: torch.device,
+    ) -> torch.Tensor | None:
+        result = super().prepare_layer_replay_keep_mask(
+            layer=layer,
+            layer_input=layer_input,
+            additional_inputs=additional_inputs,
+            keep_mask=keep_mask,
+            target_device=target_device,
+        )
+        if getattr(layer, "layer_idx", None) != GLM5_NEXT_MTP_LAYER or result is None:
+            return result
+        if (
+            result.ndim != 2
+            or not layer_input
+            or not isinstance(layer_input[0], torch.Tensor)
+            or tuple(result.shape) != tuple(layer_input[0].shape[:2])
+        ):
+            raise ValueError(
+                "GLM-5.3 MTP route-capture mask does not match the target frontier"
+            )
+        return move_to(result[:, 1:], device=target_device)
+
 
 __all__ = [
     "GLM5_NEXT_CAPTURE_INPUT_IDS",

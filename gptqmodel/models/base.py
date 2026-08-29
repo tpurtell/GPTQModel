@@ -2013,6 +2013,19 @@ class BaseQModel(nn.Module):
 
         return additional_inputs
 
+    def prepare_layer_replay_keep_mask(
+        self,
+        layer: nn.Module,
+        layer_input: List[torch.Tensor],
+        additional_inputs: Dict[str, Any],
+        keep_mask: torch.Tensor | None,
+        target_device: torch.device,
+    ) -> torch.Tensor | None:
+        """Allow transformed replay layers to align processor hook masks."""
+
+        del layer, layer_input, additional_inputs, target_device
+        return keep_mask
+
     def update_layer_replay_kwargs_from_output(
         self,
         layer: nn.Module,
