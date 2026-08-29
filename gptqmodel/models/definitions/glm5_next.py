@@ -584,6 +584,10 @@ class Glm5NextQModel(BaseQModel):
                     f"GLM-5.3 MTP {name} shape does not match captured input_ids"
                 )
             result[name] = move_to(value[:, 1:], device=target_device)
+        # The target-model replay cache carries this model-level kwarg as
+        # ``None``.  MTP deliberately recomputes its shifted attention inputs,
+        # and its attention call supplies the kwarg explicitly.
+        result.pop("position_embeddings", None)
         result.pop("prev_topk_indices", None)
         return result
 

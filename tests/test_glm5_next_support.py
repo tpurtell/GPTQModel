@@ -104,6 +104,7 @@ def test_prepare_replay_exposes_shifted_tokens_only_to_mtp():
         GLM5_NEXT_CAPTURE_INPUT_IDS: input_ids,
         "attention_mask": torch.ones_like(input_ids),
         "position_ids": torch.arange(4).unsqueeze(0),
+        "position_embeddings": None,
         "prev_topk_indices": torch.tensor([[2, 3]]),
         "use_cache": False,
     }
@@ -128,6 +129,7 @@ def test_prepare_replay_exposes_shifted_tokens_only_to_mtp():
     assert torch.equal(mtp["attention_mask"], torch.ones(1, 3, dtype=torch.long))
     assert torch.equal(mtp["position_ids"], torch.tensor([[1, 2, 3]]))
     assert "prev_topk_indices" not in mtp
+    assert "position_embeddings" not in mtp
     assert GLM5_NEXT_CAPTURE_INPUT_IDS not in mtp
 
 
