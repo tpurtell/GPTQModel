@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from gptqmodel.models import writer
 from gptqmodel.utils import model as model_utils
@@ -64,6 +66,96 @@ def test_exl3_publication_guard_accepts_packed_recovery_target():
     owner.model.experts[0].gate_proj = _FakeEXL3()
 
     assert writer._validate_exllamav3_publication_modules(owner) == 1
+
+
+def test_exl3_checkpoint_passthrough_preserves_native_source_identity(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    blobs = tmp_path / "blobs"
+    snapshot.mkdir()
+    blobs.mkdir()
+    blob_path = blobs / "payload"
+    source_path = snapshot / "source.safetensors"
+    native = torch.tensor([1.25, -2.5], dtype=torch.float32)
+    save_file(
+        {
+            "expert.weight": torch.ones((2, 2), dtype=torch.bfloat16),
+            "original.hc_attn_base": native,
+        },
+        blob_path,
+    )
+    source_path.symlink_to(blob_path)
+
+    model = torch.nn.Module()
+    model.expert = _FakeEXL3()
+    model.expert.register_buffer("trellis", torch.ones((1,), dtype=torch.int16))
+    model.expert.register_buffer("suh", torch.ones((1,), dtype=torch.float16))
+    model.expert.register_buffer("svh", torch.ones((1,), dtype=torch.float16))
+    model.expert.register_buffer("mcg", torch.ones((), dtype=torch.int32))
+    # This runtime-only spelling must never leak into the published checkpoint.
+    model.runtime_alias = torch.nn.Parameter(torch.zeros((2,), dtype=torch.float32))
+    owner = SimpleNamespace(
+        model=model,
+        turtle_model=SimpleNamespace(
+            model_local_path=str(snapshot),
+            _weight_map={
+                "expert.weight": source_path.name,
+                "original.hc_attn_base": source_path.name,
+            },
+        ),
+    )
+    storage = {
+        "expert": {
+            "stored_tensors": {
+                f"expert.{suffix}": {}
+                for suffix in ("trellis", "suh", "svh", "mcg")
+            }
+        }
+    }
+
+    plan = writer._exllamav3_checkpoint_passthrough_plan(owner, storage)
+    state = writer._build_exllamav3_checkpoint_passthrough_state_dict(owner, plan)
+
+    assert set(state) == {
+        "expert.trellis",
+        "expert.suh",
+        "expert.svh",
+        "expert.mcg",
+        "original.hc_attn_base",
+    }
+    assert "runtime_alias" not in state
+    writer.streaming_state_dict_to_shards(
+        state,
+        save_dir=str(snapshot),
+        model_base_name="published",
+        single_file_name="published.safetensors",
+        metadata={"format": "pt"},
+        max_shard_size=None,
+    )
+    with safe_open(
+        snapshot / "published.safetensors", framework="pt", device="cpu"
+    ) as checkpoint:
+        assert set(checkpoint.keys()) == {
+            "expert.trellis",
+            "expert.suh",
+            "expert.svh",
+            "expert.mcg",
+            "original.hc_attn_base",
+        }
+        assert torch.equal(checkpoint.get_tensor("original.hc_attn_base"), native)
+
+
+def test_exl3_checkpoint_passthrough_requires_source_weight_identity(tmp_path):
+    owner = SimpleNamespace(
+        turtle_model=SimpleNamespace(
+            model_local_path=str(tmp_path),
+            _weight_map={"converted.expert.weight": "source.safetensors"},
+        )
+    )
+    storage = {
+        "expert": {"stored_tensors": {"expert.trellis": {}}},
+    }
+
+    assert writer._exllamav3_checkpoint_passthrough_plan(owner, storage) is None
 
 
 def test_save_state_overlay_replaces_only_declared_prefixes(monkeypatch):

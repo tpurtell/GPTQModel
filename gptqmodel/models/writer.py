@@ -53,6 +53,7 @@ from ..utils.hf import (
 )
 from ..utils.logger import setup_logger
 from ..utils.model import (
+    OffloadTensorRef,
     TensorSource,
     copy_py_files,
     find_modules,
@@ -593,6 +594,183 @@ def _validate_exllamav3_publication_modules(
             + ", ".join(missing[:8])
         )
     return len(expected)
+
+
+def _exllamav3_checkpoint_passthrough_plan(owner, tensor_storage):
+    """Describe an exact native checkpoint passthrough when names are stable.
+
+    A lazy shell uses runtime module names, which can differ from the original
+    safetensors keys after Transformers applies a conversion map.  Serializing
+    untouched tensors from that shell silently renames native checkpoint state
+    and can also materialize it unnecessarily.  When every EXL3 replacement
+    has the same authoritative ``<module>.weight`` name in the source index,
+    retain all other source entries byte-for-byte under their original names.
+    """
+
+    checkpoint_source = getattr(owner, "turtle_model", None)
+    weight_map = getattr(checkpoint_source, "_weight_map", None)
+    source_root = getattr(checkpoint_source, "model_local_path", None)
+    if not isinstance(weight_map, dict) or not weight_map:
+        return None
+    if not isinstance(source_root, str) or not source_root:
+        return None
+    if not isinstance(tensor_storage, dict) or not tensor_storage:
+        return None
+
+    quant_names = set()
+    replaced_source_names = set()
+    for module_name, entry in tensor_storage.items():
+        if not isinstance(module_name, str) or not module_name:
+            return None
+        stored = entry.get("stored_tensors") if isinstance(entry, dict) else None
+        if not isinstance(stored, dict) or not stored:
+            return None
+        names = set(stored)
+        if any(
+            not isinstance(name, str) or not name.startswith(f"{module_name}.")
+            for name in names
+        ):
+            return None
+        quant_names.update(names)
+        replaced_source_names.add(f"{module_name}.weight")
+
+    # Conversion-based architectures are eligible only when the publication
+    # module identities themselves are also source-checkpoint identities. This
+    # makes passthrough exact and keeps the fallback behavior for architectures
+    # whose quantized prefixes require a more involved conversion contract.
+    if not replaced_source_names.issubset(weight_map):
+        return None
+    return {
+        "checkpoint_source": checkpoint_source,
+        "quant_names": frozenset(quant_names),
+        "replaced_source_names": frozenset(replaced_source_names),
+    }
+
+
+def _torch_dtype_from_safetensors_name(name: str) -> torch.dtype:
+    mapping = {
+        "F64": torch.float64,
+        "F32": torch.float32,
+        "F16": torch.float16,
+        "BF16": torch.bfloat16,
+        "I64": torch.int64,
+        "I32": torch.int32,
+        "I16": torch.int16,
+        "I8": torch.int8,
+        "U8": torch.uint8,
+        "BOOL": torch.bool,
+    }
+    optional = {
+        "F8_E4M3": "float8_e4m3fn",
+        "F8_E5M2": "float8_e5m2",
+        "F8_E8M0": "float8_e8m0fnu",
+    }
+    attribute = optional.get(name)
+    if attribute is not None and hasattr(torch, attribute):
+        return getattr(torch, attribute)
+    dtype = mapping.get(name)
+    if dtype is None:
+        raise ValueError(f"Unsupported safetensors dtype in checkpoint passthrough: {name}")
+    return dtype
+
+
+def _build_exllamav3_checkpoint_passthrough_state_dict(
+    owner,
+    plan,
+    *,
+    offload_root=None,
+    validated_overlay=None,
+) -> Dict[str, TensorSource]:
+    """Build packed EXL3 state plus exact, zero-copy native source entries."""
+
+    quant_names = set(plan["quant_names"])
+    state_dict = get_state_dict_for_save(
+        owner.model,
+        offload_root=offload_root,
+        include_names=quant_names,
+    )
+    _apply_save_state_overlay(
+        owner,
+        state_dict,
+        validated_overlay=validated_overlay,
+    )
+    actual_quant_names = set(state_dict)
+    if actual_quant_names != quant_names:
+        missing = sorted(quant_names - actual_quant_names)
+        unexpected = sorted(actual_quant_names - quant_names)
+        raise RuntimeError(
+            "EXL3 checkpoint passthrough packed tensor census differs: "
+            f"actual={len(actual_quant_names)} expected={len(quant_names)} "
+            f"missing={missing[:8]} unexpected={unexpected[:8]}"
+        )
+
+    checkpoint_source = plan["checkpoint_source"]
+    source_root = os.path.realpath(checkpoint_source.model_local_path)
+    weight_map = checkpoint_source._weight_map
+    replaced = set(plan["replaced_source_names"])
+    native_names = set(weight_map) - replaced
+    by_shard: Dict[str, List[str]] = {}
+    for name in native_names:
+        shard_name = weight_map.get(name)
+        if not isinstance(shard_name, str) or not shard_name:
+            raise RuntimeError(f"Invalid checkpoint shard for native tensor {name}")
+        by_shard.setdefault(shard_name, []).append(name)
+
+    native_sources: Dict[str, TensorSource] = {}
+    for shard_name in sorted(by_shard):
+        # Hugging Face snapshots intentionally store basename-only symlinks to
+        # the repository's shared ``blobs`` directory, which is outside the
+        # snapshot root after realpath resolution. Reject path components and
+        # traversal, but permit that canonical snapshot-link layout.
+        if os.path.basename(shard_name) != shard_name or shard_name in {".", ".."}:
+            raise RuntimeError(f"Checkpoint shard name is unsafe: {shard_name}")
+        shard_path = os.path.realpath(os.path.join(source_root, shard_name))
+        if not os.path.isfile(shard_path):
+            raise RuntimeError(f"Checkpoint shard is not a regular file: {shard_name}")
+        with safe_open(shard_path, framework="pt", device="cpu") as handler:
+            available = set(handler.keys())
+            expected = set(by_shard[shard_name])
+            missing = sorted(expected - available)
+            if missing:
+                raise RuntimeError(
+                    f"Checkpoint shard is missing native tensors: {shard_name} {missing[:8]}"
+                )
+            for name in sorted(expected):
+                tensor_slice = handler.get_slice(name)
+                dtype = _torch_dtype_from_safetensors_name(tensor_slice.get_dtype())
+                shape = tuple(tensor_slice.get_shape())
+                native_sources[name] = TensorSource(
+                    name=name,
+                    torch_dtype=dtype,
+                    shape=shape,
+                    source=OffloadTensorRef(
+                        path=shard_path,
+                        torch_dtype=dtype,
+                        shape=shape,
+                        format="safetensors",
+                        weight_name=name,
+                    ),
+                )
+
+    collisions = set(native_sources).intersection(state_dict)
+    if collisions:
+        raise RuntimeError(
+            "EXL3 checkpoint passthrough native/packed collision: "
+            + ", ".join(sorted(collisions)[:8])
+        )
+    combined = {
+        name: native_sources.get(name, state_dict.get(name))
+        for name in sorted(set(native_sources).union(state_dict))
+    }
+    if any(source is None for source in combined.values()):
+        raise RuntimeError("EXL3 checkpoint passthrough produced an empty tensor source")
+    log.info(
+        "Model save: preserving %s native source tensors under exact checkpoint names; "
+        "publishing %s packed EXL3 tensors without native shell materialization.",
+        len(native_sources),
+        len(state_dict),
+    )
+    return combined
 
 
 def _build_exllamav3_tensor_storage_for_save(
@@ -1165,6 +1343,7 @@ def ModelWriter(cls):
         save_state_overlay = _validated_save_state_overlay(self)
         quant_method = getattr(quantize_config, "method", getattr(quantize_config, "quant_method", None))
         runtime_format = resolve_quant_format(quantize_config.format, quant_method)
+        checkpoint_passthrough_plan = None
 
         if runtime_format == FORMAT.GPTQ_V2:
             log.warn(
@@ -1182,6 +1361,10 @@ def ModelWriter(cls):
             )
             quantize_config.tensor_storage = tensor_storage
             self.quantize_config.tensor_storage = copy.deepcopy(tensor_storage)
+            checkpoint_passthrough_plan = _exllamav3_checkpoint_passthrough_plan(
+                self,
+                tensor_storage,
+            )
 
         if self.load_quantized_model and runtime_format != FORMAT.EXL3:
             self.model = self.get_model_with_quantize(
@@ -1239,33 +1422,20 @@ def ModelWriter(cls):
         # Save `quantize_config.json`
         quantize_config.save_pretrained(save_dir)
 
-        def debug_saved_config(path):
-            # List all files in the directory
-            files = os.listdir(path)
-            print("Files in directory:")
-            for file in files:
-                print(file)
-
-            config_file_paths = ["generation_config.json", "config.json"]
-            for file_name in config_file_paths:
-                full_path = os.path.join(path, file_name)
-                if os.path.isfile(full_path):
-                    print(f"Content of saved `{file_name}`:")
-                    with open(full_path, 'r') as config_file:
-                        config_data = json.load(config_file)
-                        print(json.dumps(config_data, indent=4))
-                else:
-                    print(f"`{file_name}` does not exist in the directory.")
-
-        debug_saved_config(save_dir)
+        log.info("Model: Saved quantized config metadata to `%s`.", save_dir)
 
         # Save processor related config files. For example: preprocessor_config.json, chat_template.json
         if hasattr(self,"processor") and isinstance(self.processor, ProcessorMixin):
             self.processor.save_pretrained(save_dir)
         # --- end config save block ---
 
-        # Due to shell/turtle state, we need to sync the modules from turtle to shell
-        if not self.load_quantized_model:
+        offload_root = self.quantize_config.offload_to_disk_path if getattr(self.quantize_config, "offload_to_disk", False) else None
+
+        # Ordinary shell saves need native runtime tensors materialized. Exact
+        # checkpoint passthrough instead reads untouched tensors directly under
+        # their authoritative source names and therefore deliberately skips
+        # this memory-heavy conversion step.
+        if not self.load_quantized_model and checkpoint_passthrough_plan is None:
             suspend_staging = getattr(
                 self.turtle_model, "suspend_active_source_staging", None
             )
@@ -1295,19 +1465,32 @@ def ModelWriter(cls):
                         "Model save: materialized %s remaining meta params from turtle source.",
                         restored_meta,
                     )
+        elif checkpoint_passthrough_plan is not None:
+            log.info(
+                "Model save: exact native checkpoint passthrough enabled; "
+                "skipping native shell materialization."
+            )
 
-        offload_root = self.quantize_config.offload_to_disk_path if getattr(self.quantize_config, "offload_to_disk", False) else None
-        state_dict = get_state_dict_for_save(self.model, offload_root=offload_root)
+        if checkpoint_passthrough_plan is not None:
+            state_dict = _build_exllamav3_checkpoint_passthrough_state_dict(
+                self,
+                checkpoint_passthrough_plan,
+                offload_root=offload_root,
+                validated_overlay=save_state_overlay,
+            )
+        else:
+            state_dict = get_state_dict_for_save(self.model, offload_root=offload_root)
         copy_tensor_files, prefix_entries = _normalize_out_of_model_tensors_entries(
             getattr(self, "out_of_model_tensors", None)
         )
         if prefix_entries:
             _merge_prefix_tensors_into_state_dict(prefix_entries, self.model_local_path, state_dict)
-        _apply_save_state_overlay(
-            self,
-            state_dict,
-            validated_overlay=save_state_overlay,
-        )
+        if checkpoint_passthrough_plan is None:
+            _apply_save_state_overlay(
+                self,
+                state_dict,
+                validated_overlay=save_state_overlay,
+            )
 
         model_base_name = "model"
         model_save_name = model_base_name + ".safetensors"

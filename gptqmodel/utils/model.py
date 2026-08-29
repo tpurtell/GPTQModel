@@ -1709,12 +1709,15 @@ def _collect_state_dict_with_offload(
     model: nn.Module,
     offload_root: str,
     include_prefixes: Optional[Tuple[str, ...]] = None,
+    include_names: Optional[set[str]] = None,
 ) -> Dict[str, TensorSource]:
     state_dict: Dict[str, TensorSource] = collections.OrderedDict()
     index_cache: Dict[str, Optional[Dict]] = {}
 
     for name, param in model.named_parameters():
         if include_prefixes is not None and not name.startswith(include_prefixes):
+            continue
+        if include_names is not None and name not in include_names:
             continue
         module_path, leaf = _split_parameter_path(name)
         source = None
@@ -1746,6 +1749,8 @@ def _collect_state_dict_with_offload(
             name = f"{module_name}.{buffer_name}" if module_name else buffer_name
             if include_prefixes is not None and not name.startswith(include_prefixes):
                 continue
+            if include_names is not None and name not in include_names:
+                continue
             if name in state_dict:
                 continue
             module_path, leaf = _split_parameter_path(name)
@@ -1773,6 +1778,7 @@ def get_state_dict_for_save(
     model: nn.Module,
     offload_root: Optional[str] = None,
     include_prefixes: Optional[Tuple[str, ...]] = None,
+    include_names: Optional[set[str]] = None,
 ) -> Dict[str, TensorSource]:
     """
     Filter weight-sharing tensors.
@@ -1785,11 +1791,14 @@ def get_state_dict_for_save(
             model,
             offload_root,
             include_prefixes=include_prefixes,
+            include_names=include_names,
         )
     else:
         state_dict = collections.OrderedDict()
         for name, param in model.named_parameters():
             if include_prefixes is not None and not name.startswith(include_prefixes):
+                continue
+            if include_names is not None and name not in include_names:
                 continue
             state_dict[name] = TensorSource(name=name, torch_dtype=param.dtype, shape=tuple(param.shape), source=param)
         # Collect persistent buffers in a single module-tree walk, skipping
@@ -1801,6 +1810,8 @@ def get_state_dict_for_save(
                     continue
                 name = f"{module_name}.{buffer_name}" if module_name else buffer_name
                 if include_prefixes is not None and not name.startswith(include_prefixes):
+                    continue
+                if include_names is not None and name not in include_names:
                     continue
                 if name in state_dict:
                     continue
