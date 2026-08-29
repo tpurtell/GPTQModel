@@ -542,6 +542,59 @@ def _validated_save_state_overlay_suffixes(contract):
     return set(expected_suffixes)
 
 
+def _validate_exllamav3_publication_modules(
+    owner,
+    validated_overlay=None,
+) -> int:
+    """Fail before META sync if a completed EXL3 result is still native.
+
+    Recovery controllers may defer packed-module installation while they
+    advance through activation boundaries.  Every module represented in the
+    authoritative EXL3 error ledger must be present as an EXL3 module in the
+    publication tree (or its declared save-state overlay) before the generic
+    saver is allowed to materialize remaining META tensors.  Otherwise a
+    native source weight can be reconstructed accidentally, defeating bounded
+    recovery and potentially exhausting host memory on large MoE models.
+    """
+
+    records = [
+        entry.get("exl3_error_ledger_record")
+        for entry in (getattr(owner, "quant_log", None) or ())
+        if isinstance(entry, dict)
+        and isinstance(entry.get("exl3_error_ledger_record"), dict)
+    ]
+    if not records:
+        return 0
+    modules = [record.get("module") for record in records]
+    if any(not isinstance(module, str) or not module for module in modules):
+        raise RuntimeError(
+            "EXL3 publication ledger contains a missing module identity"
+        )
+    expected = set(modules)
+    actual = {
+        name
+        for name, module in owner.model.named_modules()
+        if getattr(module, "QUANT_TYPE", None) == "exl3"
+    }
+    validated = validated_overlay or _validated_save_state_overlay(owner)
+    if validated is not None:
+        _contract, overlay_model, _normalized = validated
+        actual.update(
+            name
+            for name, module in overlay_model.named_modules()
+            if getattr(module, "QUANT_TYPE", None) == "exl3"
+        )
+    missing = sorted(expected - actual)
+    if missing:
+        raise RuntimeError(
+            "EXL3 publication tree is missing packed modules: "
+            f"actual={len(expected) - len(missing)} expected={len(expected)} "
+            "missing="
+            + ", ".join(missing[:8])
+        )
+    return len(expected)
+
+
 def _build_exllamav3_tensor_storage_for_save(
     owner,
     validated_overlay=None,
@@ -1119,6 +1172,10 @@ def ModelWriter(cls):
             )
 
         if runtime_format == FORMAT.EXL3:
+            _validate_exllamav3_publication_modules(
+                self,
+                validated_overlay=save_state_overlay,
+            )
             tensor_storage = _build_exllamav3_tensor_storage_for_save(
                 self,
                 validated_overlay=save_state_overlay,

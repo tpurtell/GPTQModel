@@ -27,6 +27,45 @@ class _Owner:
         return contract
 
 
+class _FakeEXL3(torch.nn.Module):
+    QUANT_TYPE = "exl3"
+
+
+def test_exl3_publication_guard_rejects_native_recovery_target():
+    owner = SimpleNamespace(
+        model=torch.nn.Module(),
+        quant_log=[
+            {
+                "exl3_error_ledger_record": {
+                    "module": "experts.0.gate_proj"
+                }
+            }
+        ],
+    )
+    owner.model.experts = torch.nn.ModuleList([torch.nn.Module()])
+    owner.model.experts[0].gate_proj = torch.nn.Linear(2, 2, device="meta")
+
+    with pytest.raises(RuntimeError, match="publication tree is missing"):
+        writer._validate_exllamav3_publication_modules(owner)
+
+
+def test_exl3_publication_guard_accepts_packed_recovery_target():
+    owner = SimpleNamespace(
+        model=torch.nn.Module(),
+        quant_log=[
+            {
+                "exl3_error_ledger_record": {
+                    "module": "experts.0.gate_proj"
+                }
+            }
+        ],
+    )
+    owner.model.experts = torch.nn.ModuleList([torch.nn.Module()])
+    owner.model.experts[0].gate_proj = _FakeEXL3()
+
+    assert writer._validate_exllamav3_publication_modules(owner) == 1
+
+
 def test_save_state_overlay_replaces_only_declared_prefixes(monkeypatch):
     old = SimpleNamespace(value="old")
     native = SimpleNamespace(value="native")
