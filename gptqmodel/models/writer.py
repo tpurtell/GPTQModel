@@ -108,6 +108,17 @@ def _parse_split_by(value: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def _quantization_config_for_model_config(
+    quantize_config: Any,
+    runtime_format: FORMAT,
+) -> Dict[str, Any]:
+    """Return the compact quantization descriptor embedded in config.json."""
+    payload = quantize_config.to_dict()
+    if runtime_format == FORMAT.EXL3:
+        payload.pop("tensor_storage", None)
+    return payload
+
+
 def _save_model_configs_without_weights(
         model: torch.nn.Module,
         save_dir: str,
@@ -1373,8 +1384,16 @@ def ModelWriter(cls):
             )
 
         # --- start config save block ---
-        # Save quantized config
-        config.quantization_config = quantize_config.to_dict()
+        # Keep the Transformers config small. EXL3's per-tensor storage map can
+        # be tens of megabytes and already has an authoritative home in
+        # quantize_config.json. Embedding a second copy in config.json exceeds
+        # Hub's config renderer limit and makes ordinary AutoConfig loading
+        # needlessly expensive. vLLM/GPTQModel load the complete EXL3 manifest
+        # from the external quantization config filename.
+        config.quantization_config = _quantization_config_for_model_config(
+            quantize_config,
+            runtime_format,
+        )
         self.model.config = config
 
         def strip_attention_impl_fields(target: Any) -> Dict[str, Any]:

@@ -19,9 +19,10 @@ from gptqmodel.models.writer import (
     QUANT_LOG_LOSS_KIND,
     QUANT_LOG_NSAMPLES,
     ModelWriter,
+    _quantization_config_for_model_config,
     _save_model_configs_without_weights,
 )
-from gptqmodel.quantization.config import FORMAT, METHOD
+from gptqmodel.quantization.config import EXL3Config, FORMAT, METHOD
 from gptqmodel.utils.exl3_error_ledger import (
     LEDGER_FILENAME,
     LEDGER_MANIFEST_FILENAME,
@@ -224,6 +225,31 @@ def test_save_quantized_persists_exl3_ledger_and_unambiguous_csv(tmp_path, monke
             PROCESS_LOG_TIME: "1.000",
         }
     ]
+
+
+def test_exl3_config_payload_can_omit_external_tensor_storage():
+    quantize_config = EXL3Config(
+        bits=3,
+        codebook="mcg",
+        tensor_storage={
+            "model.layers.0.proj": {
+                "quant_format": "exl3",
+                "bits_per_weight": 3,
+                "stored_tensors": {},
+            }
+        },
+    )
+
+    embedded = _quantization_config_for_model_config(
+        quantize_config,
+        FORMAT.EXL3,
+    )
+
+    assert embedded["quant_method"] == METHOD.EXL3
+    assert embedded["bits"] == 3
+    assert embedded["codebook"] == "mcg"
+    assert "tensor_storage" not in embedded
+    assert "tensor_storage" in quantize_config.to_dict()
 
 
 def test_config_only_save_preserves_existing_weight_shards(tmp_path):
