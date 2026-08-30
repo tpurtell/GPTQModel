@@ -682,6 +682,61 @@ def test_restore_completed_layer_installs_packed_modules_without_hessian(
         isinstance(root.get_submodule(entry["module"]), ExllamaV3Linear)
         for entry in entries
     )
+    assert len(processor.log) == 6
+    assert len(processor.module_names) == 6
+    assert len(processor.avg_losses) == 6
+    assert len(processor.durations) == 6
+
+    processor.log[0]["exl3_projection_checkpoint"] = "0" * 64
+    with pytest.raises(RuntimeError, match="conflicting projection history"):
+        processor.restore_completed_layer_checkpoints(
+            model=model,
+            layer_index=0,
+            projection_entries=entries,
+        )
+
+
+def test_restore_completed_layer_rejects_duplicate_existing_history(
+    tmp_path,
+) -> None:
+    # Duplicate history is rejected before checkpoint or model mutation, so an
+    # empty restore request is sufficient to exercise the preflight guard.
+    processor = EXL3Processor.__new__(EXL3Processor)
+    processor.qcfg = SimpleNamespace(
+        meta={
+            "ds4rt_error_ledger": {
+                "family_join": {},
+                "run": {
+                    "projection_checkpoint": {
+                        "contract": CHECKPOINT_CONTRACT,
+                        "root": str(tmp_path / "projection-checkpoints"),
+                    }
+                },
+            }
+        },
+        offload_to_disk=True,
+        offload_to_disk_path=str(tmp_path / "offload"),
+    )
+    processor.error_journal_path = str(tmp_path / "error-journal.jsonl")
+    processor._stats_lock = threading.Lock()
+    stat = {
+        "layer": 0,
+        "module": "gate_proj",
+        "exl3_error_ledger_record": {"module": "model.layers.0.gate_proj"},
+        "exl3_projection_checkpoint": "1" * 64,
+        "exl3_error_record_sha256": "2" * 64,
+    }
+    processor.log = [stat, dict(stat)]
+    processor.durations = []
+    processor.avg_losses = []
+    processor.module_names = []
+
+    with pytest.raises(RuntimeError, match="duplicate projection history"):
+        processor.restore_completed_layer_checkpoints(
+            model=SimpleNamespace(model=nn.Module()),
+            layer_index=0,
+            projection_entries=[],
+        )
 
 
 def _inline_mtp_restore_fixture(

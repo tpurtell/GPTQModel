@@ -3661,6 +3661,36 @@ class EXL3Processor(LoopProcessor):
         if not getattr(self.qcfg, "offload_to_disk", False) or not offload_path:
             raise RuntimeError("EXL3 layer restore requires durable disk offload")
 
+        # A newly completed layer is already represented in ``self.log``.  The
+        # layer-boundary controller may nevertheless restore its packed modules
+        # from checkpoints during deferred publication.  Treat that overlap as
+        # an idempotent module materialization, not as a second publication of
+        # the same projection.  Conflicting or already-duplicated history must
+        # fail closed before any module is replaced.
+        existing_stats: dict[str, dict[str, Any]] = {}
+        with self._stats_lock:
+            log_snapshot = list(self.log)
+        for stat in log_snapshot:
+            if stat.get(PROCESS_LOG_LAYER) != layer_index:
+                continue
+            record = stat.get("exl3_error_ledger_record")
+            module_name = record.get("module") if isinstance(record, dict) else None
+            request_sha256 = stat.get("exl3_projection_checkpoint")
+            record_sha256 = stat.get("exl3_error_record_sha256")
+            if not all(
+                isinstance(value, str) and value
+                for value in (module_name, request_sha256, record_sha256)
+            ):
+                raise RuntimeError(
+                    f"EXL3 layer {layer_index} has an uncommitted projection result"
+                )
+            if module_name in existing_stats:
+                raise RuntimeError(
+                    f"EXL3 layer {layer_index} has duplicate projection history "
+                    f"for `{module_name}`"
+                )
+            existing_stats[module_name] = stat
+
         restored_stats: list[dict[str, Any]] = []
         seen_modules: set[str] = set()
         for entry in sorted(projection_entries, key=lambda item: item.get("module", "")):
@@ -3704,6 +3734,18 @@ class EXL3Processor(LoopProcessor):
                 self.error_journal_path, ledger_record
             )
             publication_ledger_record = compact_projection_record(ledger_record)
+            existing_stat = existing_stats.get(module_name)
+            if existing_stat is not None and (
+                existing_stat.get("exl3_projection_checkpoint") != request_sha256
+                or existing_stat.get("exl3_error_record_sha256")
+                != actual_record_sha256
+                or existing_stat.get("exl3_error_ledger_record")
+                != publication_ledger_record
+            ):
+                raise RuntimeError(
+                    f"EXL3 layer {layer_index} has conflicting projection history "
+                    f"for `{module_name}`"
+                )
             try:
                 source_module = model.model.get_submodule(module_name)
             except AttributeError as error:
@@ -3789,36 +3831,39 @@ class EXL3Processor(LoopProcessor):
                 raise RuntimeError(
                     f"EXL3 packed checkpoint result is malformed for `{module_name}`"
                 )
-            restored_stats.append(
-                {
-                    PROCESS_LOG_NAME: self.name(),
-                    PROCESS_LOG_LAYER: layer_index,
-                    PROCESS_LOG_MODULE: relative_name,
-                    MODULE_FEATURE_COLUMN: self.module_feature_summary(named),
-                    DTYPE_SIZE_COLUMN: self.module_dtype_size_summary(named),
-                    QUANT_LOG_LOSS: (
-                        f"{proxy_error:.10f}"
-                        if isinstance(proxy_error, (int, float))
-                        else str(proxy_error)
-                    ),
-                    QUANT_LOG_NSAMPLES: str(request.get("sample_count")),
-                    QUANT_LOG_DAMP: f"{_EXL3_SIGMA_REG:.5f}",
-                    PROCESS_LOG_TIME: f"{float(duration):.3f}",
-                    PROCESS_LOG_FWD_TIME: "0.000",
-                    PROCESS_USED_MEMORY: "restored",
-                    QUANT_LOG_LOSS_KIND: quantizer_metrics.get(
-                        "reported_metric_kind", "unknown"
-                    ),
-                    "exl3_error_ledger_record": publication_ledger_record,
-                    "exl3_error_journal": self.error_journal_path,
-                    "exl3_error_record_sha256": actual_record_sha256,
-                    "exl3_projection_checkpoint": request_sha256,
-                    "exl3_projection_checkpoint_hit": True,
-                    "exl3_execution_contract": result.get("execution_contract"),
-                    "exl3_execution_result": result.get("execution_result"),
-                    "exl3_layer_boundary_restore": True,
-                }
-            )
+            if existing_stat is None:
+                restored_stats.append(
+                    {
+                        PROCESS_LOG_NAME: self.name(),
+                        PROCESS_LOG_LAYER: layer_index,
+                        PROCESS_LOG_MODULE: relative_name,
+                        MODULE_FEATURE_COLUMN: self.module_feature_summary(named),
+                        DTYPE_SIZE_COLUMN: self.module_dtype_size_summary(named),
+                        QUANT_LOG_LOSS: (
+                            f"{proxy_error:.10f}"
+                            if isinstance(proxy_error, (int, float))
+                            else str(proxy_error)
+                        ),
+                        QUANT_LOG_NSAMPLES: str(request.get("sample_count")),
+                        QUANT_LOG_DAMP: f"{_EXL3_SIGMA_REG:.5f}",
+                        PROCESS_LOG_TIME: f"{float(duration):.3f}",
+                        PROCESS_LOG_FWD_TIME: "0.000",
+                        PROCESS_USED_MEMORY: "restored",
+                        QUANT_LOG_LOSS_KIND: quantizer_metrics.get(
+                            "reported_metric_kind", "unknown"
+                        ),
+                        "exl3_error_ledger_record": publication_ledger_record,
+                        "exl3_error_journal": self.error_journal_path,
+                        "exl3_error_record_sha256": actual_record_sha256,
+                        "exl3_projection_checkpoint": request_sha256,
+                        "exl3_projection_checkpoint_hit": True,
+                        "exl3_execution_contract": result.get(
+                            "execution_contract"
+                        ),
+                        "exl3_execution_result": result.get("execution_result"),
+                        "exl3_layer_boundary_restore": True,
+                    }
+                )
             seen_modules.add(module_name)
 
         with self._stats_lock:
