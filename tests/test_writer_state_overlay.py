@@ -79,6 +79,7 @@ def test_exl3_checkpoint_passthrough_preserves_native_source_identity(tmp_path):
     save_file(
         {
             "expert.weight": torch.ones((2, 2), dtype=torch.bfloat16),
+            "expert.weight_scale_inv": torch.ones((1, 1), dtype=torch.float32),
             "original.hc_attn_base": native,
         },
         blob_path,
@@ -99,6 +100,7 @@ def test_exl3_checkpoint_passthrough_preserves_native_source_identity(tmp_path):
             model_local_path=str(snapshot),
             _weight_map={
                 "expert.weight": source_path.name,
+                "expert.weight_scale_inv": source_path.name,
                 "original.hc_attn_base": source_path.name,
             },
         ),
@@ -113,6 +115,9 @@ def test_exl3_checkpoint_passthrough_preserves_native_source_identity(tmp_path):
     }
 
     plan = writer._exllamav3_checkpoint_passthrough_plan(owner, storage)
+    assert plan["replaced_source_names"] == frozenset(
+        {"expert.weight", "expert.weight_scale_inv"}
+    )
     state = writer._build_exllamav3_checkpoint_passthrough_state_dict(owner, plan)
 
     assert set(state) == {

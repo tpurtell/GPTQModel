@@ -629,7 +629,8 @@ def _exllamav3_checkpoint_passthrough_plan(owner, tensor_storage):
         return None
 
     quant_names = set()
-    replaced_source_names = set()
+    replaced_source_weights = set()
+    replaced_source_modules = set()
     for module_name, entry in tensor_storage.items():
         if not isinstance(module_name, str) or not module_name:
             return None
@@ -643,14 +644,29 @@ def _exllamav3_checkpoint_passthrough_plan(owner, tensor_storage):
         ):
             return None
         quant_names.update(names)
-        replaced_source_names.add(f"{module_name}.weight")
+        replaced_source_weights.add(f"{module_name}.weight")
+        replaced_source_modules.add(module_name)
 
     # Conversion-based architectures are eligible only when the publication
     # module identities themselves are also source-checkpoint identities. This
     # makes passthrough exact and keeps the fallback behavior for architectures
     # whose quantized prefixes require a more involved conversion contract.
-    if not replaced_source_names.issubset(weight_map):
+    if not replaced_source_weights.issubset(weight_map):
         return None
+    # An EXL3 module replaces the complete native module state, not only its
+    # weight tensor.  Native FP8 checkpoints commonly keep auxiliary tensors
+    # such as ``weight_scale_inv`` under the same prefix; preserving those
+    # after replacing the weight leaks stale source state into the published
+    # tensor namespace.  Match the complete authoritative source prefix, just
+    # like the ordinary save-state overlay path does.
+    replaced_source_names = set()
+    for name in weight_map:
+        owner_name = name
+        while "." in owner_name:
+            owner_name = owner_name.rsplit(".", 1)[0]
+            if owner_name in replaced_source_modules:
+                replaced_source_names.add(name)
+                break
     return {
         "checkpoint_source": checkpoint_source,
         "quant_names": frozenset(quant_names),
