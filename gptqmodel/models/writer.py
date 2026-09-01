@@ -582,6 +582,40 @@ def _validated_save_state_overlay_suffixes(contract):
     return set(expected_suffixes)
 
 
+def _validated_save_state_overlay_removals(contract):
+    """Return source-checkpoint prefixes superseded under different names."""
+
+    prefixes = contract.get("remove_prefixes")
+    if prefixes is None:
+        return (), None
+    if (
+        not isinstance(prefixes, (list, tuple))
+        or not prefixes
+        or any(not isinstance(prefix, str) or not prefix for prefix in prefixes)
+        or len(set(prefixes)) != len(prefixes)
+    ):
+        raise ValueError(
+            "save-state overlay removal prefixes must be unique non-empty strings"
+        )
+    normalized = tuple(
+        prefix if prefix.endswith(".") else f"{prefix}." for prefix in prefixes
+    )
+    expected_suffixes = contract.get("remove_expected_suffixes")
+    if (
+        not isinstance(expected_suffixes, (list, tuple))
+        or not expected_suffixes
+        or any(
+            not isinstance(suffix, str) or not suffix
+            for suffix in expected_suffixes
+        )
+        or len(set(expected_suffixes)) != len(expected_suffixes)
+    ):
+        raise ValueError(
+            "save-state overlay removal suffixes must be unique non-empty strings"
+        )
+    return normalized, set(expected_suffixes)
+
+
 def _validate_exllamav3_publication_modules(
     owner,
     validated_overlay=None,
@@ -929,11 +963,32 @@ def _apply_save_state_overlay(
                     f"actual={sorted(actual_suffixes)} "
                     f"expected={sorted(expected_suffixes)}"
                 )
-    stale = [
+    removal_prefixes, removal_suffixes = _validated_save_state_overlay_removals(
+        contract
+    )
+    removed_native = [
+        name
+        for name in state_dict
+        if any(name.startswith(prefix) for prefix in removal_prefixes)
+    ]
+    for prefix in removal_prefixes:
+        actual_suffixes = {
+            name[len(prefix) :]
+            for name in removed_native
+            if name.startswith(prefix)
+        }
+        if actual_suffixes != removal_suffixes:
+            raise ValueError(
+                f"save-state overlay source-removal contract differs for {prefix}: "
+                f"actual={sorted(actual_suffixes)} "
+                f"expected={sorted(removal_suffixes)}"
+            )
+    stale = set(removed_native)
+    stale.update(
         name
         for name in state_dict
         if any(name.startswith(prefix) for prefix in normalized)
-    ]
+    )
     for name in stale:
         del state_dict[name]
     collisions = set(selected).intersection(state_dict)
@@ -944,9 +999,11 @@ def _apply_save_state_overlay(
         )
     state_dict.update(selected)
     log.info(
-        "Model: Replaced %s tensor prefixes (%s source tensors -> %s overlay tensors)",
+        "Model: Replaced %s tensor prefixes (%s source tensors, including %s "
+        "checkpoint aliases -> %s overlay tensors)",
         len(normalized),
         len(stale),
+        len(removed_native),
         len(selected),
     )
 

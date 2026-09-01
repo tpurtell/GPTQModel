@@ -13,9 +13,17 @@ from gptqmodel.utils import model as model_utils
 
 
 class _Owner:
-    def __init__(self, prefixes, expected_suffixes=None):
+    def __init__(
+        self,
+        prefixes,
+        expected_suffixes=None,
+        remove_prefixes=None,
+        remove_expected_suffixes=None,
+    ):
         self.prefixes = prefixes
         self.expected_suffixes = expected_suffixes
+        self.remove_prefixes = remove_prefixes
+        self.remove_expected_suffixes = remove_expected_suffixes
         self.model = torch.nn.Linear(1, 1)
 
     def save_state_overlay(self):
@@ -26,6 +34,10 @@ class _Owner:
         }
         if self.expected_suffixes is not None:
             contract["expected_suffixes"] = self.expected_suffixes
+        if self.remove_prefixes is not None:
+            contract["remove_prefixes"] = self.remove_prefixes
+        if self.remove_expected_suffixes is not None:
+            contract["remove_expected_suffixes"] = self.remove_expected_suffixes
         return contract
 
 
@@ -192,6 +204,61 @@ def test_save_state_overlay_replaces_only_declared_prefixes(monkeypatch):
         "mtp.0.mlp.experts.7.gate_proj.trellis": trellis,
         "mtp.0.mlp.experts.7.gate_proj.suh": suh,
     }
+
+
+def test_save_state_overlay_removes_checkpoint_alias_prefixes(monkeypatch):
+    native = object()
+    state = {
+        "mtp.0.ffn.experts.7.w1.weight": native,
+        "mtp.0.ffn.experts.7.w1.scale": native,
+        "mtp.0.main_norm.weight": native,
+    }
+    monkeypatch.setattr(
+        writer,
+        "get_state_dict_for_save",
+        lambda *args, **kwargs: {
+            "mtp.0.mlp.experts.7.gate_proj.trellis": object(),
+            "mtp.0.mlp.experts.7.gate_proj.suh": object(),
+        },
+    )
+
+    writer._apply_save_state_overlay(
+        _Owner(
+            ["mtp.0.mlp.experts.7.gate_proj"],
+            remove_prefixes=["mtp.0.ffn.experts.7.w1"],
+            remove_expected_suffixes=["weight", "scale"],
+        ),
+        state,
+    )
+
+    assert set(state) == {
+        "mtp.0.main_norm.weight",
+        "mtp.0.mlp.experts.7.gate_proj.trellis",
+        "mtp.0.mlp.experts.7.gate_proj.suh",
+    }
+
+
+def test_save_state_overlay_removal_fails_closed_on_missing_source_suffix(
+    monkeypatch,
+):
+    state = {"mtp.0.ffn.experts.7.w1.weight": object()}
+    monkeypatch.setattr(
+        writer,
+        "get_state_dict_for_save",
+        lambda *args, **kwargs: {
+            "mtp.0.mlp.experts.7.gate_proj.trellis": object(),
+        },
+    )
+
+    with pytest.raises(ValueError, match="source-removal contract differs"):
+        writer._apply_save_state_overlay(
+            _Owner(
+                ["mtp.0.mlp.experts.7.gate_proj"],
+                remove_prefixes=["mtp.0.ffn.experts.7.w1"],
+                remove_expected_suffixes=["weight", "scale"],
+            ),
+            state,
+        )
 
 
 def test_save_tensor_storage_includes_exact_overlay_modules(monkeypatch):

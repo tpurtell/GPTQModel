@@ -1381,6 +1381,32 @@ def patch_deepseek_v4_checkpoint_precision(model) -> dict[str, int]:
     return counts
 
 
+def deepseek_v4_mtp_source_projection_prefix(runtime_prefix: str) -> str:
+    """Map one packed MTP projection to its superseded checkpoint prefix."""
+
+    projection_alias = {
+        "gate_proj": "w1",
+        "up_proj": "w3",
+        "down_proj": "w2",
+    }
+    parts = runtime_prefix.split(".")
+    if (
+        len(parts) != 6
+        or parts[0] != "mtp"
+        or not parts[1].isdigit()
+        or parts[2:4] != ["mlp", "experts"]
+        or not parts[4].isdigit()
+        or parts[5] not in projection_alias
+    ):
+        raise RuntimeError(
+            f"MTP EXL3 save overlay has an invalid module {runtime_prefix!r}"
+        )
+    return (
+        f"mtp.{parts[1]}.ffn.experts.{parts[4]}."
+        f"{projection_alias[parts[5]]}"
+    )
+
+
 class DeepSeekV4QModel(DeepSeekV3QModel):
     dynamic_expert_index = "n_routed_experts"
     rotary_embedding = "model.rotary_emb"
@@ -1610,6 +1636,10 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
                 "MTP EXL3 save overlay coverage mismatch: "
                 f"actual={len(prefixes)} expected={expected_count}"
             )
+        source_prefixes = [
+            deepseek_v4_mtp_source_projection_prefix(prefix)
+            for prefix in prefixes
+        ]
         return {
             "model": adapter.model,
             "offload_root": (
@@ -1619,6 +1649,8 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
             ),
             "replace_prefixes": prefixes,
             "expected_suffixes": ["trellis", "suh", "svh", "mcg"],
+            "remove_prefixes": source_prefixes,
+            "remove_expected_suffixes": ["weight", "scale"],
         }
 
     def after_model_load(self, model, load_quantized_model=False):

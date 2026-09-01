@@ -30,6 +30,7 @@ from gptqmodel.models.definitions.deepseek_v4 import (
     MTP_CAPTURE_DECODE_MASK,
     MTP_CAPTURE_INPUT_IDS,
     expected_deepseek_v4_mtp_checkpoint_keys,
+    deepseek_v4_mtp_source_projection_prefix,
     patch_deepseek_v4_router_precision,
     validate_deepseek_v4_mtp_checkpoint_keys,
 )
@@ -68,6 +69,21 @@ def _tiny_v4_config() -> DeepseekV4Config:
         partial_rotary_factor=0.5,
         dtype="bfloat16",
     )
+
+
+@pytest.mark.parametrize(
+    ("runtime", "checkpoint"),
+    (
+        ("mtp.0.mlp.experts.7.gate_proj", "mtp.0.ffn.experts.7.w1"),
+        ("mtp.1.mlp.experts.8.up_proj", "mtp.1.ffn.experts.8.w3"),
+        ("mtp.2.mlp.experts.9.down_proj", "mtp.2.ffn.experts.9.w2"),
+    ),
+)
+def test_mtp_save_overlay_maps_runtime_projections_to_checkpoint_prefixes(
+    runtime,
+    checkpoint,
+):
+    assert deepseek_v4_mtp_source_projection_prefix(runtime) == checkpoint
 
 
 def test_deepseek_v4_model_type_selects_definition(monkeypatch):
