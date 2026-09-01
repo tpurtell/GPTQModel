@@ -98,6 +98,8 @@ def expected_deepseek_v4_mtp_checkpoint_keys(config) -> set[str]:
     for block_index in range(MTP_BLOCK_COUNT):
         prefix = f"mtp.{block_index}."
         expected.update(prefix + suffix for suffix in common)
+        if int(getattr(config, "vision_n_layers", 0) or 0) > 0:
+            expected.add(f"{prefix}ffn.gate.bias_vl")
         for expert_index in range(num_experts):
             for projection in ("w1", "w2", "w3"):
                 expert_prefix = f"{prefix}ffn.experts.{expert_index}.{projection}"
@@ -1386,7 +1388,19 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
     # namespace. Preserve it byte-for-byte until a quantizer explicitly
     # replaces those tensors; silently dropping it produces an incomplete V4
     # artifact even when normal target-layer quantization succeeds.
-    out_of_model_tensors = {"prefixes": ["mtp"]}
+    out_of_model_tensors = {
+        "prefixes": ["mtp", "vision", "aligner"],
+        "suffixes": [".ffn.gate.bias_vl"],
+        "tensors": [
+            "image_start",
+            "image_end",
+            "image_newline",
+            "image_pad",
+            "layers.0.ffn.gate.bias",
+            "layers.1.ffn.gate.bias",
+            "layers.2.ffn.gate.bias",
+        ],
+    }
     router_compute_dtype = torch.float32
     # This tree is deliberately separate from ``module_tree``. Feeding it to
     # the normal ModuleLooper would serialize target layer 42 into MTP block 0

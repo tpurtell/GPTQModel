@@ -453,14 +453,18 @@ def _resolve_out_of_model_source_files(
     )
 
 
-def _load_tensors_by_prefixes(
+def _load_tensors_by_selectors(
     model_local_path: str,
     prefixes: List[str],
+    suffixes: Optional[List[str]] = None,
+    tensor_names: Optional[List[str]] = None,
     source_files: Optional[List[str]] = None,
 ) -> Dict[str, torch.Tensor]:
-    # Gather tensors whose names match any of the requested prefixes.
-    # Gather tensors whose names match any of the requested prefixes from all available shards.
+    """Gather source tensors selected by prefix, suffix, or exact name."""
+
     tensors: Dict[str, torch.Tensor] = {}
+    suffixes = suffixes or []
+    tensor_name_set = set(tensor_names or [])
     source_file_names = _resolve_out_of_model_source_files(model_local_path, source_files)
     for source_file_name in source_file_names:
         source_tensor_path = os.path.join(model_local_path, source_file_name)
@@ -469,13 +473,17 @@ def _load_tensors_by_prefixes(
         try:
             with safe_open(source_tensor_path, framework="pt", device="cpu") as f:
                 for tensor_name in f.keys():
-                    if any(tensor_name.startswith(prefix) for prefix in prefixes):
+                    if (
+                        tensor_name in tensor_name_set
+                        or any(tensor_name.startswith(prefix) for prefix in prefixes)
+                        or any(tensor_name.endswith(suffix) for suffix in suffixes)
+                    ):
                         if tensor_name not in tensors:
                             tensors[tensor_name] = f.get_tensor(tensor_name)
         except Exception as exc:
             log.warn(
-                f"Model: Failed to read tensors from {source_file_name} while scanning for prefixes "
-                f"{prefixes}: {exc}"
+                f"Model: Failed to read tensors from {source_file_name} while scanning "
+                f"for out-of-model selectors: {exc}"
             )
     return tensors
 
@@ -491,20 +499,40 @@ def _tensor_source_from_tensor(name: str, tensor: torch.Tensor) -> TensorSource:
     )
 
 
-def _merge_prefix_tensors_into_state_dict(
-    prefixes: List[str], model_local_path: str, state_dict: Dict[str, TensorSource]
+def _merge_selected_tensors_into_state_dict(
+    prefixes: List[str],
+    suffixes: List[str],
+    tensor_names: List[str],
+    model_local_path: str,
+    state_dict: Dict[str, TensorSource],
 ) -> None:
     # Inject matched tensors into the ongoing state_dict before sharding.
     merged = 0
     normalized_prefixes = [prefix if prefix.endswith(".") else f"{prefix}." for prefix in prefixes]
-    tensors = _load_tensors_by_prefixes(model_local_path, normalized_prefixes)
+    tensors = _load_tensors_by_selectors(
+        model_local_path,
+        normalized_prefixes,
+        suffixes,
+        tensor_names,
+    )
     for name, tensor in tensors.items():
         state_dict[name] = _tensor_source_from_tensor(name, tensor)
         merged += 1
     if merged:
-        log.info(f"Model: Merged {merged} tensors with prefixes {normalized_prefixes} into the state dict")
+        log.info(
+            "Model: Merged %s tensors selected by prefixes=%s suffixes=%s names=%s into the state dict",
+            merged,
+            normalized_prefixes,
+            suffixes,
+            tensor_names,
+        )
     else:
-        log.warn(f"Model: No tensors matched prefixes {normalized_prefixes} while merging into the state dict")
+        log.warn(
+            "Model: No tensors matched out-of-model selectors prefixes=%s suffixes=%s names=%s",
+            normalized_prefixes,
+            suffixes,
+            tensor_names,
+        )
 
 
 def _validated_save_state_overlay(owner):
@@ -925,12 +953,14 @@ def _apply_save_state_overlay(
 
 def _normalize_out_of_model_tensors_entries(
     entries: Optional[List[Union[str, Dict[str, Any]]]]
-) -> tuple[List[str], List[str]]:
+) -> tuple[List[str], List[str], List[str], List[str]]:
     # Normalize configured files/prefixes into explicit lists.
     copy_files: List[str] = []
     prefixes: List[str] = []
+    suffixes: List[str] = []
+    tensor_names: List[str] = []
     if not entries:
-        return copy_files, prefixes
+        return copy_files, prefixes, suffixes, tensor_names
 
     raw_entries = list(entries) if isinstance(entries, (list, tuple)) else [entries]
     for entry in raw_entries:
@@ -956,7 +986,23 @@ def _normalize_out_of_model_tensors_entries(
                     raise ValueError("`prefixes` entries must be non-empty strings.")
                 prefixes.append(prefix)
 
-    return copy_files, prefixes
+        suffixes_value = entry.get("suffixes")
+        if suffixes_value is not None:
+            suffix_list = [suffixes_value] if isinstance(suffixes_value, str) else list(suffixes_value)
+            for suffix in suffix_list:
+                if not isinstance(suffix, str) or not suffix:
+                    raise ValueError("`suffixes` entries must be non-empty strings.")
+                suffixes.append(suffix)
+
+        tensors_value = entry.get("tensors")
+        if tensors_value is not None:
+            tensors = [tensors_value] if isinstance(tensors_value, str) else list(tensors_value)
+            for tensor_name in tensors:
+                if not isinstance(tensor_name, str) or not tensor_name:
+                    raise ValueError("`tensors` entries must be non-empty strings.")
+                tensor_names.append(tensor_name)
+
+    return copy_files, prefixes, suffixes, tensor_names
 
 
 def _resolve_layer_split_group(tensor_name: str, layer_prefixes: List[str]) -> tuple[str, bool]:
@@ -1515,12 +1561,23 @@ def ModelWriter(cls):
             )
         else:
             state_dict = get_state_dict_for_save(self.model, offload_root=offload_root)
-        copy_tensor_files, prefix_entries = _normalize_out_of_model_tensors_entries(
+        (
+            copy_tensor_files,
+            prefix_entries,
+            suffix_entries,
+            tensor_name_entries,
+        ) = _normalize_out_of_model_tensors_entries(
             getattr(self, "out_of_model_tensors", None)
         )
-        if prefix_entries:
-            _merge_prefix_tensors_into_state_dict(prefix_entries, self.model_local_path, state_dict)
         if checkpoint_passthrough_plan is None:
+            if prefix_entries or suffix_entries or tensor_name_entries:
+                _merge_selected_tensors_into_state_dict(
+                    prefix_entries,
+                    suffix_entries,
+                    tensor_name_entries,
+                    self.model_local_path,
+                    state_dict,
+                )
             _apply_save_state_overlay(
                 self,
                 state_dict,

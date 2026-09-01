@@ -540,6 +540,54 @@ def test_merge_prefixed_tensors(tmp_path, monkeypatch):
     assert {"mtp.fc.weight", "mtp.model.layers.0.weight"} <= keys
 
 
+def test_merge_suffix_and_exact_tensors(tmp_path, monkeypatch):
+    original_dir = tmp_path / "original"
+    original_dir.mkdir()
+    shard_name = "model.safetensors"
+    save_file(
+        {
+            "layers.0.ffn.gate.bias_vl": torch.ones(2),
+            "image_start": torch.full((2,), 2.0),
+            "unselected": torch.full((2,), 3.0),
+        },
+        str(original_dir / shard_name),
+    )
+    with open(original_dir / "model.safetensors.index.json", "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "metadata": {"total_size": 0},
+                "weight_map": {
+                    "layers.0.ffn.gate.bias_vl": shard_name,
+                    "image_start": shard_name,
+                    "unselected": shard_name,
+                },
+            },
+            handle,
+        )
+
+    writer = _build_writer_with_out_of_model_file(
+        str(original_dir),
+        out_of_model_tensor_files=[
+            {
+                "suffixes": [".ffn.gate.bias_vl"],
+                "tensors": ["image_start"],
+            }
+        ],
+    )
+    state_dict_data = {"model.weight": _tensor_source("model.weight", torch.zeros(1))}
+    _patch_basic_env(monkeypatch, state_dict_data)
+    _patch_streaming(monkeypatch)
+
+    save_dir = tmp_path / "save"
+    writer.save_quantized(save_dir=str(save_dir))
+
+    with safe_open(save_dir / "model.safetensors", framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+    assert "layers.0.ffn.gate.bias_vl" in keys
+    assert "image_start" in keys
+    assert "unselected" not in keys
+
+
 def test_merge_prefixed_tensors_with_multiple_shards(tmp_path, monkeypatch):
     original_dir = tmp_path / "original"
     original_dir.mkdir()

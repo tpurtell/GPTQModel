@@ -105,7 +105,19 @@ def test_deepseek_v4_module_tree_matches_v4_attention_and_fused_experts():
 
 
 def test_deepseek_v4_preserves_integrated_mtp_namespace() -> None:
-    assert DeepSeekV4QModel.out_of_model_tensors == {"prefixes": ["mtp"]}
+    assert DeepSeekV4QModel.out_of_model_tensors == {
+        "prefixes": ["mtp", "vision", "aligner"],
+        "suffixes": [".ffn.gate.bias_vl"],
+        "tensors": [
+            "image_start",
+            "image_end",
+            "image_newline",
+            "image_pad",
+            "layers.0.ffn.gate.bias",
+            "layers.1.ffn.gate.bias",
+            "layers.2.ffn.gate.bias",
+        ],
+    }
 
 
 def test_deepseek_v4_configures_base_replay_store_with_resolved_path(
@@ -240,6 +252,13 @@ def test_deepseek_v4_mtp_checkpoint_contract_is_exact_and_does_not_trust_nextn_c
     assert "mtp.2.ffn.experts.2.w3.scale" in keys
     assert "mtp.0.main_proj.weight" in keys
     assert "mtp.2.confidence_head.proj.weight" in keys
+
+    config.vision_n_layers = 1
+    vision_keys = expected_deepseek_v4_mtp_checkpoint_keys(config)
+    assert "mtp.0.ffn.gate.bias_vl" in vision_keys
+    assert "mtp.2.ffn.gate.bias_vl" in vision_keys
+    validate_deepseek_v4_mtp_checkpoint_keys(config, vision_keys)
+    config.vision_n_layers = 0
 
     missing = set(keys)
     missing.remove("mtp.1.ffn.experts.2.w2.scale")
