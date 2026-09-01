@@ -691,8 +691,12 @@ def _exllamav3_checkpoint_passthrough_plan(owner, tensor_storage):
         return None
 
     quant_names = set()
-    replaced_source_weights = set()
     replaced_source_modules = set()
+    source_candidates = getattr(
+        owner,
+        "exllamav3_checkpoint_module_candidates",
+        None,
+    )
     for module_name, entry in tensor_storage.items():
         if not isinstance(module_name, str) or not module_name:
             return None
@@ -706,15 +710,41 @@ def _exllamav3_checkpoint_passthrough_plan(owner, tensor_storage):
         ):
             return None
         quant_names.update(names)
-        replaced_source_weights.add(f"{module_name}.weight")
-        replaced_source_modules.add(module_name)
+        if callable(source_candidates):
+            candidates = source_candidates(module_name)
+            if (
+                not isinstance(candidates, (list, tuple))
+                or not candidates
+                or any(
+                    not isinstance(candidate, str) or not candidate
+                    for candidate in candidates
+                )
+                or len(set(candidates)) != len(candidates)
+            ):
+                raise RuntimeError(
+                    "EXL3 checkpoint module candidates must be unique "
+                    f"non-empty strings for {module_name}"
+                )
+        else:
+            candidates = (module_name,)
+        matches = [
+            candidate
+            for candidate in candidates
+            if f"{candidate}.weight" in weight_map
+        ]
+        if len(matches) != 1:
+            if callable(source_candidates):
+                raise RuntimeError(
+                    "EXL3 checkpoint module mapping is not unique for "
+                    f"{module_name}: {matches}"
+                )
+            return None
+        replaced_source_modules.add(matches[0])
 
     # Conversion-based architectures are eligible only when the publication
     # module identities themselves are also source-checkpoint identities. This
     # makes passthrough exact and keeps the fallback behavior for architectures
     # whose quantized prefixes require a more involved conversion contract.
-    if not replaced_source_weights.issubset(weight_map):
-        return None
     # An EXL3 module replaces the complete native module state, not only its
     # weight tensor.  Native FP8 checkpoints commonly keep auxiliary tensors
     # such as ``weight_scale_inv`` under the same prefix; preserving those
@@ -782,6 +812,7 @@ def _build_exllamav3_checkpoint_passthrough_state_dict(
         owner,
         state_dict,
         validated_overlay=validated_overlay,
+        require_source_removals=False,
     )
     actual_quant_names = set(state_dict)
     if actual_quant_names != quant_names:
@@ -923,6 +954,8 @@ def _apply_save_state_overlay(
     owner,
     state_dict: Dict[str, TensorSource],
     validated_overlay=None,
+    *,
+    require_source_removals: bool = True,
 ) -> None:
     """Replace complete tensor prefixes from an attached quantization model."""
 
@@ -971,18 +1004,19 @@ def _apply_save_state_overlay(
         for name in state_dict
         if any(name.startswith(prefix) for prefix in removal_prefixes)
     ]
-    for prefix in removal_prefixes:
-        actual_suffixes = {
-            name[len(prefix) :]
-            for name in removed_native
-            if name.startswith(prefix)
-        }
-        if actual_suffixes != removal_suffixes:
-            raise ValueError(
-                f"save-state overlay source-removal contract differs for {prefix}: "
-                f"actual={sorted(actual_suffixes)} "
-                f"expected={sorted(removal_suffixes)}"
-            )
+    if require_source_removals:
+        for prefix in removal_prefixes:
+            actual_suffixes = {
+                name[len(prefix) :]
+                for name in removed_native
+                if name.startswith(prefix)
+            }
+            if actual_suffixes != removal_suffixes:
+                raise ValueError(
+                    f"save-state overlay source-removal contract differs for {prefix}: "
+                    f"actual={sorted(actual_suffixes)} "
+                    f"expected={sorted(removal_suffixes)}"
+                )
     stale = set(removed_native)
     stale.update(
         name

@@ -1459,6 +1459,40 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         },
     ]
 
+    def exllamav3_checkpoint_module_candidates(
+        self,
+        runtime_prefix: str,
+    ) -> tuple[str, ...]:
+        """Resolve packed runtime experts to exact V4 checkpoint prefixes."""
+
+        projection_alias = {
+            "gate_proj": "w1",
+            "up_proj": "w3",
+            "down_proj": "w2",
+        }
+        parts = runtime_prefix.split(".")
+        if (
+            len(parts) == 7
+            and parts[:2] == ["model", "layers"]
+            and parts[2].isdigit()
+            and parts[3:5] == ["mlp", "experts"]
+            and parts[5].isdigit()
+            and parts[6] in projection_alias
+        ):
+            checkpoint_prefix = (
+                f"layers.{parts[2]}.ffn.experts.{parts[5]}."
+                f"{projection_alias[parts[6]]}"
+            )
+        elif runtime_prefix.startswith("mtp."):
+            checkpoint_prefix = deepseek_v4_mtp_source_projection_prefix(
+                runtime_prefix
+            )
+        else:
+            raise RuntimeError(
+                f"DeepSeek V4 EXL3 module has an invalid runtime prefix {runtime_prefix!r}"
+            )
+        return runtime_prefix, checkpoint_prefix
+
     def configure_base_replay_store(
         self,
         root: str | os.PathLike[str],

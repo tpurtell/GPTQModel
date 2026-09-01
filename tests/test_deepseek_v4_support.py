@@ -86,6 +86,27 @@ def test_mtp_save_overlay_maps_runtime_projections_to_checkpoint_prefixes(
     assert deepseek_v4_mtp_source_projection_prefix(runtime) == checkpoint
 
 
+@pytest.mark.parametrize(
+    ("runtime", "checkpoint"),
+    (
+        (
+            "model.layers.4.mlp.experts.7.gate_proj",
+            "layers.4.ffn.experts.7.w1",
+        ),
+        ("mtp.1.mlp.experts.8.up_proj", "mtp.1.ffn.experts.8.w3"),
+    ),
+)
+def test_deepseek_v4_exl3_resolves_native_checkpoint_projection(
+    runtime,
+    checkpoint,
+):
+    owner = object.__new__(DeepSeekV4QModel)
+    assert owner.exllamav3_checkpoint_module_candidates(runtime) == (
+        runtime,
+        checkpoint,
+    )
+
+
 def test_deepseek_v4_model_type_selects_definition(monkeypatch):
     fake_config = SimpleNamespace(model_type="deepseek_v4")
 

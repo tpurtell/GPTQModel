@@ -175,6 +175,39 @@ def test_exl3_checkpoint_passthrough_requires_source_weight_identity(tmp_path):
     assert writer._exllamav3_checkpoint_passthrough_plan(owner, storage) is None
 
 
+def test_exl3_checkpoint_passthrough_resolves_converted_source_module(tmp_path):
+    owner = SimpleNamespace(
+        turtle_model=SimpleNamespace(
+            model_local_path=str(tmp_path),
+            _weight_map={
+                "layers.0.ffn.experts.0.w1.weight": "source.safetensors",
+                "layers.0.ffn.experts.0.w1.scale": "source.safetensors",
+                "native.attention.weight": "source.safetensors",
+            },
+        ),
+        exllamav3_checkpoint_module_candidates=lambda module: (
+            module,
+            "layers.0.ffn.experts.0.w1",
+        ),
+    )
+    storage = {
+        "model.layers.0.mlp.experts.0.gate_proj": {
+            "stored_tensors": {
+                "model.layers.0.mlp.experts.0.gate_proj.trellis": {},
+            }
+        }
+    }
+
+    plan = writer._exllamav3_checkpoint_passthrough_plan(owner, storage)
+
+    assert plan["replaced_source_names"] == frozenset(
+        {
+            "layers.0.ffn.experts.0.w1.weight",
+            "layers.0.ffn.experts.0.w1.scale",
+        }
+    )
+
+
 def test_save_state_overlay_replaces_only_declared_prefixes(monkeypatch):
     old = SimpleNamespace(value="old")
     native = SimpleNamespace(value="native")
