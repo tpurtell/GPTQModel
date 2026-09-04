@@ -492,6 +492,7 @@ class InlineMixedTierPlanStore:
             prefix=f".{path.name}.", dir=path.parent
         )
         try:
+            os.fchmod(descriptor, 0o644)
             with os.fdopen(descriptor, "wb") as target:
                 target.write(payload)
                 target.flush()

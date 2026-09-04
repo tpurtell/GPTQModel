@@ -173,6 +173,7 @@ def test_tier_plan_store_is_idempotent_and_rejects_drift(tmp_path):
     store = InlineMixedTierPlanStore(policy)
     store.commit(plan)
     store.commit(plan)
+    assert store.path(0).stat().st_mode & 0o777 == 0o644
     changed = json.loads(json.dumps(plan))
     changed["selected"][0]["expert"] = 0
     with pytest.raises(ValueError, match="invalid"):
