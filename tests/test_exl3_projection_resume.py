@@ -54,6 +54,47 @@ class _Capture:
         self.H = None
 
 
+def test_base_inline_policy_leaves_mtp_projection_uniform_k3(tmp_path) -> None:
+    policy = InlineMixedPolicy(
+        namespace="base",
+        base_bits=3,
+        upgrade_bits=4,
+        extra_bits=Fraction(1, 4),
+        projection_ratio=(3, 5, 8),
+        tier_plan_root=tmp_path / "tier-plans",
+        logical_layer_start=3,
+        logical_layer_count=42,
+    )
+    processor = EXL3Processor.__new__(EXL3Processor)
+    processor.qcfg = SimpleNamespace(
+        meta={
+            INLINE_MIXED_META_KEY: {
+                **policy.policy_body,
+                "tier_plan_root": str(policy.tier_plan_root),
+            }
+        }
+    )
+    processor._remote_client_for_run = lambda _provenance: None
+    observed = {}
+
+    def observe_process(**kwargs):
+        observed.update(kwargs)
+        return "uniform-mtp"
+
+    processor._process_on_slot = observe_process
+    module = NamedModule(
+        nn.Linear(2, 2, bias=False),
+        "mlp.experts.0.gate_proj",
+        "mtp.0.mlp.experts.0.gate_proj",
+        0,
+    )
+
+    assert processor.process(module) == "uniform-mtp"
+    assert observed["bits_override"] is None
+    assert observed["inline_context"] is None
+    assert observed["defer_stats"] is False
+
+
 def _processor_and_module(
     root: Path,
     weight: torch.Tensor,

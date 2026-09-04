@@ -844,8 +844,8 @@ def run_layer_stage(
             # A processor may need one layer-wide decision after all individual
             # modules have finished but before the only authoritative replay.
             # Inline EXL3 mixed-bitrate selection uses this boundary to replace
-            # its highest-risk K2 projections with K3 without propagating K2
-            # activations into the next decoder layer.
+            # its highest-risk base-tier projections with the adjacent higher
+            # tier before activations propagate into the next decoder layer.
             prepare_layer_replay = getattr(processor, "prepare_layer_replay", None)
             if callable(prepare_layer_replay):
                 prepare_layer_replay(

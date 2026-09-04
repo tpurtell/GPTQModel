@@ -34,16 +34,22 @@ def _request(scale: float = 1.0) -> dict:
     )
 
 
-def _inline_request(role: str, *, candidate_request_sha256: str | None = None) -> dict:
+def _inline_request(
+    role: str,
+    *,
+    base_bits: int = 2,
+    candidate_request_sha256: str | None = None,
+) -> dict:
+    upgrade_bits = base_bits + 1
     inline = {
         "role": role,
         "policy_sha256": "a" * 64,
-        "base_bits": 2,
-        "upgrade_bits": 3,
+        "base_bits": base_bits,
+        "upgrade_bits": upgrade_bits,
     }
-    bits = 2
-    if role == "selected_k3":
-        bits = 3
+    bits = base_bits
+    if role == f"selected_k{upgrade_bits}":
+        bits = upgrade_bits
         inline.update(
             {
                 "candidate_request_sha256": candidate_request_sha256,
@@ -181,6 +187,23 @@ def test_projection_checkpoint_reserves_inline_k2_candidate_and_selected_k3(
 
     with pytest.raises(ValueError, match="uniform and inline"):
         store.reserve_module_request(_request())
+
+
+def test_projection_checkpoint_reserves_inline_k3_candidate_and_selected_k4(
+    tmp_path,
+) -> None:
+    store = EXL3ProjectionCheckpointStore(tmp_path / "checkpoints")
+    candidate = _inline_request("candidate_k3", base_bits=3)
+    selected = _inline_request(
+        "selected_k4",
+        base_bits=3,
+        candidate_request_sha256=candidate["request_sha256"],
+    )
+
+    store.reserve_module_request(candidate)
+    store.reserve_module_request(selected)
+    store.reserve_module_request(candidate)
+    store.reserve_module_request(selected)
 
 
 def test_projection_checkpoint_load_committed_rejects_stored_request_tampering(

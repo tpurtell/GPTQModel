@@ -7,6 +7,7 @@ import json
 import pytest
 
 from gptqmodel.utils.exl3_inline_mixed import (
+    INLINE_MIXED_LEGACY_K2_SCORE,
     INLINE_MIXED_META_KEY,
     INLINE_MIXED_SCHEMA,
     INLINE_MIXED_SCHEMA_VERSION,
@@ -68,6 +69,12 @@ def test_policy_parses_exact_fraction_and_rejects_float_target(tmp_path):
     with pytest.raises(ValueError, match="invalid contract"):
         inline_mixed_policy(broken)
 
+    legacy = json.loads(json.dumps(raw))
+    legacy[INLINE_MIXED_META_KEY]["score_kind"] = INLINE_MIXED_LEGACY_K2_SCORE
+    parsed_legacy = inline_mixed_policy(legacy)
+    assert parsed_legacy is not None
+    assert parsed_legacy.score_kind == INLINE_MIXED_LEGACY_K2_SCORE
+
 
 def test_21_bpw_358_quotas_are_exact_and_causally_distributed(tmp_path):
     policy = _policy(tmp_path)
@@ -84,6 +91,43 @@ def test_21_bpw_358_quotas_are_exact_and_causally_distributed(tmp_path):
         for projection, value in quota.items():
             accumulated[projection] += value
     assert accumulated == totals
+
+
+def test_glm_k325_358_quotas_use_only_target_layer_range(tmp_path):
+    policy = InlineMixedPolicy(
+        namespace="base",
+        base_bits=3,
+        upgrade_bits=4,
+        extra_bits=Fraction(1, 4),
+        projection_ratio=(3, 5, 8),
+        tier_plan_root=tmp_path,
+        logical_layer_start=3,
+        logical_layer_count=42,
+    )
+    totals = policy.namespace_quotas(layer_count=42, experts_per_layer=288)
+    assert totals == {"w1": 1701, "w3": 2835, "w2": 4536}
+    assert sum(totals.values()) == 9072
+
+    accumulated = {projection: 0 for projection in totals}
+    for layer in range(3, 45):
+        quota = policy.layer_quotas(
+            layer_index=layer,
+            layer_count=46,
+            experts_per_layer=288,
+        )
+        assert quota["w2"] == 108
+        assert quota["w1"] in {40, 41}
+        assert quota["w3"] in {67, 68}
+        for projection, value in quota.items():
+            accumulated[projection] += value
+    assert accumulated == totals
+
+    with pytest.raises(ValueError, match="layer index"):
+        policy.layer_quotas(
+            layer_index=45,
+            layer_count=46,
+            experts_per_layer=288,
+        )
 
 
 def test_layer_plan_ranks_only_within_projection_class(tmp_path):

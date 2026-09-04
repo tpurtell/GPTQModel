@@ -195,30 +195,29 @@ class EXL3ProjectionCheckpointStore:
             return str(module), "uniform"
         role = inline.get("role") if isinstance(inline, dict) else None
         policy_sha256 = inline.get("policy_sha256") if isinstance(inline, dict) else None
-        if (
-            role not in {"candidate_k2", "selected_k3"}
-            or not isinstance(policy_sha256, str)
-            or len(policy_sha256) != 64
-        ):
-            raise ValueError("invalid EXL3 inline-mixed checkpoint role")
         bits = contract.get("bits")
         base_bits = inline.get("base_bits")
         upgrade_bits = inline.get("upgrade_bits")
+        candidate_role = f"candidate_k{base_bits}"
+        selected_role = f"selected_k{upgrade_bits}"
         if (
             not isinstance(base_bits, int)
             or isinstance(base_bits, bool)
             or not isinstance(upgrade_bits, int)
             or isinstance(upgrade_bits, bool)
             or upgrade_bits != base_bits + 1
-            or bits != (base_bits if role == "candidate_k2" else upgrade_bits)
+            or role not in {candidate_role, selected_role}
+            or not isinstance(policy_sha256, str)
+            or len(policy_sha256) != 64
+            or bits != (base_bits if role == candidate_role else upgrade_bits)
         ):
             raise ValueError("EXL3 inline-mixed checkpoint tier is inconsistent")
-        if role == "selected_k3" and any(
+        if role == selected_role and any(
             not isinstance(inline.get(field), str) or len(inline[field]) != 64
             for field in ("candidate_request_sha256", "tier_plan_sha256")
         ):
             raise ValueError(
-                "EXL3 selected K3 checkpoint lacks its K2/tier-plan binding"
+                "EXL3 selected-tier checkpoint lacks its candidate/tier-plan binding"
             )
         return str(module), role
 
@@ -285,11 +284,21 @@ class EXL3ProjectionCheckpointStore:
 
             key = self._module_request_key(request)
             inline = request.get("quantizer_contract", {}).get("inline_mixed")
-            if key[1] == "selected_k3":
+            base_bits = inline.get("base_bits") if isinstance(inline, dict) else None
+            candidate_role = f"candidate_k{base_bits}"
+            selected_role = (
+                f"selected_k{inline.get('upgrade_bits')}"
+                if isinstance(inline, dict)
+                else None
+            )
+            if key[1] == selected_role:
                 candidate_digest = inline["candidate_request_sha256"]
-                if self._module_requests.get((module, "candidate_k2")) != candidate_digest:
+                if (
+                    self._module_requests.get((module, candidate_role))
+                    != candidate_digest
+                ):
                     raise ValueError(
-                        "EXL3 selected K3 is not bound to the reserved K2 "
+                        "EXL3 selected tier is not bound to the reserved "
                         f"candidate for `{module}`"
                     )
             conflicting = [

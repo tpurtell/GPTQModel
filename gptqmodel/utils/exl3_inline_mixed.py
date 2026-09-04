@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
 
-"""Deterministic, crash-consistent inline EXL3 K2/K3 tier selection."""
+"""Deterministic, crash-consistent inline adjacent-tier EXL3 selection."""
 
 from __future__ import annotations
 
@@ -20,6 +20,9 @@ INLINE_MIXED_META_KEY = "ds4rt_inline_mixed"
 INLINE_MIXED_SCHEMA = "gptqmodel.exl3-inline-mixed"
 INLINE_MIXED_SCHEMA_VERSION = 1
 INLINE_MIXED_SCORE = (
+    "base-tier-hessian-weighted-relative-error-times-natural-gate-squared-mass-v1"
+)
+INLINE_MIXED_LEGACY_K2_SCORE = (
     "k2-hessian-weighted-relative-error-times-natural-gate-squared-mass-v1"
 )
 INLINE_MIXED_CHECKPOINT_ROLE = "inline_mixed"
@@ -57,6 +60,8 @@ class InlineMixedPolicy:
     extra_bits: Fraction
     projection_ratio: tuple[int, int, int]
     tier_plan_root: Path
+    logical_layer_start: int = 0
+    logical_layer_count: int | None = None
     score_kind: str = INLINE_MIXED_SCORE
 
     @property
@@ -65,7 +70,7 @@ class InlineMixedPolicy:
 
     @property
     def policy_body(self) -> dict[str, Any]:
-        return {
+        body = {
             "schema": INLINE_MIXED_SCHEMA,
             "schema_version": INLINE_MIXED_SCHEMA_VERSION,
             "namespace": self.namespace,
@@ -84,6 +89,10 @@ class InlineMixedPolicy:
             },
             "score_kind": self.score_kind,
         }
+        if self.logical_layer_count is not None:
+            body["logical_layer_start"] = self.logical_layer_start
+            body["logical_layer_count"] = self.logical_layer_count
+        return body
 
     @property
     def policy_sha256(self) -> str:
@@ -105,7 +114,9 @@ class InlineMixedPolicy:
             2 * ideal_upgrades.numerator + ideal_upgrades.denominator
         ) // (2 * ideal_upgrades.denominator)
         if not 0 <= total_upgrades <= candidate_count:
-            raise ValueError("EXL3 inline-mixed target is outside the K2/K3 range")
+            raise ValueError(
+                "EXL3 inline-mixed target is outside the adjacent-tier range"
+            )
 
         ratio_sum = sum(self.projection_ratio)
         ideals = {
@@ -141,16 +152,22 @@ class InlineMixedPolicy:
     ) -> dict[str, int]:
         """Spread exact namespace quotas causally across decoder layers."""
 
-        if not 0 <= layer_index < layer_count:
+        quota_layer_count = self.logical_layer_count or layer_count
+        quota_layer_index = layer_index - self.logical_layer_start
+        if (
+            (self.logical_layer_count is None and self.logical_layer_start != 0)
+            or self.logical_layer_start + quota_layer_count > layer_count
+            or not 0 <= quota_layer_index < quota_layer_count
+        ):
             raise ValueError("EXL3 inline-mixed layer index is invalid")
         totals = self.namespace_quotas(
-            layer_count=layer_count,
+            layer_count=quota_layer_count,
             experts_per_layer=experts_per_layer,
         )
         return {
             projection: (
-                ((layer_index + 1) * total) // layer_count
-                - (layer_index * total) // layer_count
+                ((quota_layer_index + 1) * total) // quota_layer_count
+                - (quota_layer_index * total) // quota_layer_count
             )
             for projection, total in totals.items()
         }
@@ -168,6 +185,11 @@ def inline_mixed_policy(meta: Any) -> InlineMixedPolicy | None:
     ratio = raw.get("projection_ratio")
     root = raw.get("tier_plan_root")
     namespace = raw.get("namespace")
+    # Before adjacent tiers were generalized, an omitted score kind meant the
+    # K2-labelled scoring contract. Preserve that exact policy hash on resume.
+    score_kind = raw.get("score_kind", INLINE_MIXED_LEGACY_K2_SCORE)
+    logical_layer_start = raw.get("logical_layer_start", 0)
+    logical_layer_count = raw.get("logical_layer_count")
     if (
         raw.get("schema") != INLINE_MIXED_SCHEMA
         or raw.get("schema_version") != INLINE_MIXED_SCHEMA_VERSION
@@ -177,7 +199,19 @@ def inline_mixed_policy(meta: Any) -> InlineMixedPolicy | None:
         or set(ratio) != set(PROJECTION_ORDER)
         or not isinstance(root, str)
         or not root
-        or raw.get("score_kind", INLINE_MIXED_SCORE) != INLINE_MIXED_SCORE
+        or score_kind not in {INLINE_MIXED_SCORE, INLINE_MIXED_LEGACY_K2_SCORE}
+        or isinstance(logical_layer_start, bool)
+        or not isinstance(logical_layer_start, int)
+        or logical_layer_start < 0
+        or (logical_layer_start != 0 and logical_layer_count is None)
+        or (
+            logical_layer_count is not None
+            and (
+                isinstance(logical_layer_count, bool)
+                or not isinstance(logical_layer_count, int)
+                or logical_layer_count <= 0
+            )
+        )
     ):
         raise ValueError("EXL3 inline-mixed metadata has an invalid contract")
     numerator = _positive_integer(extra.get("numerator"), "extra numerator")
@@ -197,6 +231,9 @@ def inline_mixed_policy(meta: Any) -> InlineMixedPolicy | None:
             for projection in PROJECTION_ORDER
         ),
         tier_plan_root=Path(root).expanduser().resolve(),
+        logical_layer_start=logical_layer_start,
+        logical_layer_count=logical_layer_count,
+        score_kind=score_kind,
     )
     if policy.upgrade_bits != policy.base_bits + 1:
         raise ValueError("EXL3 inline-mixed requires adjacent integer tiers")
@@ -204,7 +241,7 @@ def inline_mixed_policy(meta: Any) -> InlineMixedPolicy | None:
 
 
 def projection_score(record: dict[str, Any]) -> float:
-    """Compute the accepted K2-only risk proxy from one projection ledger."""
+    """Compute the accepted base-tier risk proxy from one projection ledger."""
 
     metrics = record.get("quantizer_metrics")
     routes = record.get("route_evidence")
@@ -239,7 +276,7 @@ def build_layer_tier_plan(
     layer_count: int,
     candidate_records: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Select the highest-risk K2 projections under fixed projection quotas."""
+    """Select the highest-risk base-tier projections under fixed quotas."""
 
     records = list(candidate_records)
     identities: dict[tuple[int, str], tuple[dict[str, Any], float]] = {}
@@ -308,7 +345,7 @@ def build_layer_tier_plan(
 
 
 class InlineMixedTierPlanStore:
-    """Atomically publish immutable per-layer tier maps before K3 execution."""
+    """Atomically publish immutable per-layer maps before upgraded-tier work."""
 
     def __init__(self, policy: InlineMixedPolicy) -> None:
         self.policy = policy
@@ -329,8 +366,8 @@ class InlineMixedTierPlanStore:
         """Authenticate one committed tier plan without trusting its filename.
 
         Projection checkpoints are independently content addressed, but the
-        layer plan is the authority that chooses which K2 candidates acquire
-        a K3 replacement.  Recovery therefore validates the complete policy,
+        layer plan is the authority that chooses which base-tier candidates
+        acquire an upgraded replacement. Recovery validates the complete policy,
         geometry, quota, selection, and digest contract before it uses any
         selected checkpoint.  A missing plan is an incomplete layer; an
         existing malformed plan is corruption and must never become a fresh
@@ -477,6 +514,7 @@ class InlineMixedTierPlanStore:
 __all__ = [
     "INLINE_MIXED_CHECKPOINT_ROLE",
     "INLINE_MIXED_META_KEY",
+    "INLINE_MIXED_LEGACY_K2_SCORE",
     "INLINE_MIXED_SCHEMA",
     "INLINE_MIXED_SCHEMA_VERSION",
     "INLINE_MIXED_SCORE",
