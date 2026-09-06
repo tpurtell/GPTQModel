@@ -1231,6 +1231,43 @@ class LazyTurtle:
                                     continue
                                 leaf_name = raw_name.rsplit(".", 1)[-1]
                                 tensors[leaf_name] = handler.get_tensor(raw_name)
+                elif source_name is not None:
+                    # Defused experts have no direct checkpoint prefix. Reuse
+                    # the ordinary materializer's fused slicing/transpose rules
+                    # when reloading a dense source for an inline tier upgrade.
+                    shard_path = self._checkpoint_shard_path(
+                        self._weight_map[source_name], module_path=path
+                    )
+                    with safe_open(shard_path, framework="pt", device="cpu") as handler:
+                        raw_weight = handler.get_tensor(source_name)
+                        if not raw_weight.is_floating_point() or raw_weight.element_size() < 2:
+                            raise RuntimeError(
+                                f"Fused quantization source requires dense weights: {source_name}"
+                            )
+                        weight = self._transform_checkpoint_tensor(
+                            raw_weight,
+                            expert_index=expert_index,
+                            split_index=split_index,
+                            split_dim=split_dim,
+                            expected_shape=tuple(target_submodule.weight.shape),
+                            prefer_transposed=self._resolve_prefer_transposed_hint(
+                                target_model=target_model,
+                                module_path=path,
+                                rel_name="weight",
+                                modules_by_name={
+                                    prefix: target_model.get_submodule(prefix)
+                                    for prefix in (
+                                        ".".join(path.split(".")[:count])
+                                        for count in range(1, len(path.split(".")) + 1)
+                                    )
+                                },
+                            ),
+                        )
+                        if weight is None:
+                            raise RuntimeError(
+                                f"Fused quantization source shape mismatch: {source_name} -> {path}"
+                            )
+                        tensors["weight"] = weight.clone()
 
             # Normalize the direct ``.scale`` spelling used by native
             # DeepSeek-V4 checkpoints to the names consumed by GPTQModel's

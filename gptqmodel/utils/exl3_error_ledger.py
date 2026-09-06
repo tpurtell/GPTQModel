@@ -62,7 +62,7 @@ _BASE_EXPERT = re.compile(
     r"(?P<expert>\d+)\.(?P<projection>gate_proj|up_proj|down_proj)$"
 )
 _MTP_EXPERT = re.compile(
-    r"^mtp\.(?P<layer>\d+)\.mlp\.experts\."
+    r"^mtp\.(?:layers\.)?(?P<layer>\d+)\.mlp\.experts\."
     r"(?P<expert>\d+)\.(?P<projection>gate_proj|up_proj|down_proj)$"
 )
 _GLM5_NEXT_EXPERT = re.compile(
@@ -194,14 +194,23 @@ def compact_projection_record(record: dict[str, Any]) -> dict[str, Any]:
     return _finite_json_value(clean)
 
 
-def routed_expert_identity(module_full_name: str) -> dict[str, Any] | None:
+def routed_expert_identity(
+    module_full_name: str, *, family_join: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
     """Map a GPTQModel routed projection name to its stable DS4 identity."""
 
     glm5_next = _GLM5_NEXT_EXPERT.fullmatch(module_full_name)
     if glm5_next is not None:
         layer = int(glm5_next.group("layer"))
+        # Qwen has the same nested target prefix as GLM5-Next, but its target
+        # continues beyond layer 45 and its draft lives at mtp.layers.0. Bind
+        # that distinction to immutable run provenance, preserving old GLM
+        # checkpoint identities when no model type was recorded.
+        qwen = isinstance(family_join, dict) and family_join.get("model_type") in {
+            "qwen4_exp", "qwen4_exp_text"
+        }
         return {
-            "block_namespace": "mtp" if layer == 45 else "base",
+            "block_namespace": "mtp" if layer == 45 and not qwen else "base",
             "logical_layer": layer,
             "expert": int(glm5_next.group("expert")),
             "projection": _PROJECTION_NAMES[glm5_next.group("projection")],
@@ -218,6 +227,21 @@ def routed_expert_identity(module_full_name: str) -> dict[str, Any] | None:
             "projection": _PROJECTION_NAMES[match.group("projection")],
         }
     return None
+
+
+def routed_expert_processor_layer(identity: dict[str, Any], *, family_join=None) -> int:
+    """Translate a logical draft index to its integrated traversal index."""
+    logical = identity["logical_layer"]
+    if (
+        identity["block_namespace"] == "mtp"
+        and isinstance(family_join, dict)
+        and family_join.get("model_type") in {"qwen4_exp", "qwen4_exp_text"}
+    ):
+        target_layers = family_join.get("target_layer_count")
+        if isinstance(target_layers, bool) or not isinstance(target_layers, int) or target_layers <= 0:
+            raise ValueError("Qwen integrated MTP requires its bound target layer count")
+        return target_layers + logical
+    return logical
 
 
 def route_evidence_required(provenance: dict[str, Any] | None) -> bool:
@@ -652,7 +676,10 @@ def build_projection_record(
             else deepcopy(provenance) if provenance is not None else None
         ),
     }
-    identity = routed_expert_identity(module_full_name)
+    identity = routed_expert_identity(
+        module_full_name,
+        family_join=provenance.get("family_join") if isinstance(provenance, dict) else None,
+    )
     if identity is not None:
         record.update(identity)
         recovery = None

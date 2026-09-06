@@ -2253,6 +2253,15 @@ class BaseQModel(nn.Module):
     ) -> nn.Module:
         """Build a dense CPU source module from checkpoint tensors for quantization."""
 
+        missing = [
+            name for name, parameter in target_submodule.named_parameters()
+            if parameter.is_meta
+            and not isinstance((checkpoint_tensors or {}).get(name), torch.Tensor)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Cannot reload quantization source: missing checkpoint tensors {missing}"
+            )
         quant_source = copy.deepcopy(target_submodule)
         if _module_has_meta_tensors(quant_source):
             quant_source = quant_source.to_empty(device=CPU)

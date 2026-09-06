@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 
 INLINE_MIXED_META_KEY = "ds4rt_inline_mixed"
+INLINE_MIXED_NAMESPACES_META_KEY = "ds4rt_inline_mixed_by_namespace"
 INLINE_MIXED_SCHEMA = "gptqmodel.exl3-inline-mixed"
 INLINE_MIXED_SCHEMA_VERSION = 1
 INLINE_MIXED_SCORE = (
@@ -173,9 +174,32 @@ class InlineMixedPolicy:
         }
 
 
-def inline_mixed_policy(meta: Any) -> InlineMixedPolicy | None:
+def inline_mixed_policy(meta: Any, *, namespace: str | None = None) -> InlineMixedPolicy | None:
     """Parse the private exact-rational policy without accepting float BPW."""
 
+    requested_namespace = namespace
+    if isinstance(meta, dict) and INLINE_MIXED_NAMESPACES_META_KEY in meta:
+        raw_policies = meta[INLINE_MIXED_NAMESPACES_META_KEY]
+        if (
+            INLINE_MIXED_META_KEY in meta
+            or not isinstance(raw_policies, dict)
+            or not raw_policies
+            or not set(raw_policies).issubset({"base", "mtp"})
+        ):
+            raise ValueError("EXL3 inline-mixed namespace policies are invalid")
+        policies = {
+            name: inline_mixed_policy({INLINE_MIXED_META_KEY: value})
+            for name, value in raw_policies.items()
+        }
+        if any(policy.namespace != name for name, policy in policies.items()):
+            raise ValueError("EXL3 inline-mixed namespace policy identity differs")
+        if len({(p.base_bits, p.upgrade_bits) for p in policies.values()}) != 1:
+            raise ValueError("EXL3 integrated namespaces require the same candidate tiers")
+        # The unscoped query establishes shared candidate-journal and Hessian
+        # retention policy. Projection work always selects its own namespace.
+        if namespace is None:
+            return policies.get("base", next(iter(policies.values())))
+        return policies.get(namespace)
     if not isinstance(meta, dict) or INLINE_MIXED_META_KEY not in meta:
         return None
     raw = meta[INLINE_MIXED_META_KEY]
@@ -237,6 +261,8 @@ def inline_mixed_policy(meta: Any) -> InlineMixedPolicy | None:
     )
     if policy.upgrade_bits != policy.base_bits + 1:
         raise ValueError("EXL3 inline-mixed requires adjacent integer tiers")
+    if requested_namespace is not None and policy.namespace != requested_namespace:
+        return None
     return policy
 
 

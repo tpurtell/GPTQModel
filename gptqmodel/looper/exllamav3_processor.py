@@ -115,6 +115,7 @@ from ..utils.exl3_remote import (
 )
 from ..utils.exl3_router_candidates import (
     ROUTER_CANDIDATE_CAPTURE_PAYLOAD_CONTRACT,
+    has_learned_router_recovery,
     learned_router_ranked_choices,
 )
 from ..utils.exllamav3 import create_exllamav3_module
@@ -237,9 +238,7 @@ def _router_recovery_candidates(
             indices.new_empty((rows, 0), dtype=torch.int64),
             logits.new_empty((rows, 0), dtype=torch.float32),
         )
-    if not isinstance(
-        getattr(router, "e_score_correction_bias", None), torch.Tensor
-    ):
+    if not has_learned_router_recovery(router):
         raise RuntimeError(
             "EXL3 recovery candidate capture requires a learned top-k or hash router"
         )
@@ -284,7 +283,7 @@ class _EXL3NaturalRouteCapture:
         for task_name, named_module in subset.items():
             full_name = getattr(named_module, "full_name", None)
             identity = (
-                routed_expert_identity(full_name)
+                processor._routed_expert_identity(full_name)
                 if isinstance(full_name, str)
                 else None
             )
@@ -789,10 +788,22 @@ class EXL3Processor(LoopProcessor):
             )
         return provenance
 
-    def _inline_mixed_policy(self):
+    def _inline_mixed_policy(self, module_full_name=None, *, namespace=None):
         """Return the exact-rational layer-local mixed policy, if configured."""
 
-        return inline_mixed_policy(getattr(self.qcfg, "meta", None))
+        if module_full_name is not None:
+            identity = self._routed_expert_identity(module_full_name)
+            if identity is None:
+                return None
+            namespace = identity["block_namespace"]
+        return inline_mixed_policy(getattr(self.qcfg, "meta", None), namespace=namespace)
+
+    def _routed_expert_identity(self, module_full_name):
+        provenance = self._ledger_provenance()
+        return routed_expert_identity(
+            module_full_name,
+            family_join=provenance.get("family_join") if isinstance(provenance, dict) else None,
+        )
 
     def _remote_client_for_run(self, provenance: dict[str, Any] | None):
         """Construct the immutable remote-worker client at most once per run."""
@@ -851,15 +862,15 @@ class EXL3Processor(LoopProcessor):
             raise ValueError("EXL3 capture-frontier root changed during the run")
         return store
 
-    @staticmethod
     def _subset_capture_phase(
+        self,
         subset: Dict[str, NamedModule],
     ) -> tuple[str, dict[str, dict[str, Any]]]:
         identities = {
             task_name: identity
             for task_name, named_module in subset.items()
             if isinstance(getattr(named_module, "full_name", None), str)
-            and (identity := routed_expert_identity(named_module.full_name))
+            and (identity := self._routed_expert_identity(named_module.full_name))
             is not None
         }
         projections = {identity["projection"] for identity in identities.values()}
@@ -1210,7 +1221,7 @@ class EXL3Processor(LoopProcessor):
                     record.zero_route_recovery
                 )
 
-            identity = routed_expert_identity(full_name)
+            identity = self._routed_expert_identity(full_name)
             if identity is not None and record.route_evidence is not None:
                 family_id = (
                     identity["block_namespace"],
@@ -1283,9 +1294,9 @@ class EXL3Processor(LoopProcessor):
                 full_name
             ].snapshot_hessian(target_device=torch.device("cpu")),
         )
-        policy = self._inline_mixed_policy()
+        policy = self._inline_mixed_policy(next(iter(subset.values())).full_name)
         retain_for_inline = policy is not None and any(
-            (identity := routed_expert_identity(named_module.full_name)) is not None
+            (identity := self._routed_expert_identity(named_module.full_name)) is not None
             and identity["block_namespace"] == policy.namespace
             for named_module in subset.values()
         )
@@ -1687,7 +1698,7 @@ class EXL3Processor(LoopProcessor):
             for task_name, named_module in subset.items()
             if task_name in self.tasks
             and isinstance(getattr(named_module, "full_name", None), str)
-            and (identity := routed_expert_identity(named_module.full_name)) is not None
+            and (identity := self._routed_expert_identity(named_module.full_name)) is not None
         }
         if not targets:
             return nullcontext()
@@ -1803,20 +1814,13 @@ class EXL3Processor(LoopProcessor):
         if mlp is None:
             mlp = getattr(layer_module, "ffn", None)
         router = getattr(mlp, "gate", None)
-        learned_topk_router = (
-            isinstance(router, Module)
-            and isinstance(
-                getattr(router, "e_score_correction_bias", None),
-                torch.Tensor,
-            )
-            and not hasattr(router, "tid2eid")
-        )
+        learned_topk_router = has_learned_router_recovery(router)
         recovery_tasks: list[str] = []
         counts_by_expert: dict[int, int] = {}
         family_ids: set[tuple[str, int]] = set()
         for task_name in sorted(subset):
             named_module = subset[task_name]
-            identity = routed_expert_identity(
+            identity = self._routed_expert_identity(
                 getattr(named_module, "full_name", "")
             )
             task = self.tasks.get(task_name)
@@ -1950,7 +1954,7 @@ class EXL3Processor(LoopProcessor):
         for task_name in task_names:
             named_module = subset.get(task_name)
             task = self.tasks.get(task_name)
-            identity = routed_expert_identity(
+            identity = self._routed_expert_identity(
                 getattr(named_module, "full_name", "")
             )
             if identity is None or not isinstance(task, dict):
@@ -2080,17 +2084,10 @@ class EXL3Processor(LoopProcessor):
         if mlp is None:
             mlp = getattr(layer_module, "ffn", None)
         router = getattr(mlp, "gate", None)
-        learned_topk_router = (
-            isinstance(router, Module)
-            and isinstance(
-                getattr(router, "e_score_correction_bias", None),
-                torch.Tensor,
-            )
-            and not hasattr(router, "tid2eid")
-        )
+        learned_topk_router = has_learned_router_recovery(router)
         for task_name in sorted(subset):
             named_module = subset[task_name]
-            identity = routed_expert_identity(
+            identity = self._routed_expert_identity(
                 getattr(named_module, "full_name", "")
             )
             task = self.tasks.get(task_name)
@@ -2177,7 +2174,7 @@ class EXL3Processor(LoopProcessor):
         task.expected_nsamples = getattr(self, "total_calibration_tokens", None)
         task.quantizer.configure(perchannel=True)
 
-        identity = routed_expert_identity(module.full_name)
+        identity = self._routed_expert_identity(module.full_name)
         capture_contract = None
         if identity is not None:
             configured_devices = list(
@@ -2251,7 +2248,7 @@ class EXL3Processor(LoopProcessor):
         }
         remote_client = self._remote_client_for_run(self._ledger_provenance())
         if remote_client is not None:
-            if routed_expert_identity(module.full_name) is None:
+            if self._routed_expert_identity(module.full_name) is None:
                 raise ValueError(
                     "EXL3 distributed dispatch only accepts routed-expert projections"
                 )
@@ -2641,14 +2638,19 @@ class EXL3Processor(LoopProcessor):
         """Choose and execute upgrades before the only propagation replay."""
 
         del layer_module
-        policy = self._inline_mixed_policy()
+        routed_names = [
+            module.full_name for module in processed_modules.values()
+            if isinstance(module, NamedModule)
+            and self._routed_expert_identity(module.full_name) is not None
+        ]
+        policy = self._inline_mixed_policy(routed_names[0]) if routed_names else None
         if policy is None or is_lm_head_module:
             return
         candidates: list[tuple[NamedModule, dict[str, Any], dict[str, Any]]] = []
         for module in processed_modules.values():
             if not isinstance(module, NamedModule):
                 continue
-            identity = routed_expert_identity(module.full_name)
+            identity = self._routed_expert_identity(module.full_name)
             if identity is None or identity["block_namespace"] != policy.namespace:
                 continue
             task_entry = self.tasks.get(module.name)
@@ -2666,7 +2668,7 @@ class EXL3Processor(LoopProcessor):
             return
 
         logical_layers = {
-            routed_expert_identity(module.full_name)["logical_layer"]
+            self._routed_expert_identity(module.full_name)["logical_layer"]
             for module, _task, _record in candidates
         }
         if len(logical_layers) != 1:
@@ -2743,8 +2745,8 @@ class EXL3Processor(LoopProcessor):
         del subset, previous_subset, subset_index, subset_total
 
         ledger_provenance = self._ledger_provenance()
-        policy = self._inline_mixed_policy()
-        identity = routed_expert_identity(module.full_name)
+        policy = self._inline_mixed_policy(module.full_name)
+        identity = self._routed_expert_identity(module.full_name)
         inline_context = None
         bits_override = None
         assignment_phase = None
@@ -2775,7 +2777,7 @@ class EXL3Processor(LoopProcessor):
         execution_lease = None
         execution_slot = None
         if remote_client is not None:
-            if routed_expert_identity(module.full_name) is None:
+            if self._routed_expert_identity(module.full_name) is None:
                 raise ValueError(
                     "EXL3 distributed dispatch only accepts routed-expert projections"
                 )
@@ -2829,7 +2831,7 @@ class EXL3Processor(LoopProcessor):
         target_device = torch.device(target_device)
         if target_device.type != "cuda":
             raise ValueError("EXL3 quantization requires CUDA/HIP execution.")
-        policy = self._inline_mixed_policy()
+        policy = self._inline_mixed_policy(module.full_name)
         candidate_pass = (
             isinstance(inline_context, dict)
             and policy is not None
@@ -2861,7 +2863,7 @@ class EXL3Processor(LoopProcessor):
         execution_contract = None
         projection_provenance = ledger_provenance
         if remote_client is not None:
-            if routed_expert_identity(module.full_name) is None:
+            if self._routed_expert_identity(module.full_name) is None:
                 raise ValueError(
                     "EXL3 remote dispatch only accepts routed-expert projections"
                 )
@@ -3399,7 +3401,7 @@ class EXL3Processor(LoopProcessor):
         if not isinstance(family_join, dict):
             raise ValueError("EXL3 checkpoint restore has no family join")
         store = EXL3ProjectionCheckpointStore(checkpoint_root)
-        policy = self._inline_mixed_policy()
+        policy = self._inline_mixed_policy(namespace=block_namespace)
         if policy is not None and policy.namespace != block_namespace:
             policy = None
 
@@ -3430,7 +3432,7 @@ class EXL3Processor(LoopProcessor):
             module = request.get("module")
             if not isinstance(module, str):
                 raise ValueError("EXL3 checkpoint restore found no module identity")
-            identity = routed_expert_identity(module)
+            identity = self._routed_expert_identity(module)
             if identity is None:
                 if module.startswith(f"{block_prefix}."):
                     raise ValueError(

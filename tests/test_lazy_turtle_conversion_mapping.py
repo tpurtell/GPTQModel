@@ -1577,6 +1577,56 @@ def test_lazy_turtle_resolves_fused_qwen3_5_moe_text_experts_through_language_mo
     ) == ("model.language_model.layers.0.mlp.experts.down_proj", 1, None, None)
 
 
+@pytest.mark.parametrize("namespace", ["model.language_model.layers", "mtp.layers"])
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+def test_qwen_fused_expert_quant_source_reload(tmp_path, namespace, projection):
+    shell = nn.Module()
+    shell.config = SimpleNamespace(model_type="qwen4_exp")
+    parent = shell
+    for component in namespace.split("."):
+        child = nn.Module()
+        parent.add_module(component, child)
+        parent = child
+    layer = _DefusedLayerShell()
+    layer.mlp.experts.append(_DefusedExpertLeaf())
+    parent.add_module("0", layer)
+    gate_up = torch.arange(48, dtype=torch.bfloat16).reshape(2, 6, 4)
+    down = torch.arange(24, dtype=torch.bfloat16).reshape(2, 4, 3)
+    turtle = _build_lazy_turtle(
+        tmp_path,
+        {
+            f"{namespace}.0.mlp.experts.gate_up_proj": gate_up,
+            f"{namespace}.0.mlp.experts.down_proj": down,
+        },
+        target_model=shell,
+    )
+    leaf = getattr(layer.mlp.experts[1], projection)
+    tensors = turtle.checkpoint_tensors_for_submodule(
+        target_model=shell, target_submodule=leaf
+    )
+    expected = {
+        "gate_proj": gate_up[1, :3],
+        "up_proj": gate_up[1, 3:],
+        "down_proj": down[1],
+    }[projection]
+    assert torch.equal(tensors["weight"], expected)
+    assert leaf.weight.is_meta
+    adapter = object.__new__(BaseQModel)
+    restored = adapter._build_decoder_quant_source_module(
+        leaf, checkpoint_tensors=tensors, target_dtype=torch.bfloat16
+    )
+    assert torch.equal(restored.weight, expected)
+
+
+def test_quant_source_rejects_missing_meta_checkpoint_weight():
+    adapter = object.__new__(BaseQModel)
+    leaf = nn.Linear(4, 3, bias=False, device="meta")
+    with pytest.raises(RuntimeError, match="missing checkpoint tensors.*weight"):
+        adapter._build_decoder_quant_source_module(
+            leaf, checkpoint_tensors={}, target_dtype=torch.bfloat16
+        )
+
+
 @pytest.mark.parametrize(
     ("extension", "payload"),
     [

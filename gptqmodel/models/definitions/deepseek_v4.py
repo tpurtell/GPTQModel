@@ -25,7 +25,7 @@ from ...utils.exl3_error_ledger import (
     ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
     zero_route_recovery_recipe,
 )
-from ...utils.exl3_router_candidates import learned_router_ranked_choices
+from ...utils.exl3_router_candidates import has_learned_router_recovery, learned_router_ranked_choices
 
 
 MTP_BLOCK_COUNT = 3
@@ -2501,13 +2501,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
                     "or MTP block"
                 )
         router = getattr(getattr(layer_module, "mlp", None), "gate", None)
-        if (
-            not isinstance(router, nn.Module)
-            or not isinstance(
-                getattr(router, "e_score_correction_bias", None), torch.Tensor
-            )
-            or hasattr(router, "tid2eid")
-        ):
+        if not has_learned_router_recovery(router):
             raise RuntimeError(
                 "DeepSeek V4 route recovery requires a learned top-k router"
             )
@@ -3085,7 +3079,10 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
         pause_installed = False
         router_pre_handle = None
         base_hooks_paused = False
-        if block_namespace == "mtp":
+        uses_router_hooks = block_namespace == "base" or bool(
+            getattr(self, "zero_route_recovery_uses_router_hooks", False)
+        )
+        if not uses_router_hooks:
             if hasattr(layer_module, force_attr) or hasattr(layer_module, pause_attr):
                 raise RuntimeError(
                     "DeepSeek V4 zero-route recovery context is already active"
@@ -3102,7 +3099,7 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             capture_router_candidates
         )
         try:
-            if block_namespace == "base":
+            if uses_router_hooks:
                 looper._set_processor_hooks_paused(processor, True)
                 base_hooks_paused = True
             yield

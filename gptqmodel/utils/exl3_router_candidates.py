@@ -13,6 +13,7 @@ from torch import nn
 
 RECOVERY_SCORE_FN_ATTR = "_gptqmodel_recovery_score_fn"
 RECOVERY_GROUP_POLICY_ATTR = "_gptqmodel_recovery_group_policy"
+RECOVERY_CORRECTION_POLICY_ATTR = "_gptqmodel_recovery_correction_policy"
 RECOVERY_GROUP_POLICY_CONTRACT = "gptqmodel.learned-router-group-policy-v1"
 ROUTER_CANDIDATE_CAPTURE_PAYLOAD_CONTRACT = (
     "gptqmodel.exl3-router-candidate-capture-v3"
@@ -90,6 +91,13 @@ def learned_router_ranked_choices(
     """
 
     correction = getattr(router, "e_score_correction_bias", None)
+    if (
+        correction is None
+        and getattr(router, RECOVERY_CORRECTION_POLICY_ATTR, None) == "none"
+        and isinstance(logits, torch.Tensor)
+        and logits.ndim == 2
+    ):
+        correction = logits.new_zeros(logits.shape[-1], dtype=torch.float32)
     if (
         not isinstance(logits, torch.Tensor)
         or logits.ndim != 2
@@ -200,6 +208,33 @@ def learned_router_ranked_choices(
     return ranked_scores, ranked_indices
 
 
+def has_learned_router_recovery(router: nn.Module) -> bool:
+    return isinstance(router, nn.Module) and not hasattr(router, "tid2eid") and (
+        isinstance(getattr(router, "e_score_correction_bias", None), torch.Tensor)
+        or (
+            getattr(router, RECOVERY_CORRECTION_POLICY_ATTR, None) == "none"
+            and callable(getattr(router, RECOVERY_SCORE_FN_ATTR, None))
+        )
+    )
+
+
+def _softmax_scores(logits: torch.Tensor) -> torch.Tensor:
+    return torch.softmax(logits, dim=-1, dtype=torch.float32)
+
+
+def bind_softmax_router_recovery(router: nn.Module) -> None:
+    """Declare ungrouped softmax ranking without adding checkpoint parameters."""
+    if (
+        not isinstance(router, nn.Module)
+        or getattr(router, "e_score_correction_bias", None) is not None
+        or getattr(router, RECOVERY_GROUP_POLICY_ATTR, None) is not None
+        or hasattr(router, "tid2eid")
+    ):
+        raise ValueError("softmax recovery requires an ungrouped router without correction bias")
+    setattr(router, RECOVERY_SCORE_FN_ATTR, _softmax_scores)
+    setattr(router, RECOVERY_CORRECTION_POLICY_ATTR, "none")
+
+
 def bind_sigmoid_grouped_router_recovery(router: nn.Module) -> None:
     """Bind the score and group policy implemented by GLM's learned router."""
 
@@ -227,8 +262,11 @@ def bind_sigmoid_grouped_router_recovery(router: nn.Module) -> None:
 __all__ = [
     "RECOVERY_GROUP_POLICY_ATTR",
     "RECOVERY_GROUP_POLICY_CONTRACT",
+    "RECOVERY_CORRECTION_POLICY_ATTR",
     "RECOVERY_SCORE_FN_ATTR",
     "ROUTER_CANDIDATE_CAPTURE_PAYLOAD_CONTRACT",
     "bind_sigmoid_grouped_router_recovery",
+    "bind_softmax_router_recovery",
+    "has_learned_router_recovery",
     "learned_router_ranked_choices",
 ]

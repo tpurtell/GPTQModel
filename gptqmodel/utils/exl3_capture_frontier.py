@@ -21,7 +21,7 @@ from safetensors.torch import load_file as load_safetensors_file
 from safetensors.torch import save_file as save_safetensors_file
 import xxhash
 
-from .exl3_error_ledger import routed_expert_identity
+from .exl3_error_ledger import routed_expert_identity, routed_expert_processor_layer
 
 
 CAPTURE_FRONTIER_ENV = "GPTQMODEL_EXL3_CAPTURE_FRONTIER"
@@ -288,7 +288,7 @@ class EXL3CaptureFrontierStore:
         for record in records:
             module_name = record.get("module") if isinstance(record, dict) else None
             identity = (
-                routed_expert_identity(module_name)
+                routed_expert_identity(module_name, family_join=self.family_join)
                 if isinstance(module_name, str)
                 else None
             )
@@ -503,7 +503,7 @@ class EXL3CaptureFrontierStore:
             identities: dict[str, dict[str, Any]] = {}
             for module_name in module_names:
                 state = state_by_module[module_name]
-                identity = routed_expert_identity(module_name)
+                identity = routed_expert_identity(module_name, family_join=self.family_join)
                 if identity is None:
                     raise EXL3CaptureFrontierError("capture module is not routed")
                 phase = _projection_phase(identity)
@@ -671,7 +671,7 @@ class EXL3CaptureFrontierStore:
                 )
                 module_names = key_body.get("module_names")
                 identities = (
-                    [routed_expert_identity(name) for name in module_names]
+                    [routed_expert_identity(name, family_join=self.family_join) for name in module_names]
                     if isinstance(module_names, list)
                     and module_names
                     and all(isinstance(name, str) for name in module_names)
@@ -690,7 +690,7 @@ class EXL3CaptureFrontierStore:
                     if isinstance(identity, dict)
                 }
                 logical_layers = {
-                    identity["logical_layer"]
+                    routed_expert_processor_layer(identity, family_join=self.family_join)
                     for identity in identities
                     if isinstance(identity, dict)
                 }
