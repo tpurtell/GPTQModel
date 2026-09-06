@@ -743,6 +743,17 @@ def _exllamav3_checkpoint_passthrough_plan(owner, tensor_storage):
         "exllamav3_checkpoint_module_candidates",
         None,
     )
+    fused_replacements = getattr(owner, "exllamav3_checkpoint_replaced_tensors", None)
+    replaced_fused_names = None
+    if callable(fused_replacements):
+        replaced_fused_names = fused_replacements(tensor_storage)
+        if (
+            not isinstance(replaced_fused_names, (set, frozenset))
+            or not replaced_fused_names
+            or not all(isinstance(name, str) for name in replaced_fused_names)
+            or not replaced_fused_names.issubset(weight_map)
+        ):
+            raise RuntimeError("EXL3 fused checkpoint replacement set is invalid")
     for module_name, entry in tensor_storage.items():
         if not isinstance(module_name, str) or not module_name:
             return None
@@ -756,6 +767,8 @@ def _exllamav3_checkpoint_passthrough_plan(owner, tensor_storage):
         ):
             return None
         quant_names.update(names)
+        if replaced_fused_names is not None:
+            continue
         if callable(source_candidates):
             candidates = source_candidates(module_name)
             if (
@@ -786,6 +799,13 @@ def _exllamav3_checkpoint_passthrough_plan(owner, tensor_storage):
                 )
             return None
         replaced_source_modules.add(matches[0])
+
+    if replaced_fused_names is not None:
+        return {
+            "checkpoint_source": checkpoint_source,
+            "quant_names": frozenset(quant_names),
+            "replaced_source_names": frozenset(replaced_fused_names),
+        }
 
     # Conversion-based architectures are eligible only when the publication
     # module identities themselves are also source-checkpoint identities. This

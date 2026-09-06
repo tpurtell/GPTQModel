@@ -80,7 +80,8 @@ def test_exl3_publication_guard_accepts_packed_recovery_target():
     assert writer._validate_exllamav3_publication_modules(owner) == 1
 
 
-def test_exl3_checkpoint_passthrough_preserves_native_source_identity(tmp_path):
+@pytest.mark.parametrize("fused", [False, True])
+def test_exl3_checkpoint_passthrough_preserves_native_source_identity(tmp_path, fused):
     snapshot = tmp_path / "snapshot"
     blobs = tmp_path / "blobs"
     snapshot.mkdir()
@@ -88,9 +89,10 @@ def test_exl3_checkpoint_passthrough_preserves_native_source_identity(tmp_path):
     blob_path = blobs / "payload"
     source_path = snapshot / "source.safetensors"
     native = torch.tensor([1.25, -2.5], dtype=torch.float32)
+    source_weight = "fused.gate_up_proj" if fused else "expert.weight"
     save_file(
         {
-            "expert.weight": torch.ones((2, 2), dtype=torch.bfloat16),
+            source_weight: torch.ones((2, 2), dtype=torch.bfloat16),
             "expert.weight_scale_inv": torch.ones((1, 1), dtype=torch.float32),
             "original.hc_attn_base": native,
         },
@@ -111,7 +113,7 @@ def test_exl3_checkpoint_passthrough_preserves_native_source_identity(tmp_path):
         turtle_model=SimpleNamespace(
             model_local_path=str(snapshot),
             _weight_map={
-                "expert.weight": source_path.name,
+                source_weight: source_path.name,
                 "expert.weight_scale_inv": source_path.name,
                 "original.hc_attn_base": source_path.name,
             },
@@ -126,9 +128,14 @@ def test_exl3_checkpoint_passthrough_preserves_native_source_identity(tmp_path):
         }
     }
 
+    if fused:
+        owner.exllamav3_checkpoint_replaced_tensors = lambda storage: {
+            source_weight, "expert.weight_scale_inv"
+        }
+
     plan = writer._exllamav3_checkpoint_passthrough_plan(owner, storage)
     assert plan["replaced_source_names"] == frozenset(
-        {"expert.weight", "expert.weight_scale_inv"}
+        {source_weight, "expert.weight_scale_inv"}
     )
     state = writer._build_exllamav3_checkpoint_passthrough_state_dict(owner, plan)
 
