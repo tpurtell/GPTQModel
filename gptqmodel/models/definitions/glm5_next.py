@@ -38,6 +38,18 @@ GLM5_NEXT_ROUTED_EXPERT_PATTERN = (
 )
 
 
+def _expert_layer_count(config) -> int:
+    """Count target sparse blocks plus the checkpoint-only MTP block."""
+    layer_types = getattr(config, "mlp_layer_types", None)
+    if layer_types is not None:
+        if len(layer_types) != int(config.num_hidden_layers) or any(
+            kind not in {"dense", "sparse"} for kind in layer_types
+        ):
+            raise ValueError("GLM-5.3 MLP layer schedule is invalid")
+        return sum(kind == "sparse" for kind in layer_types) + 1
+    return int(config.num_hidden_layers) - int(config.first_k_dense_replace) + 1
+
+
 class _Glm5NextSharedHead(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -356,9 +368,7 @@ class Glm5NextQModel(BaseQModel):
             model,
             cleanup_original=cleanup_original,
         )
-        expected = int(model.config.text_config.num_hidden_layers) - int(
-            model.config.text_config.first_k_dense_replace
-        ) + 1
+        expected = _expert_layer_count(model.config.text_config)
         if converted != expected:
             raise RuntimeError(
                 "GLM-5.3 expert defusion coverage mismatch: "
@@ -402,7 +412,7 @@ class Glm5NextQModel(BaseQModel):
     def after_model_load(self, model, load_quantized_model=False):
         del load_quantized_model
         config = model.config.text_config
-        expected = int(config.num_hidden_layers) - int(config.first_k_dense_replace) + 1
+        expected = _expert_layer_count(config)
         patched = 0
         for name, module in model.named_modules():
             if not name.endswith(".mlp.gate"):

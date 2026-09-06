@@ -98,6 +98,7 @@ from ._const import (
     META,
 )
 from .loader import ModelLoader, _setup_rotation_online_had
+from .shared_input import SharedInputPlan, build_shared_input_plan
 from .writer import ModelWriter
 
 
@@ -109,6 +110,42 @@ if TYPE_CHECKING:
         HFDatasetType = HFIterableDatasetType = object
 
     from ..looper.named_module import NamedModule
+
+
+class _QuantizedCheckpointSource:
+    """Expose an on-disk quantized checkpoint through the shard-map interface.
+
+    Embedding-only saves use this lightweight source when a model was loaded
+    through the regular quantized loader and therefore has no LazyTurtle.
+    """
+
+    def __init__(self, model_local_path: str):
+        self.model_local_path = model_local_path
+        index_path = os.path.join(model_local_path, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as handle:
+                index = json.load(handle)
+            weight_map = index.get("weight_map", {})
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ValueError(f"Checkpoint index at `{index_path}` has an empty or invalid `weight_map`.")
+            self._weight_map = {
+                str(tensor_name): str(shard_name)
+                for tensor_name, shard_name in weight_map.items()
+            }
+            return
+
+        single_shard = os.path.join(model_local_path, "model.safetensors")
+        if not os.path.exists(single_shard):
+            raise FileNotFoundError(
+                f"No `model.safetensors.index.json` or `model.safetensors` found under `{model_local_path}`."
+            )
+
+        from safetensors import safe_open
+
+        with safe_open(single_shard, framework="pt", device="cpu") as handler:
+            self._weight_map = {
+                tensor_name: "model.safetensors" for tensor_name in handler.keys()
+            }
 
 
 class _ClassPropertyDescriptor:
@@ -191,6 +228,12 @@ class BaseQModel(nn.Module):
     module_tree: List[str] = None
     # Override module_tree according to different QUANT_METHOD
     module_tree_overrides: dict[METHOD, List[str]] = None
+
+    # `model_type`s whose `:in=<tag>` shared-input metadata was verified against a real (tiny, CPU)
+    # forward in tests/module_tree/test_shared_input_cpu_forward.py. Not inherited: every concrete
+    # definition (and every extra model_type mapped onto it) must list itself or its `:in=` tags
+    # are ignored and Hessian dedup stays off. See `shared_input_verified()`.
+    shared_input_verified_model_types: frozenset[str] = frozenset()
 
     # Strict=True -> all layer_modules must exists in model
     # Some models (deepseek2-lite) dynamically create lora modules based on config.rank
@@ -291,6 +334,9 @@ class BaseQModel(nn.Module):
     # The actual experts live inside submodules (e.g. Qwen3MoeModel.mlp.experts),
     # so `defuser_module_paths` is used to explicitly locate and defuse them.
     defuser_module_paths = None
+
+    # Multimodal wrappers can reuse the checkpoint rules of their text model.
+    hf_conversion_model_type_alias: Optional[str] = None
 
     def __init__(
         self,
@@ -488,6 +534,15 @@ class BaseQModel(nn.Module):
         configured_map = getattr(cls, "HF_CONVERSION_MAP_REVERSED", None)
         if configured_map is not None:
             return copy.deepcopy(configured_map)
+
+        model_type_alias = getattr(cls, "hf_conversion_model_type_alias", None)
+        if model_type_alias:
+            inferred_map = LazyTurtle.infer_hf_conversion_map_reversed(
+                target_model=target_model,
+                model_type=model_type_alias,
+            )
+            if inferred_map is not None:
+                return copy.deepcopy(inferred_map)
 
         inferred_map = LazyTurtle.infer_hf_conversion_map_reversed(target_model=target_model)
         return copy.deepcopy(inferred_map) if inferred_map is not None else None
@@ -742,6 +797,45 @@ class BaseQModel(nn.Module):
 
         # print(f"simple_layer_modules layer_modules: {layer_modules}")
         return layer_modules
+
+    @classmethod
+    def shared_input_verified(cls, model_config=None) -> bool:
+        """
+        True when this definition's `:in=<tag>` metadata was verified by a real forward
+        for `model_config.model_type`.
+
+        Only the model types a class lists in its own `shared_input_verified_model_types`
+        count (`module_tree` is inherited, the verification set is not), so a subclass or
+        an extra `model_type` mapped onto a verified definition stays singleton-only until
+        it is covered by `tests/module_tree/test_shared_input_cpu_forward.py`.
+        """
+        model_type = getattr(model_config, "model_type", None)
+        if not isinstance(model_type, str):
+            return False
+        verified = cls.__dict__.get("shared_input_verified_model_types", ())
+        return model_type in verified
+
+    @classmethod
+    def shared_input_plan(
+        cls,
+        model_config=None,
+        quantize_config=None,
+        is_awq_quantize: bool = False,
+    ) -> SharedInputPlan:
+        """
+        Group the quantizable modules of one decoder layer by shared input tensor.
+
+        Modules in the same group consume identical activations, so Hessian (X^T X)
+        collection only needs to run for the group leader. Every module is a singleton
+        unless sibling leaves opt in with the same `:in=<tag>` flag *and* the model type
+        is listed in `shared_input_verified_model_types` (see `shared_input_verified`).
+        """
+        layer_modules = cls.simple_layer_modules(model_config, quantize_config, is_awq_quantize=is_awq_quantize)
+        return build_shared_input_plan(
+            cls.module_tree,
+            layer_modules,
+            explicit_tags=cls.shared_input_verified(model_config),
+        )
 
     @classmethod
     def full_layer_modules(cls, model_config=None, is_awq_quantize: bool = False, include_capture_only: bool = False):
@@ -1047,6 +1141,7 @@ class BaseQModel(nn.Module):
                 backend=backend,
                 adapter_calibration_dataset=adapter_calibration_dataset,
                 calibration_concat_separator=calibration_concat_separator,
+                embed_quant_config=embed_quant_config,
             )
 
         timer = getattr(self, "quant_region_timer", None)
@@ -1096,7 +1191,20 @@ class BaseQModel(nn.Module):
         embed_quant_config = self._normalize_embed_quant_config(embed_quant_config, embed_quant_mode)
         if embed_quant_config is None:
             raise ValueError("`requantize()` requires `embed_quant_config` or `embed_quant_mode`.")
-        return self.quantize(
+
+        # Quantized checkpoint loading may use only a device map, leaving the
+        # quantization device unset. Requantization still needs a concrete
+        # device for kernel selection and calibration replay.
+        quantize_config = getattr(self, "quantize_config", None)
+        if quantize_config is not None and quantize_config.device is None:
+            input_endpoint = self.get_input_embeddings()
+            endpoint = input_endpoint if input_endpoint is not None else self.get_output_embeddings()
+            endpoint_device = get_device(endpoint) if endpoint is not None else get_device(self.model)
+            if endpoint_device.type == "meta":
+                endpoint_device = CPU
+            quantize_config.device = DEVICE(endpoint_device.type)
+
+        result = self.quantize(
             calibration=calibration,
             calibration_concat_size=calibration_concat_size,
             calibration_sort=calibration_sort,
@@ -1110,6 +1218,31 @@ class BaseQModel(nn.Module):
             embed_quant_config=embed_quant_config,
         )
 
+        # A loaded quantized model may contain inference-repacked or fused
+        # modules that cannot safely be serialized as a complete checkpoint.
+        # Preserve the source checkpoint and let the embedding-only writer
+        # replace only the shards owned by the requested endpoints.
+        prefixes = set(getattr(self, "_embedding_replacement_prefixes", set()))
+        mode = embed_quant_config.embed_quant_mode
+        if mode in (QuantizeEmbed.INPUT, QuantizeEmbed.BOTH):
+            input_name = self.get_input_embeddings_name()
+            if input_name:
+                prefixes.add(input_name)
+        if mode in (QuantizeEmbed.OUTPUT, QuantizeEmbed.BOTH):
+            output_name = self.get_output_embeddings_name() or self.lm_head
+            if output_name:
+                prefixes.add(output_name)
+        self._embedding_replacement_prefixes = prefixes
+
+        if self.load_quantized_model and prefixes:
+            if self.turtle_model is None:
+                # Keep the shard-map-only source separate: shell materializers
+                # require a complete LazyTurtle implementation.
+                self._embedding_replacement_source = _QuantizedCheckpointSource(str(self.model_local_path))
+            self._model_free_weight_only_embeddings_only = True
+
+        return result
+
     def _quantize_with_calibration(
         self,
         *,
@@ -1120,6 +1253,7 @@ class BaseQModel(nn.Module):
         backend: Optional[BACKEND],
         adapter_calibration_dataset,
         calibration_concat_separator: Optional[str],
+        embed_quant_config: Optional[QuantizeEmbedConfig],
     ):
         from ..adapter.adapter import Lora
         from ..looper.eora_processor import EoraProcessor
@@ -1245,7 +1379,11 @@ class BaseQModel(nn.Module):
                 )
             )
 
-        module_looper = ModuleLooper(self, processors=processors)
+        module_looper = ModuleLooper(
+            self,
+            processors=processors,
+            embed_quant_config=embed_quant_config,
+        )
 
         gc_context = (
             DEVICE_THREAD_POOL.no_auto_gc()
@@ -2061,6 +2199,35 @@ class BaseQModel(nn.Module):
         else:
             return module
 
+    def forward_device_for_module(self, module: nn.Module, planned_device: torch.device) -> torch.device:
+        """Apply model-declared placement exclusions to subset replay planning."""
+
+        turtle_model = self.turtle_model
+        if not isinstance(turtle_model, LazyTurtle):
+            return planned_device
+
+        # LazyTurtle matches exclusions by dotted parameter path, not module type.
+        module_paths = getattr(self, "_forward_module_paths_by_id", None)
+        if module_paths is None or id(module) not in module_paths:
+            module_paths = {id(candidate): name for name, candidate in self.model.named_modules() if name}
+            self._forward_module_paths_by_id = module_paths
+        module_path = module_paths.get(id(module))
+        if module_path is None:
+            return planned_device
+        # Check only tensors owned by this leaf; descendants receive their own plan entry.
+        for rel_name, _ in module.named_parameters(recurse=False):
+            if turtle_model.is_no_placement_tensor(module_path, rel_name):
+                return torch.device(CPU)
+        return planned_device
+
+    def has_forward_device_overrides(self) -> bool:
+        """Return whether replay must preserve model-declared tensor placement."""
+
+        turtle_model = self.turtle_model
+        return isinstance(turtle_model, LazyTurtle) and bool(
+            getattr(turtle_model, "_no_placement_params", ())
+        )
+
     def post_quantize(self, module: nn.Module) -> nn.Module:
         #return self.offload_to_disk(module=module)
         return move_to(module, device=CPU)
@@ -2630,6 +2797,26 @@ class BaseQModel(nn.Module):
     def awq_skip_modules_for_scaling(self) -> bool:
         pass
 
+    @classmethod
+    def awq_input_feature_aggregation(cls, module_name: str) -> Optional[Dict[str, Any]]:
+        """Declare bounded token-row aggregation for pointwise MoE modules."""
+
+        if not isinstance(module_name, str):
+            return None
+
+        for moe_root in cls.get_moe_module_name() or []:
+            if module_name == moe_root:
+                return {
+                    "mode": "token_rows",
+                    "capture_root": True,
+                }
+            if module_name.startswith(f"{moe_root}."):
+                return {
+                    "mode": "token_rows",
+                }
+
+        return None
+
     def awq_get_modules_for_scaling(self, module, input_feat, module_kwargs):
         nodes = []
         last_module = None  # most recent norm obj (from a '!...' block)
@@ -2730,6 +2917,7 @@ class BaseQModel(nn.Module):
                     n, root = generate_node_for_awq_scaling(inp=input_feat[name], prev_op=prev_op,
                                                             module_kwargs=_module_kwargs_for_feature(feature_name), nodes_size=len(nodes),
                                                             subset=subset, module2inspect=None)
+                    n["_input_feature_name"] = feature_name
                     if root is not None and last_module_root != root:
                         last_module_root = root
 
@@ -2795,6 +2983,7 @@ class BaseQModel(nn.Module):
                 n, root = generate_node_for_awq_scaling(inp=inp, prev_op=prev_op,
                                                         module_kwargs=_module_kwargs_for_feature(feature_name), nodes_size=len(nodes),
                                                         subset=subset, module2inspect=module2inspect)
+                n["_input_feature_name"] = feature_name
 
                 nodes.append(n)
 
@@ -2967,7 +3156,9 @@ class BaseQModel(nn.Module):
           - ':!' means participates in inference but is NOT quantized; keep this marker in output.
           - ':?' marks capture-only nodes; activations are recorded but the module is not quantized.
           - ':<digit>' means grouping; children with the same group id are emitted in the same block.
-          - Both can appear together, e.g. 'module_name:!:2'.
+          - ':in=<tag>' declares which sibling children consume the same input tensor (see shared_input.py);
+            it does not affect the emitted blocks.
+          - Flags can be combined, e.g. 'module_name:!:2' or 'module_name:1:in=q'.
           - Supports nested dict structures for MoE models with experts.
           - Special key "#" in nested dicts means direct children under parent (no additional nesting).
           - EXPERT_INDEX_PLACEHOLDER in keys will be handled by simple_layer_modules for MoE expansion.

@@ -21,6 +21,9 @@
 
 ## Latest News 🗞️🚀
 
+* 09/02/2026 7.4.0-dev `main`: ✨ Added `apertus1p5` and `apertus1p5_text` quantization.
+* 09/01/2026 7.4.0-dev `main`: ✨ Added `glm5_next` / GLM-5.3-Flash quantization support.
+* 08/31/2026 7.4.0-dev `main`: ✨ Added Qwen3.8-Flash-Next (`qwen4_exp`) quantization.
 * 08/26/2026 7.4.0-dev `main`: ✨ Added NVIDIA `LocateAnything-3B` quantization support.
 * 08/25/2026 7.4.0-dev `main`: ✨ Added Tencent `HunyuanOCR` quantization support.
 * 08/25/2026 7.4.0-dev `main`: ✨ Added `lm_head` and embedding quantization lifecycle.
@@ -255,7 +258,7 @@ Selected public references where teams or companies explicitly mention GPT-QMode
 
 | Model                         |   |                                 |  |                            |  |                                 |  |                        |   |
 |-------------------------------|---|---------------------------------|--|----------------------------|--|---------------------------------|--|------------------------|---|
-| Apertus                       | ✅ | EXAONE 3/4                      | ✅ | Dots1                      | ✅ | Mistral3 / Ministral3           | ✅ | Qwen 2/3/3.5 (Next/MoE) | ✅ |
+| Apertus 1/1.5                 | ✅ | EXAONE 3/4                      | ✅ | Dots1                      | ✅ | Mistral3 / Ministral3           | ✅ | Qwen 2/3/3.5/3.8 (Next/MoE) | ✅ |
 | Baichuan                      | ✅ | Falcon (H1 / Mamba)             | ✅ | InternLM 1/2/2.5           | ✅ | Mixtral                         | ✅ | Qwen 2/2.5/3 VL        | ✅ |
 | Bloom                         | ✅ | FastVLM                         | ✅ | Kimi K2                    | ✅ | MobileLLM                       | ✅ | Qwen 2.5/3 Omni        | ✅ |
 | ChatGLM                       | ✅ | Gemma 1-4 / 3n                  | ✅ | Klear                      | ✅ | MOSS                            | ✅ | RefinedWeb             | ✅ |
@@ -266,7 +269,7 @@ Selected public references where teams or companies explicitly mention GPT-QMode
 | DeepSeek-V2/V3/V3.2/V4/R1     | ✅ | GPT-OSS                         | ✅ | LongCat Flash              | ✅ | OLMo2/3 / LLaDA2                | ✅ | Yi                     | ✅ |
 | DeepSeek-V2 Lite / VL / VL2 / OCR2 | ✅ | Granite / Granite MoE           | ✅ | LongLLaMA                  | ✅ | Ovis 1.6/2/2.5/2.6 MoE/2.6 Next | ✅ | Seed-OSS               | ✅ |
 | Dream                         | ✅ | GRIN-MoE                        | ✅ | Instella                   | ✅ | Phi 1-4                         | ✅ | Voxtral                | ✅ |
-| ERNIE 4.5 / MoE / VL MoE      | ✅ | GLM 4/4V/4.5V/4.6V/5/5.1/OCR/ASR | ✅ | GLM4 MoE / Lite / 4.5V MoE | ✅ | MiniCPM 3/O/V/V 4_6             | ✅ | PanGu-α                | ✅ |
+| ERNIE 4.5 / MoE / VL MoE      | ✅ | GLM 4/4V/4.5V/4.6V/5/5.1/5.3/OCR/ASR | ✅ | GLM4 MoE / Lite / 4.5V MoE | ✅ | MiniCPM 3/O/V/V 4_6             | ✅ | PanGu-α                | ✅ |
 | XVERSE                        | ✅ | Brumby                          | ✅ | Hymba                      | ✅ | Mistral                         | ✅ | Qwen 1/2/3/3.5         | ✅ |
 | MiniMax M2/M3                 | ✅ | AfMoE                           | ✅ | Bailing-MoE                | ✅ | LFM2 / LFM2-VL / LFM2-MoE       | ✅ | Marin                  | ✅ |
 | InternVL Chat                 | ✅ | Laguna                          | ✅ | Mimo / Mimo V2             | ✅ | Zamba / Zamba2                  | ✅ | Intern S1 / S2 Preview             | ✅ |
@@ -573,6 +576,19 @@ print(f"Result: {result}")
 ### How to Add Support for a New Model 🛠️
 
 Read the [`gptqmodel/models/llama.py`](https://github.com/ModelCloud/GPTQModel/blob/5627f5ffeb3f19b1a2a97e3b6de6fbe668b0dc42/gptqmodel/models/llama.py) code which explains in detail via comments how the model support is defined. Use it as a guide for PRs to add new models. Most models follow the same pattern.
+
+#### Shared-input metadata (`:in=<tag>`) 🔗
+
+Modules that consume the *same* activation tensor (e.g. `q_proj`/`k_proj`/`v_proj` after `input_layernorm`) produce identical GPTQ Hessians (`H = XᵀX`), so the Hessian only needs to be collected once per group. `BaseQModel.shared_input_plan(model_config, quantize_config)` derives these groups from `module_tree`:
+
+- Default: every quantizable leaf is its own singleton group. Subset digits (`:0`) describe execution/quantization order, not tensor identity, so they are never used to infer sharing.
+- Opt in with `:in=<tag>`: sibling leaves (same parent) with the same tag share an input, e.g. `"q_proj:0:in=x", "k_proj:0:in=x", "v_proj:0:in=x"` or `"gate_proj:0:in=x", "up_proj:0:in=x"`. Tags are scoped per parent. Different tags never share (MLA: `"q_b_proj:1:in=q_a", "kv_b_proj:1:in=kv_a"` read different latents).
+- A leaf repeated across `module_tree` variants must carry identical flags; conflicts raise at plan time.
+- `:!` / `:?` leaves and `:in=` tags never change the emitted subset blocks or quantization order.
+- Runtime dedup is per subset block: the looper captures one block at a time and elects the first group member in that block as leader; the other members in the *same* block skip Hessian capture and adopt a private copy of the leader's `H`. A tag whose members sit in different blocks (e.g. `in_proj_qkv:0` / `in_proj_z:1`) is still validated by the probe but deduplicates nothing (`SharedInputGroup.dedup_followers`, `SharedInputPlan.dedup_count` reflect this).
+- Tags are inert until the definition lists the `model_type` in its own `shared_input_verified_model_types` (not inherited). Unlisted model types (including Llama-clone subclasses that inherit `module_tree`) get singleton plans and never skip capture; `tests/module_tree/test_shared_input_cpu_forward.py` enforces that every listed type has a real-forward case.
+
+Only add `:in=` tags after verifying them against a real (tiny, CPU) model with `gptqmodel.models.shared_input.probe_shared_inputs(layer, plan, forward)`; it hooks every planned module, runs `forward`, and reports groups whose inputs differ (`mismatches`), identical inputs that were not declared (`undeclared`), planned modules that do not exist (`missing_modules`) and groups that never ran (`unverified`, e.g. un-routed experts). `report.ok` is strict (`fully_verified`); use `has_errors` when un-routed experts are expected. See `tests/module_tree/test_shared_input*.py` for the covered definitions.
 
 ### Pair with Evaluation for post-quantization LLM Benchmarks 📊
 

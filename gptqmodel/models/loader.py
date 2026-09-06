@@ -68,6 +68,7 @@ from ..utils.machete import _validate_machete_device_support
 from ..utils.marlin import _marlin_capability_supported, _validate_marlin_device_support
 from ..utils.swordfish import _validate_swordfish_device_support
 from ..utils.model import (
+    apply_no_placement_to_device_map,
     auto_dtype,
     convert_gptq_v1_to_v2_format,
     find_config_seq_len,
@@ -80,6 +81,7 @@ from ..utils.model import (
     is_embeddings_module_quantized,
     load_checkpoint_in_model_then_tie_weights,
     make_quant,
+    no_placement_module_names,
     simple_dispatch_model,
 )
 from ._const import DEVICE, HAS_NPU, normalize_device
@@ -160,13 +162,17 @@ def _maybe_print_module_tree(model) -> None:
 
 
 def _convert_model_with_defuser(cls, model, cleanup_original: bool) -> bool:
-    converted = defuser.convert_model(model, cleanup_original=cleanup_original)
-
+    # A model-owned converter may include checkpoint-only blocks and enforce
+    # exact coverage. Give it the original fused tensors: newer Defuser
+    # registries can otherwise consume them before the custom hook runs.
+    converted = False
     model_conversion_hook = getattr(cls, "convert_model_structure", None)
     if callable(model_conversion_hook):
         converted = bool(
             model_conversion_hook(model, cleanup_original=cleanup_original)
-        ) or converted
+        )
+    if not converted:
+        converted = defuser.convert_model(model, cleanup_original=cleanup_original)
 
     defuser_module_paths = getattr(cls, "defuser_module_paths", ())
     if defuser_module_paths:
@@ -1644,6 +1650,17 @@ def ModelLoader(cls):
         else:
             device_map = dict(explicit_device_map)
             log.info(f"Loader: honoring explicit device_map request: {device_map}")
+        original_device_map = dict(device_map)
+        # Checkpoint loading needs a non-overlapping map: parent and child entries
+        # would otherwise make Accelerate read the same PLE tensor on both devices.
+        device_map = apply_no_placement_to_device_map(model, device_map)
+        if device_map != original_device_map:
+            cpu_modules = sorted(no_placement_module_names(model))
+            log.info(f"Loader: keeping no-placement modules on CPU: {cpu_modules}")
+        # Runtime dispatch keeps the parent entry so layer inputs still move to
+        # the right GPU, while the explicit CPU leaf blocks recursive PLE moves.
+        dispatch_device_map = dict(original_device_map)
+        dispatch_device_map.update(dict.fromkeys(no_placement_module_names(model), "cpu"))
         log.info(f"Loader: device_map = {device_map}")
 
         load_checkpoint_in_model = native_gguf_qspec is None
@@ -1768,7 +1785,7 @@ def ModelLoader(cls):
             )
 
         if native_gguf_qspec is not None:
-            model = simple_dispatch_model(model, device_map)
+            model = simple_dispatch_model(model, dispatch_device_map)
             _load_quantized_gguf_checkpoint_into_model(
                 model=model,
                 gguf_checkpoint_path=gguf_checkpoint_path,
@@ -1776,7 +1793,7 @@ def ModelLoader(cls):
             )
         else:
             # TODO: Why are we using this custom function and not dispatch_model?
-            model = simple_dispatch_model(model, device_map)
+            model = simple_dispatch_model(model, dispatch_device_map)
 
         if format_code == FORMAT.EXL3:
             qlinear_kernel = ExllamaV3TorchLinear if backend == BACKEND.EXL3_TORCH else ExllamaV3Linear

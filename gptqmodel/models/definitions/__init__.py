@@ -97,6 +97,7 @@ from .qwen2_vl import Qwen2VLQModel
 from .qwen3 import Qwen3QModel
 from .qwen3_moe import Qwen3MoeQModel
 from .qwen3_vl import Qwen3_VLQModel
+from .qwen4_exp import Qwen4ExpQModel
 from .rw import RwgQModel
 from .solar_open import SolarOpenQModel
 from .solar_open2 import SolarOpen2QModel
@@ -111,7 +112,7 @@ from .zamba2 import Zamba2QModel
 from .pangu_alpha import PanguAlphaQModel
 from .longcat_flash import LongCatFlashQModel
 from .locateanything import LocateAnythingQModel
-from .apertus import ApertusQModel
+from .apertus import Apertus1p5QModel, Apertus1p5TextQModel, ApertusQModel
 from .axk2 import AXK2QModel
 from .klear import KlearQModel
 from .laguna import LagunaQModel

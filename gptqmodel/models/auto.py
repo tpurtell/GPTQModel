@@ -65,7 +65,7 @@ from ..utils.model import find_modules  # noqa: E402
 from ..utils.torch import torch_empty_cache  # noqa: E402
 from .base import BaseQModel  # noqa: E402
 from .definitions.afmoe import AfMoeQModel  # noqa: E402
-from .definitions.apertus import ApertusQModel  # noqa: E402
+from .definitions.apertus import Apertus1p5QModel, Apertus1p5TextQModel, ApertusQModel  # noqa: E402
 from .definitions.axk2 import AXK2QModel  # noqa: E402
 from .definitions.baichuan import BaiChuanQModel  # noqa: E402
 from .definitions.bailing_moe import BailingMoeQModel  # noqa: E402
@@ -185,6 +185,7 @@ from .definitions.qwen3_moe import Qwen3MoeQModel  # noqa: E402
 from .definitions.qwen3_next import Qwen3NextGPTQ  # noqa: E402
 from .definitions.qwen3_omni_moe import Qwen3OmniMoeGPTQ
 from .definitions.qwen3_vl import Qwen3_VLQModel
+from .definitions.qwen4_exp import Qwen4ExpQModel  # noqa: E402
 from .definitions.rw import RwgQModel  # noqa: E402
 from .definitions.solar_open import SolarOpenQModel  # noqa: E402
 from .definitions.solar_open2 import SolarOpen2QModel  # noqa: E402
@@ -212,6 +213,8 @@ else:
 
 MODEL_MAP = {
     "apertus": ApertusQModel,
+    "apertus1p5": Apertus1p5QModel,
+    "apertus1p5_text": Apertus1p5TextQModel,
     "axk2": AXK2QModel,
     "dream": DreamQModel,
     "bloom": BloomQModel,
@@ -311,6 +314,7 @@ MODEL_MAP = {
     "qwen2_5_omni": Qwen2_5_OmniGPTQ,
     "qwen3_omni_moe": Qwen3OmniMoeGPTQ,
     "qwen3_vl": Qwen3_VLQModel,
+    "qwen4_exp": Qwen4ExpQModel,
     "dbrx": DbrxQModel,
     "dbrx_converted": DbrxConvertedQModel,
     "deepseek_v2": DeepSeekV2QModel,

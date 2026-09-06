@@ -306,6 +306,16 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
                 f"Got: gate={self.gate_proj_name}, up={self.up_proj_name}, down={self.down_proj_name}"
             )
 
+    def apply_expert_activation(self, experts_module, expert, gate_out, up_out):
+        """Apply the model's fused expert gate when it exposes one."""
+
+        fused_gate = getattr(experts_module, "_apply_gate", None)
+        if callable(fused_gate):
+            return fused_gate(torch.cat([gate_out, up_out], dim=-1))
+        if hasattr(expert, "act_fn"):
+            return expert.act_fn(gate_out) * up_out
+        return torch.nn.functional.silu(gate_out) * up_out
+
     def _extract_moe_block_prefix(self, subset: Dict[str, Any], moe_block: nn.Module) -> Optional[str]:
         """
         Extract moe_block_prefix from subset keys.
@@ -365,8 +375,6 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
         order they appear in the subset/module tree, then calls the original
         routed forward for the final output.
         """
-        import torch.nn.functional as F
-
         if not processor or not original_forward:
             error_msg = "Missing processor or original_forward"
             log.error(error_msg)
@@ -376,6 +384,10 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
             # moe_block_prefix is None fallback to original forward
             # this is normal for example glm4_moe has 1-3 :moe layers without experts
             return original_forward(hidden_states, **kwargs)
+
+        root_recorder = getattr(processor, "record_moe_root_input_feature", None)
+        if callable(root_recorder):
+            root_recorder(moe_block_prefix, hidden_states)
 
         expert_count = 0
         stop_forward_raised = False
@@ -478,10 +490,12 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
                         gate_out = gate_module(expert_input)
                         up_out = up_module(expert_input)
 
-                        if hasattr(expert, 'act_fn'):
-                            intermediate = expert.act_fn(gate_out) * up_out
-                        else:
-                            intermediate = F.silu(gate_out) * up_out
+                        intermediate = self.apply_expert_activation(
+                            experts_module=experts_module,
+                            expert=expert,
+                            gate_out=gate_out,
+                            up_out=up_out,
+                        )
                         del gate_out, up_out
 
                         get_callable_module(down_key)(intermediate)

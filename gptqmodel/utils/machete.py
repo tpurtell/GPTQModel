@@ -37,7 +37,7 @@ log = setup_logger()
 _MACHETE_OPS_NAME = "gptqmodel_machete_ops"
 _MACHETE_OPS_NAMESPACE = "gptqmodel_machete"
 
-_CUTLASS_VERSION = "4.4.2"
+_CUTLASS_VERSION = "4.7.1"
 _CUTLASS_RELEASE_URL = f"https://github.com/NVIDIA/cutlass/archive/refs/tags/v{_CUTLASS_VERSION}.tar.gz"
 _CUTLASS_VERSION_MARKER = ".gptqmodel_cutlass_version"
 _CUTLASS_VERSION_DEFINE_PATTERN = pcre.compile(
@@ -418,6 +418,7 @@ _MACHETE_TORCH_OPS_EXTENSION = TorchOpsJitExtension(
     force_rebuild_env="GPTQMODEL_MACHETE_FORCE_REBUILD",
     verbose_env="GPTQMODEL_EXT_VERBOSE",
     requires_cuda=True,
+    python_abi_dependent=False,
     # Machete kernels are Hopper-only, so compile-only workflows may need to
     # force a non-local target such as `TORCH_CUDA_ARCH_LIST=9.0a`.
     merge_visible_cuda_arch_override=False,

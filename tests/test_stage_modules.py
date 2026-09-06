@@ -7,6 +7,7 @@ from typing import Dict
 import torch
 
 import gptqmodel.looper.stage_subset as stage_subset_module
+from gptqmodel import QuantizeEmbed, QuantizeEmbedConfig
 from gptqmodel.looper.awq_processor import AWQProcessor
 from gptqmodel.looper.forward_executor import ForwardExecutor
 from gptqmodel.looper.gptq_processor import GPTQProcessor
@@ -39,12 +40,27 @@ class _DummyQModel:
             moe_vram_strategy_devices=None,
             moe_routing_bypass=lambda: False,
         )
+        self.model = torch.nn.Module()
+        self.model.config = types.SimpleNamespace(tie_word_embeddings=False)
         self.layer_callback = None
 
 
 def _make_looper():
     processors = [types.SimpleNamespace(layer_count=0, pb=None)]
     return ModuleLooper(model=_DummyQModel(), processors=processors)
+
+
+def test_module_looper_preserves_embedding_only_setting():
+    looper = ModuleLooper(
+        model=_DummyQModel(),
+        processors=[],
+        embed_quant_config=QuantizeEmbedConfig(
+            embed_quant_mode=QuantizeEmbed.INPUT,
+            embed_only=False,
+        ),
+    )
+
+    assert looper.embed_only is False
 
 
 def test_cache_inputs_delegates_to_stage_capture(monkeypatch):
@@ -366,6 +382,7 @@ def _make_forward_executor_looper(
                 compute_device_filter=None,
             ),
             prepare_layer_replay_kwargs=lambda layer, layer_input, additional_inputs, target_device: additional_inputs,
+            prepare_layer_replay_keep_mask=lambda **kwargs: kwargs["keep_mask"],
         ),
         moe_routing_override=moe_routing_override,
         moe_routing_bypass=moe_routing_bypass,
@@ -839,6 +856,12 @@ def test_subset_pass_finishes_zero_route_recovery_before_quant_fanout(monkeypatc
             fwd_replay_after_process=True,
         )
         tasks = {projection.name: object()}
+
+        def begin_shared_input_capture(self, *args, **kwargs):
+            return {}
+
+        def end_shared_input_capture(self, subset_names):
+            return {}
 
         def pre_process_fwd_hook(self, _name):
             return lambda *_args, **_kwargs: None
@@ -1535,6 +1558,8 @@ def test_run_layer_stage_invokes_subset_stage(monkeypatch):
         def __init__(self):
             self.gptq_model = DummyGptqModel()
             self.processors = [DummyProcessor()]
+            self.input_embeddings_name = None
+            self.output_embeddings_name = None
             self._quant_devices = [torch.device("cpu")]
             self._module_device_map = {}
             self._quant_device_lock = threading.Lock()
@@ -1603,6 +1628,8 @@ def test_run_layer_stage_invokes_subset_stage(monkeypatch):
         layer_count=2,
         region_timer=None,
         finalize_progress_cls=FinalizeProgressInfo,
+        embed_quant_mode=QuantizeEmbed.OUTPUT,
+        embed_only=False,
         logger=logger,
     )
 
@@ -2784,7 +2811,7 @@ def test_run_layer_stage_replays_untouched_layer_outputs_when_all_modules_skippe
         ) -> Dict[str, NamedModule]:
             subset = {}
             for name in names:
-                full_name = f"{layers_prefix}.{layer_index}.{name}"
+                full_name = f"{layers_prefix}.{name}"
                 if self.gptq_model.quantize_config.dynamic_get(layer_name=full_name) is False:
                     continue
                 subset[name] = NamedModule(

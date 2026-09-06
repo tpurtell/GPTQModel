@@ -10,7 +10,7 @@ import threading
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 from safetensors import safe_open
@@ -25,6 +25,11 @@ class InputCache:
     layer_input_kwargs: List[Dict[str, torch.Tensor]]
     position_ids: List[torch.Tensor]
     attention_masks: List[torch.Tensor]
+    src_inputs: Optional[List[List[torch.Tensor]]] = None
+
+    def __post_init__(self):
+        if self.src_inputs is None:
+            self.src_inputs = list(self.layer_inputs) if self.layer_inputs is not None else []
 
     def module_kwargs(self):
         """Returns the replay kwargs that are shared across cached module calls."""
