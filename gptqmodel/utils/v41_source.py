@@ -82,8 +82,7 @@ class V41Source:
     @torch.no_grad()
     def load_decoded_block(self, layer_index, device="cuda:0", *, native_kernels=None):
         from transformers import DeepseekV41Config
-        from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41DecoderLayer
-        from ..models.definitions.deepseek_v41 import DeepSeekV41Experts
+        from ..models.definitions.deepseek_v41 import DeepSeekV41Experts, DeepSeekV41DecoderLayer
 
         config = DeepseekV41Config.from_dict(self.config).get_text_config()
         if type(layer_index) is not int or not 0 <= layer_index < config.num_hidden_layers:
@@ -91,7 +90,7 @@ class V41Source:
         config._experts_implementation = "eager"
         config._attn_implementation = "eager"
         with torch.device("meta"):
-            block = DeepseekV41DecoderLayer(config, layer_index)
+            block = DeepSeekV41DecoderLayer(config, layer_index)
             block.mlp.experts = DeepSeekV41Experts.from_fused(block.mlp.experts)
         expected = block.state_dict()
         for key, template in expected.items():
@@ -122,12 +121,13 @@ class V41Source:
         # Rotary embedding constants are nonpersistent buffers initialized on meta.
         # Recreate these tiny modules on the execution device from their config.
         from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41RotaryEmbedding
+        from ..models.definitions.deepseek_v41 import DeepSeekV41RotaryEmbedding
         for name, module in list(block.named_modules()):
             if isinstance(module, DeepseekV41RotaryEmbedding):
                 parent_key, _, leaf = name.rpartition(".")
                 parent = block.get_submodule(parent_key) if parent_key else block
                 with torch.device(device):
-                    setattr(parent, leaf, DeepseekV41RotaryEmbedding(config))
+                    setattr(parent, leaf, DeepSeekV41RotaryEmbedding(config))
         from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41RMSNorm
         from ..models.definitions.deepseek_v41 import DeepSeekV41RMSNorm
 
@@ -138,4 +138,11 @@ class V41Source:
                 setattr(parent, leaf, DeepSeekV41RMSNorm(module.weight.detach(), module.variance_epsilon))
         if any(tensor.is_meta for tensor in list(block.parameters()) + list(block.buffers())):
             raise ValueError("V4.1 block retains uninitialized meta tensors")
+        if native_kernels is not None:
+            block.self_attn.v41_source_kernels = native_kernels
+            from .v41_native import V41NativeAttention
+            block.self_attn.__class__ = V41NativeAttention
+            from ..models.definitions.deepseek_v41 import DeepSeekV41HyperConnection
+            block.attn_hc = DeepSeekV41HyperConnection(block.attn_hc, native_kernels)
+            block.ffn_hc = DeepSeekV41HyperConnection(block.ffn_hc, native_kernels)
         return block.eval()

@@ -6,6 +6,79 @@ dtype. The kernel module is supplied by the caller from an authenticated source.
 
 import torch
 from torch import nn
+from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention
+
+
+def reference_rotary(x, cos, sin, inverse=False):
+    """Use the checkpoint's complex multiplication and single final rounding."""
+    width = cos.shape[-1] * 2
+    result = x.clone()
+    pairs = torch.view_as_complex(x[..., -width:].float().reshape(*x.shape[:-1], -1, 2))
+    coeff = torch.complex(cos, -sin if inverse else sin)
+    if x.ndim == 4:
+        coeff = coeff.unsqueeze(2)
+    result[..., -width:] = torch.view_as_real(pairs * coeff).flatten(-2)
+    return result
+
+
+class V41NativeAttention(DeepseekV41Attention):
+    """Full-prompt calibrated forward; reuse shared compressed storage directly."""
+
+    def forward(self, hidden_states, shared, position_embeddings, attention_mask=None,
+                past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            raise ValueError("V4.1 quantization attention expects independent full prompts")
+        kernels = self.v41_source_kernels
+        batch, length, _ = hidden_states.shape
+        positions = kwargs["position_ids"]
+        padding = kwargs.get("padding_mask")
+        cos, sin = position_embeddings[self.rope_layer_type]
+        qr = self.q_a_norm(self.q_a_proj(hidden_states))
+        q = reference_rotary(self.q_b_proj(qr).view(batch, length, self.num_heads, self.head_dim), cos, sin)
+        kv = reference_rotary(self.kv_norm(self.kv_proj(hidden_states)), cos, sin)
+        kernels.act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
+        end = torch.arange(length, device=kv.device).unsqueeze(-1)
+        indices = (end - self.sliding_window + 1).clamp_min(0) + torch.arange(min(length, self.sliding_window), device=kv.device)
+        indices = indices.expand(batch, -1, -1).clone()
+        valid = indices <= end
+        if attention_mask is not None:
+            mask = attention_mask.expand(batch, -1, -1, -1)[:, 0]
+            allowed = mask.gather(-1, indices.clamp_max(length - 1))
+            valid = valid & (allowed if allowed.dtype == torch.bool else allowed == 0)
+        indices = indices.masked_fill(~valid, -1)
+        if self.compress_ratio:
+            latent = group_positions = None
+            if self.is_kv_source:
+                shared["compress_kv"] = None
+                latent, group_positions, counts, lengths = self.compressor(hidden_states, None, positions, padding)
+                shared["group_counts"] = counts
+                shared["compress_lens"] = lengths // self.compress_ratio
+                if padding is not None:
+                    shared["compress_lens"] = shared["compress_lens"].masked_fill(~padding, 0)
+            if self.is_index_source:
+                self.indexer(hidden_states, qr, latent, group_positions, positions, None, shared)
+            if latent is not None:
+                cc, cs = self.compress_rotary(latent, position_ids=group_positions, layer_type="compress")
+                rotated = reference_rotary(latent, cc, cs)
+                kernels.fp4_act_quant(rotated, 16, True, scale_dtype=torch.float8_e4m3fn)
+                shared["compress_kv"] = rotated.unsqueeze(1)
+            compressed, selected = shared.get("compress_kv"), shared.get("topk_idx")
+            if compressed is not None and selected is not None and selected.shape[-1]:
+                selected = selected.to(kv.device)
+                extra = torch.where(selected >= 0, selected + length, -1)
+                indices = torch.cat((indices, extra), dim=-1)
+                kv = torch.cat((kv, compressed[:, 0].to(kv.device)), dim=1)
+        indices = indices.to(torch.int32).contiguous()
+        output = torch.empty_like(q)
+        for start in range(0, self.num_heads, 16):
+            output[:, :, start:start + 16] = kernels.sparse_attn(
+                q[:, :, start:start + 16].contiguous(), kv.contiguous(),
+                self.sinks[start:start + 16].contiguous(), indices, self.scaling)
+        output = reference_rotary(output, cos, sin, inverse=True)
+        grouped = output.reshape(batch, length, self.config.o_groups, -1)
+        return self.o_b_proj(self.o_a_proj(grouped).flatten(2)), None
+
+
 
 
 class V41NativeLinear(nn.Module):

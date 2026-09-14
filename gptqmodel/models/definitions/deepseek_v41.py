@@ -9,9 +9,50 @@ in the automatic quantization dispatcher.
 import torch
 from torch import nn
 from torch.nn import functional as F
+from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41RotaryEmbedding, DeepseekV41DecoderLayer
 
 from ...utils.ple_mmap import MappedPLETable
 from ..base import BaseQModel
+
+
+class DeepSeekV41RotaryEmbedding(DeepseekV41RotaryEmbedding):
+    """Keep the small rotary coefficients FP32, matching complex reference RoPE."""
+
+    def forward(self, x, position_ids, layer_type=None):
+        if self.rope_type[layer_type] not in ("default", "yarn"):
+            raise ValueError("V4.1 calibration supports the checkpoint's default/YaRN RoPE")
+        inv = getattr(self, f"{layer_type}_inv_freq").to(x.device).float()
+        angles = position_ids.float().unsqueeze(-1) * inv
+        coeff = torch.polar(torch.ones_like(angles), angles)
+        factor = getattr(self, f"{layer_type}_attention_scaling")
+        return coeff.real * factor, coeff.imag * factor
+
+
+class DeepSeekV41HyperConnection(nn.Module):
+    def __init__(self, source, kernels):
+        super().__init__()
+        self.fn, self.base, self.scale = source.fn, source.base, source.scale
+        self.hc_mult = source.hc_mult
+        self.hc_sinkhorn_iters = source.hc_sinkhorn_iters
+        self.hc_eps = source.hc_eps
+        self.norm_eps = source.input_norm.eps
+        self.kernels = kernels
+
+    def forward(self, hidden):
+        flat = hidden.flatten(2).float()
+        inverse_rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(flat, self.fn) * inverse_rms
+        return self.kernels.hc_split_sinkhorn(mixes, self.scale, self.base,
+                                              self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
+
+
+class DeepSeekV41DecoderLayer(DeepseekV41DecoderLayer):
+    @staticmethod
+    def hc_expand(x, residual, post, comb):
+        # Match the checkpoint's multiply-then-reduce order. A matrix multiply
+        # changes intermediate rounding before the final BF16 store.
+        mixed = (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=2)
+        return (post.unsqueeze(-1) * x.unsqueeze(-2) + mixed).to(x.dtype)
 
 
 class DeepSeekV41RMSNorm(nn.Module):
