@@ -122,6 +122,34 @@ class V41Source:
         norm = DeepSeekV41RMSNorm(self.tensor("mtp.0.main_norm.weight", device), config.rms_norm_eps)
         return V41DSparkInput(embedding, projection, norm, config).eval()
 
+    def load_main_input(self, hash_state, device="cuda:0"):
+        """Use an already-bound, attested hash state; never initialize a tokenizer."""
+        from .v41_inputs import V41MainInput
+        from ..models.definitions.deepseek_v41 import DeepSeekV41MappedEmbedding, DeepSeekV41RotaryEmbedding
+
+        config = self.block_config()
+        if hash_state.token_map.numel() != config.vocab_size:
+            raise ValueError("main input requires the attested full token map")
+        if tuple(hash_state.layout.layer_ids) != tuple(config.engram_layer_ids):
+            raise ValueError("hash-state PLE layer layout differs from source")
+        weight = self.tensor("embed.weight", device)
+        if weight.dtype != torch.bfloat16:
+            raise ValueError("unexpected source token embedding dtype")
+        embedding = torch.nn.Embedding.from_pretrained(weight, freeze=True)
+        tables = {}
+        try:
+            for layer in config.engram_layer_ids:
+                prefix = f"layers.{layer}.engram.embed"
+                tables[str(layer)] = DeepSeekV41MappedEmbedding(
+                    self.snapshot / self.weight_map[prefix + ".weight"], prefix)
+            with torch.device(device):
+                rotary = DeepSeekV41RotaryEmbedding(config)
+            return V41MainInput(embedding, hash_state.to(device), rotary, tables, config).eval()
+        except BaseException:
+            for table in tables.values():
+                table.close()
+            raise
+
     @torch.no_grad()
     def load_decoded_block(self, layer_index, device="cuda:0", *, native_kernels=None, namespace="layers"):
         from ..models.definitions.deepseek_v41 import DeepSeekV41Experts, DeepSeekV41DecoderLayer
