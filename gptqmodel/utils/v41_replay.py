@@ -4,7 +4,7 @@ Each batch owns the mHC carry, compressed KV, index keys, candidate selections,
 and its PLE gathers. No model-global reference may substitute for this state.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -30,6 +30,8 @@ class V41ReplayBatch:
     shared: dict
     kwargs: dict
     engram_rows: dict
+    target_layer_ids: tuple = ()
+    target_features: dict = field(default_factory=dict)
 
     @classmethod
     @torch.no_grad()
@@ -73,7 +75,8 @@ class V41ReplayBatch:
         shared = kwargs.pop("shared")
         return cls(0, owned_tree(captured["hidden"], "cpu"),
                    owned_tree(captured["pre_mix"], "cpu"), owned_tree(shared, "cpu"),
-                   owned_tree(kwargs, "cpu"), owned_tree(gathered, "cpu"))
+                   owned_tree(kwargs, "cpu"), owned_tree(gathered, "cpu"),
+                   tuple(text.config.dspark_target_layer_ids))
 
     @torch.no_grad()
     def advance(self, layer, device):
@@ -87,14 +90,26 @@ class V41ReplayBatch:
         shared = owned_tree(self.shared, device)
         kwargs = owned_tree(self.kwargs, device)
         rows = self.engram_rows.get(self.next_layer)
-        hidden, pre_mix = layer(
-            self.hidden.to(device), self.pre_mix.to(device),
-            None if rows is None else rows.to(device), None,
-            shared=shared, **kwargs,
-        )
+        targets = dict(self.target_features)
+        handle = None
+        if self.next_layer in self.target_layer_ids:
+            # This is after any Engram injection, before the block's attention:
+            # the reference uses the unweighted BF16 stream mean, not hc_collapse.
+            def capture(module, args):
+                targets[self.next_layer] = owned_tree(args[0].mean(dim=2), "cpu")
+            handle = layer.attn_hc.register_forward_pre_hook(capture)
+        try:
+            hidden, pre_mix = layer(
+                self.hidden.to(device), self.pre_mix.to(device),
+                None if rows is None else rows.to(device), None,
+                shared=shared, **kwargs,
+            )
+        finally:
+            if handle is not None:
+                handle.remove()
         # Consumed PLE rows must not survive in the next durable frontier.
         remaining = {index: value for index, value in self.engram_rows.items()
                      if index > self.next_layer}
         return type(self)(self.next_layer + 1, owned_tree(hidden, "cpu"),
                           owned_tree(pre_mix, "cpu"), owned_tree(shared, "cpu"),
-                          self.kwargs, remaining)
+                          self.kwargs, remaining, self.target_layer_ids, targets)

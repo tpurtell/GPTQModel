@@ -99,6 +99,29 @@ class V41Source:
         config._attn_implementation = "eager"
         return config
 
+    def load_dspark_input(self, device="cuda:0", *, native_kernels, embedding=None):
+        """Load only dSpark's input adapter; optionally share an existing embedding."""
+        from .v41_dspark import V41DSparkInput
+        from .v41_native import V41NativeLinear
+        from ..models.definitions.deepseek_v41 import DeepSeekV41RMSNorm
+
+        config = self.block_config()
+        if embedding is None:
+            weight = self.tensor("embed.weight", device)
+            if weight.dtype != torch.bfloat16:
+                raise ValueError("unexpected source token embedding dtype")
+            embedding = torch.nn.Embedding.from_pretrained(weight, freeze=True)
+        name = "mtp.0.main_proj"
+        if name + ".scale" in self.weight_map:
+            projection = V41NativeLinear(self.tensor(name + ".weight", device),
+                                         self.tensor(name + ".scale", device), native_kernels)
+        else:
+            weight = self.tensor(name + ".weight", device)
+            projection = torch.nn.Linear(weight.shape[1], weight.shape[0], bias=False, device="meta")
+            projection.weight = torch.nn.Parameter(weight, requires_grad=False)
+        norm = DeepSeekV41RMSNorm(self.tensor("mtp.0.main_norm.weight", device), config.rms_norm_eps)
+        return V41DSparkInput(embedding, projection, norm, config).eval()
+
     @torch.no_grad()
     def load_decoded_block(self, layer_index, device="cuda:0", *, native_kernels=None, namespace="layers"):
         from ..models.definitions.deepseek_v41 import DeepSeekV41Experts, DeepSeekV41DecoderLayer
