@@ -49,6 +49,11 @@ class V41Source:
         if self.config.get("model_type") != "deepseek_v41":
             raise ValueError("expected DeepSeek V4.1 source config")
         self.weight_map = json.loads((self.snapshot / "model.safetensors.index.json").read_text())["weight_map"]
+        self._projection_buffers = {}
+        for key in self.weight_map:
+            if ".ffn.experts." in key:
+                prefix, _, suffix = key.rpartition(".")
+                self._projection_buffers.setdefault(prefix, set()).add(suffix)
         for shard in set(self.weight_map.values()):
             if Path(shard).name != shard or not (self.snapshot / shard).is_file():
                 raise ValueError(f"invalid or missing V4.1 shard: {shard}")
@@ -60,6 +65,17 @@ class V41Source:
             return shard.get_tensor(name).to(device=device, copy=True)
 
     def decoded(self, name, device="cpu", dtype=torch.bfloat16):
+        if name.endswith(".weight") and name.removesuffix(".weight") + ".trellis" in self.weight_map:
+            from ..exllamav3.modules.quant.exl3_lib.quantize import reconstruct_exl3_tensors
+
+            packed = self.packed_projection(name.removesuffix(".weight"), device)
+            # Serialized EXL3 reconstruction is [in, out], whereas source
+            # linear parameters use [out, in]. This is dense reference replay,
+            # not a claim that the fused serving kernel has been qualified.
+            value = reconstruct_exl3_tensors(packed, device=device, dtype=dtype).T.contiguous()
+            if not torch.isfinite(value).all():
+                raise ValueError("nonfinite reloaded EXL3 weight")
+            return value
         value = self.tensor(name, device)
         scale_name = name.removesuffix(".weight") + ".scale"
         if not name.endswith(".weight") or scale_name not in self.weight_map:
@@ -80,6 +96,32 @@ class V41Source:
             expanded = scale[start // 32].float().repeat_interleave(32)[:cols]
             result[start:start + 32] = value[start:start + 32].float() * expanded
         return result
+
+    def packed_projection(self, name, device="cpu"):
+        """Read only a routed EXL3 projection from standard indexed shards."""
+        match = re.fullmatch(r"(layers|mtp)\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])", name)
+        if match is None:
+            raise ValueError("EXL3 reload is restricted to routed V4.1 projections")
+        namespace, layer, expert, projection = match.groups()
+        layers, experts = (40, 384) if namespace == "layers" else (3, 128)
+        if int(layer) >= layers or int(expert) >= experts:
+            raise ValueError("EXL3 projection outside V4.1 architecture")
+        suffixes = self._projection_buffers.get(name, set())
+        if suffixes != {"trellis", "suh", "svh", "mcg"}:
+            raise ValueError("EXL3 projection must contain exactly four packed buffers")
+        packed = {suffix: self.tensor(name + "." + suffix, device) for suffix in sorted(suffixes)}
+        inputs, outputs = (2304, 5120) if projection == "w2" else (5120, 2304)
+        trellis, suh, svh, mcg = (packed[key] for key in ("trellis", "suh", "svh", "mcg"))
+        if (trellis.dtype != torch.int16 or trellis.ndim != 3
+                or tuple(trellis.shape[:2]) != (inputs // 16, outputs // 16)
+                or trellis.shape[-1] not in (48, 64)
+                or suh.dtype != torch.float16 or tuple(suh.shape) != (inputs,)
+                or svh.dtype != torch.float16 or tuple(svh.shape) != (outputs,)
+                or mcg.dtype != torch.int32 or mcg.numel() != 1):
+            raise ValueError("EXL3 packed geometry/dtype differs from V4.1 projection")
+        if not torch.isfinite(suh).all() or not torch.isfinite(svh).all():
+            raise ValueError("nonfinite reloaded EXL3 scales")
+        return packed
 
     def block_config(self, namespace="layers"):
         from transformers import DeepseekV41Config
