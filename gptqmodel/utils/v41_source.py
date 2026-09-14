@@ -80,7 +80,7 @@ class V41Source:
         return result
 
     @torch.no_grad()
-    def load_decoded_block(self, layer_index, device="cuda:0"):
+    def load_decoded_block(self, layer_index, device="cuda:0", *, native_kernels=None):
         from transformers import DeepseekV41Config
         from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41DecoderLayer
         from ..models.definitions.deepseek_v41 import DeepSeekV41Experts
@@ -96,6 +96,20 @@ class V41Source:
         expected = block.state_dict()
         for key, template in expected.items():
             source_key = source_layer_key(layer_index, key)
+            scale_key = source_key.removesuffix(".weight") + ".scale"
+            if (native_kernels is not None and key.endswith(".weight")
+                    and scale_key in self.weight_map and ".o_a_proj." not in key):
+                from .v41_native import V41NativeLinear
+
+                parent_key = key.removesuffix(".weight")
+                owner_key, _, leaf = parent_key.rpartition(".")
+                owner = block.get_submodule(owner_key) if owner_key else block
+                linear = V41NativeLinear(self.tensor(source_key, device),
+                                         self.tensor(scale_key, device), native_kernels)
+                if (linear.out_features, linear.in_features) != tuple(template.shape):
+                    raise ValueError(f"native V4.1 shape mismatch: {source_key}")
+                setattr(owner, leaf, linear)
+                continue
             value = self.decoded(source_key, device)
             if value.shape != template.shape:
                 raise ValueError(f"V4.1 shape mismatch: {source_key}: {value.shape} != {template.shape}")
@@ -114,6 +128,14 @@ class V41Source:
                 parent = block.get_submodule(parent_key) if parent_key else block
                 with torch.device(device):
                     setattr(parent, leaf, DeepseekV41RotaryEmbedding(config))
+        from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41RMSNorm
+        from ..models.definitions.deepseek_v41 import DeepSeekV41RMSNorm
+
+        for name, module in list(block.named_modules()):
+            if isinstance(module, DeepseekV41RMSNorm):
+                parent_key, _, leaf = name.rpartition(".")
+                parent = block.get_submodule(parent_key) if parent_key else block
+                setattr(parent, leaf, DeepSeekV41RMSNorm(module.weight.detach(), module.variance_epsilon))
         if any(tensor.is_meta for tensor in list(block.parameters()) + list(block.buffers())):
             raise ValueError("V4.1 block retains uninitialized meta tensors")
         return block.eval()

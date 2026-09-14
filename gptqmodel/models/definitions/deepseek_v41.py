@@ -14,6 +14,20 @@ from ...utils.ple_mmap import MappedPLETable
 from ..base import BaseQModel
 
 
+class DeepSeekV41RMSNorm(nn.Module):
+    """Weight multiplication precedes BF16 rounding in the checkpoint reference."""
+
+    def __init__(self, weight, eps):
+        super().__init__()
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.variance_epsilon = eps
+
+    def forward(self, hidden):
+        value = hidden.float()
+        value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + self.variance_epsilon)
+        return (self.weight * value).to(hidden.dtype)
+
+
 class DeepSeekV41MappedEmbedding(nn.Module):
     """Parameter-free PLE gather: file pages can be reclaimed independently."""
 
