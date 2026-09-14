@@ -49,8 +49,8 @@ def _save_state(state, path, *, provenance, kind):
             if any(type(key) not in (str, int) for key in value):
                 raise TypeError("frontier dictionary keys must be strings or integers")
             return ["dict", [[encode(key), encode(item)] for key, item in value.items()]]
-        if isinstance(value, tuple):
-            return ["tuple", [encode(item) for item in value]]
+        if isinstance(value, (tuple, list)):
+            return ["tuple" if isinstance(value, tuple) else "list", [encode(item) for item in value]]
         if value is None or type(value) in (str, int, float, bool):
             return ["scalar", value]
         raise TypeError(f"unsupported frontier value: {type(value).__name__}")
@@ -112,6 +112,8 @@ def _load_state(path, *, expected_sha256, expected_provenance, kind):
                     return {decode(key): decode(value) for key, value in payload}
                 if kind == "tuple":
                     return tuple(decode(value) for value in payload)
+                if kind == "list":
+                    return [decode(value) for value in payload]
                 if kind == "scalar":
                     return payload
                 raise ValueError("invalid frontier node")
