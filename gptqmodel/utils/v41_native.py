@@ -6,7 +6,7 @@ dtype. The kernel module is supplied by the caller from an authenticated source.
 
 import torch
 from torch import nn
-from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention
+from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention, DeepseekV41Indexer, select_candidate_blocks
 
 
 def reference_rotary(x, cos, sin, inverse=False):
@@ -19,6 +19,59 @@ def reference_rotary(x, cos, sin, inverse=False):
         coeff = coeff.unsqueeze(2)
     result[..., -width:] = torch.view_as_real(pairs * coeff).flatten(-2)
     return result
+
+
+class V41NativeIndexer(DeepseekV41Indexer):
+    """Bounded query scoring with the checkpoint's BF16 arithmetic and order."""
+
+    def forward(self, hidden_states, q_residual, latent, group_positions,
+                position_ids, cache_layer, shared):
+        if cache_layer is not None:
+            raise ValueError("native calibration indexer requires a full prompt")
+        kernels = self.v41_source_kernels
+        batch, length, _ = hidden_states.shape
+        if self.owns_k:
+            shared["index_k"] = None
+            if latent is not None:
+                key = self.k_norm(self.k_proj(latent))
+                cos, sin = self.rotary_emb(key, group_positions, "compress")
+                key = reference_rotary(key, cos, sin)
+                kernels.fp4_act_quant(key, 32, True)
+                shared["index_k"] = key.unsqueeze(1)
+        keys = shared.get("index_k")
+        if keys is None or keys.shape[2] == 0:
+            shared["topk_idx"] = None
+            if self.is_candidate_source:
+                shared["candidates"] = None
+            return
+        keys = keys[:, 0].to(hidden_states.device)
+        cos, sin = self.rotary_emb(hidden_states, position_ids, "compress")
+        query = self.q_b_proj(q_residual).view(batch, length, self.num_heads, self.head_dim)
+        query = reference_rotary(query, cos, sin)
+        kernels.fp4_act_quant(query, 32, True)
+        weights = self.weights_proj(hidden_states) * (self.softmax_scale * self.heads_scaling)
+        lengths = shared["compress_lens"].to(keys.device).unsqueeze(-1)
+        entries = torch.arange(keys.shape[1], device=keys.device)
+        top_k = min(self.index_topk, keys.shape[1])
+        candidates = shared.get("candidates") if self.uses_candidates else None
+        # 64 MiB score temporary, independent of model context capacity.
+        chunk = max(1, min(length, (32 * 1024 * 1024) // (batch * self.num_heads * keys.shape[1])))
+        selected, published = [], []
+        for start in range(0, length, chunk):
+            stop = start + chunk
+            scores = torch.einsum("bshd,btd->bsht", query[:, start:stop], keys)
+            scores = (scores.relu_() * weights[:, start:stop].unsqueeze(-1)).sum(dim=2)
+            scores.masked_fill_(entries >= lengths[:, start:stop], -torch.inf)
+            if self.is_candidate_source:
+                published.append(select_candidate_blocks(scores, lengths[:, start:stop],
+                                                          self.candidate_topk_blocks, self.candidate_block_size))
+            elif candidates is not None:
+                scores.masked_fill_(~candidates[:, start:stop].to(scores.device), -torch.inf)
+            indices = scores.topk(top_k, dim=-1, sorted=False).indices.sort(dim=-1).values
+            selected.append(torch.where(indices < lengths[:, start:stop], indices, -1))
+        shared["topk_idx"] = torch.cat(selected, dim=1)
+        if self.is_candidate_source:
+            shared["candidates"] = torch.cat(published, dim=1)
 
 
 class V41NativeAttention(DeepseekV41Attention):

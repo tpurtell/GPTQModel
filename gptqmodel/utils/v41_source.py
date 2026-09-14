@@ -140,8 +140,11 @@ class V41Source:
             raise ValueError("V4.1 block retains uninitialized meta tensors")
         if native_kernels is not None:
             block.self_attn.v41_source_kernels = native_kernels
-            from .v41_native import V41NativeAttention
+            from .v41_native import V41NativeAttention, V41NativeIndexer
             block.self_attn.__class__ = V41NativeAttention
+            if block.self_attn.indexer is not None:
+                block.self_attn.indexer.__class__ = V41NativeIndexer
+                block.self_attn.indexer.v41_source_kernels = native_kernels
             from ..models.definitions.deepseek_v41 import DeepSeekV41HyperConnection
             block.attn_hc = DeepSeekV41HyperConnection(block.attn_hc, native_kernels)
             block.ffn_hc = DeepSeekV41HyperConnection(block.ffn_hc, native_kernels)
