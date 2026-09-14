@@ -25,7 +25,7 @@ def _digest(stream):
     return digest.hexdigest()
 
 
-def save_frontier(batch, path, *, provenance):
+def _save_state(state, path, *, provenance, kind):
     """Publish an owned CPU snapshot by atomic rename; return its SHA-256.
 
     Provenance must bind source, corpus, recipe and implementation in the
@@ -33,8 +33,8 @@ def save_frontier(batch, path, *, provenance):
     code upgrade must explicitly migrate the run identity, never silently skip
     this check. Saving is synchronous: do not mutate the batch concurrently.
     """
-    if not isinstance(batch, V41ReplayBatch) or not isinstance(provenance, dict) or not provenance:
-        raise ValueError("a V4.1 replay batch and nonempty provenance are required")
+    if not isinstance(state, dict) or not isinstance(provenance, dict) or not provenance:
+        raise ValueError("V4.1 state and nonempty provenance are required")
     # Reject values JSON would silently normalize (e.g. integer mapping keys).
     if json.loads(json.dumps(provenance, allow_nan=False)) != provenance:
         raise ValueError("provenance must round-trip through JSON unchanged")
@@ -55,7 +55,7 @@ def save_frontier(batch, path, *, provenance):
             return ["scalar", value]
         raise TypeError(f"unsupported frontier value: {type(value).__name__}")
 
-    manifest = json.dumps(dict(version=1, provenance=provenance, state=encode(vars(batch))),
+    manifest = json.dumps(dict(version=1, kind=kind, provenance=provenance, state=encode(state)),
                           allow_nan=False, separators=(",", ":"))
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,7 +78,7 @@ def save_frontier(batch, path, *, provenance):
             os.unlink(temporary)
 
 
-def load_frontier(path, *, expected_sha256, expected_provenance):
+def _load_state(path, *, expected_sha256, expected_provenance, kind):
     """Verify journal digest and identity before allocating owned CPU state.
 
     Keep one open inode through verification and safetensors mapping so an
@@ -93,6 +93,10 @@ def load_frontier(path, *, expected_sha256, expected_provenance):
             manifest = json.loads(metadata["v41_frontier"])
             if manifest.get("version") != 1:
                 raise ValueError("unsupported V4.1 frontier version")
+            # Existing version-1 snapshots predate the explicit kind field and
+            # contain replay states only. They cannot be read as routed batches.
+            if manifest.get("kind", "replay") != kind:
+                raise ValueError("V4.1 frontier kind mismatch")
             if not expected_provenance or manifest.get("provenance") != expected_provenance:
                 raise ValueError("V4.1 frontier provenance mismatch")
             used = set()
@@ -115,6 +119,20 @@ def load_frontier(path, *, expected_sha256, expected_provenance):
             state = decode(manifest["state"])
             if used != set(reader.keys()):
                 raise ValueError("unreferenced frontier tensors")
+    return state
+
+
+def save_frontier(batch, path, *, provenance):
+    """Atomically save replay state; journal the returned digest after success."""
+    if not isinstance(batch, V41ReplayBatch):
+        raise ValueError("expected a V4.1 replay batch")
+    return _save_state(vars(batch), path, provenance=provenance, kind="replay")
+
+
+def load_frontier(path, *, expected_sha256, expected_provenance):
+    """Load owned replay state after verifying digest, kind and provenance."""
+    state = _load_state(path, expected_sha256=expected_sha256,
+                        expected_provenance=expected_provenance, kind="replay")
     batch = V41ReplayBatch(**state)
     if type(batch.next_layer) is not int or batch.next_layer < 0:
         raise ValueError("invalid frontier layer")
@@ -122,4 +140,22 @@ def load_frontier(path, *, expected_sha256, expected_provenance):
         raise ValueError("invalid frontier hidden state")
     if any(not isinstance(value, dict) for value in (batch.shared, batch.kwargs, batch.engram_rows)):
         raise ValueError("invalid frontier mappings")
+    return batch
+
+
+def save_routed_batch(batch, path, *, provenance):
+    """Atomically persist the reusable FFN frontier, never a completed block."""
+    from .v41_routed_batch import V41RoutedBatch
+    if not isinstance(batch, V41RoutedBatch):
+        raise ValueError("expected a V4.1 routed batch")
+    batch.validate()
+    return _save_state(vars(batch), path, provenance=provenance, kind="routed")
+
+
+def load_routed_batch(path, *, expected_sha256, expected_provenance):
+    from .v41_routed_batch import V41RoutedBatch
+    state = _load_state(path, expected_sha256=expected_sha256,
+                        expected_provenance=expected_provenance, kind="routed")
+    batch = V41RoutedBatch(**state)
+    batch.validate()
     return batch
