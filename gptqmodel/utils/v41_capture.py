@@ -9,7 +9,7 @@ import torch
 
 
 class V41Capture:
-    def __init__(self, block, expert_ids, *, device, chunk_rows=1024):
+    def __init__(self, block, expert_ids, *, device, chunk_rows=1024, phase="both"):
         self.block = block
         self.expert_ids = tuple(expert_ids)
         experts = block.mlp.experts
@@ -19,6 +19,9 @@ class V41Capture:
         if type(chunk_rows) is not int or chunk_rows < 1:
             raise ValueError("capture chunk size must be positive")
         self.device = torch.device(device)
+        if phase not in ("both", "gate_up", "down"):
+            raise ValueError("invalid projection capture phase")
+        self.phase = phase
         self.chunk_rows = chunk_rows
         self.handles = []
         self.failed = False
@@ -29,6 +32,8 @@ class V41Capture:
         for index in self.expert_ids:
             for family, width in (("gate_up", experts[index].gate_proj.in_features),
                                   ("down", experts[index].down_proj.in_features)):
+                if phase != "both" and family != phase:
+                    continue
                 key = index, family
                 self.hessians[key] = torch.zeros(width, width, device=device, dtype=torch.float32)
                 self.counts[key] = 0
@@ -70,6 +75,8 @@ class V41Capture:
             for index in self.expert_ids:
                 expert = self.block.mlp.experts[index]
                 for family, module in (("gate_up", expert.gate_proj), ("down", expert.down_proj)):
+                    if (index, family) not in self.hessians:
+                        continue
                     def hook(module, args, key=(index, family)):
                         self._capture(key, args)
                     self.handles.append(module.register_forward_pre_hook(hook))
@@ -77,6 +84,40 @@ class V41Capture:
             self.__exit__(None, None, None)
             raise
         return self
+
+    @torch.no_grad()
+    def capture_routed(self, batch):
+        """Capture a precomputed routed batch without replaying other experts.
+
+        Gate/up needs no expert GEMM at all. Down runs only selected experts'
+        gate/up and forms their route-weighted activation; no down GEMM is needed.
+        The router batch must come from this block's immutable input frontier.
+        """
+        if self.handles or self.failed:
+            raise RuntimeError("direct capture must be detached and healthy")
+        if self.device.type == "cuda" and torch.backends.cuda.matmul.allow_tf32:
+            raise ValueError("direct capture requires TF32 disabled")
+        try:
+            self._routes(None, (batch.hidden, batch.indices, batch.weights))
+            for index in self.expert_ids:
+                tokens, slots = torch.where(batch.indices == index)
+                if not tokens.numel():
+                    continue
+                inputs = batch.hidden[tokens].to(self.device)
+                if (index, "gate_up") in self.hessians:
+                    self._capture((index, "gate_up"), (inputs,))
+                if (index, "down") in self.hessians:
+                    expert = self.block.mlp.experts[index]
+                    gate, up = expert.gate_proj(inputs).float(), expert.up_proj(inputs).float()
+                    if expert.limit > 0:
+                        gate = gate.clamp(max=expert.limit)
+                        up = up.clamp(min=-expert.limit, max=expert.limit)
+                    weights = batch.weights[tokens, slots].to(self.device)
+                    intermediate = (torch.nn.functional.silu(gate) * up * weights[:, None]).to(inputs.dtype)
+                    self._capture((index, "down"), (intermediate,))
+        except BaseException:
+            self.failed = True
+            raise
 
     def __exit__(self, *exc):
         if exc and exc[0] is not None:

@@ -46,9 +46,21 @@ class V41Recovery:
                 remaining = self.target_count - len(self.coordinates[key])
                 if remaining > 0 and indices.numel():
                     indices = indices[:remaining]
-                    self.rows[key].append(inputs[indices].to("cpu", copy=True))
+                    self.rows[key].append(inputs[indices.to(inputs.device)].to("cpu", copy=True))
                     self.coordinates[key].extend((indices.cpu() + self.offset).tolist())
         self.offset += inputs.shape[0]
+
+    def observe_routed(self, batch):
+        """Reuse the captured router result without executing attention or MoE."""
+        if self.handle is not None or self.failed:
+            raise RuntimeError("direct recovery observation must be detached and healthy")
+        device = self.router.e_score_correction_bias.device
+        try:
+            self._observe(self.router, (batch.hidden,),
+                          (batch.logits.to(device), batch.weights.to(device), batch.indices.to(device)))
+        except BaseException:
+            self.failed = True
+            raise
 
     def __enter__(self):
         if self.handle is not None or self.failed:
