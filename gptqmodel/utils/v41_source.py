@@ -1,7 +1,9 @@
 """Bounded, one-tensor-at-a-time V4.1 source access.
 
 Decoded block loading is for numerical diagnostics and trellis source weights.
-It does not reproduce the native FP8 activation quantization of source GEMMs.
+Supplying native_kernels retains packed source linears and their activation
+quantization. The mtp namespace loads only dSpark core blocks, not its input
+projection, shared embedding or auxiliary output heads.
 """
 
 import json
@@ -79,22 +81,39 @@ class V41Source:
             result[start:start + 32] = value[start:start + 32].float() * expanded
         return result
 
-    @torch.no_grad()
-    def load_decoded_block(self, layer_index, device="cuda:0", *, native_kernels=None):
+    def block_config(self, namespace="layers"):
         from transformers import DeepseekV41Config
-        from ..models.definitions.deepseek_v41 import DeepSeekV41Experts, DeepSeekV41DecoderLayer
-
         config = DeepseekV41Config.from_dict(self.config).get_text_config()
-        if type(layer_index) is not int or not 0 <= layer_index < config.num_hidden_layers:
-            raise ValueError("main block index outside source config")
+        if namespace == "mtp":
+            config.num_hidden_layers = config.num_nextn_predict_layers
+            config.n_routed_experts = config.dspark_n_routed_experts
+            config.num_experts_per_tok = config.dspark_num_experts_per_tok
+            config.compress_ratios = [0] * config.num_hidden_layers
+            config.kv_source_layer_ids = []
+            config.index_source_layer_ids = []
+            config.candidate_source_layer_id = -1
+            config.engram_layer_ids = []
+        elif namespace != "layers":
+            raise ValueError("invalid V4.1 block namespace")
         config._experts_implementation = "eager"
         config._attn_implementation = "eager"
+        return config
+
+    @torch.no_grad()
+    def load_decoded_block(self, layer_index, device="cuda:0", *, native_kernels=None, namespace="layers"):
+        from ..models.definitions.deepseek_v41 import DeepSeekV41Experts, DeepSeekV41DecoderLayer
+
+        config = self.block_config(namespace)
+        if type(layer_index) is not int or not 0 <= layer_index < config.num_hidden_layers:
+            raise ValueError("block index outside source config")
+        if namespace == "mtp" and native_kernels is None:
+            raise ValueError("dSpark requires its native noncausal draft attention")
         with torch.device("meta"):
             block = DeepSeekV41DecoderLayer(config, layer_index)
             block.mlp.experts = DeepSeekV41Experts.from_fused(block.mlp.experts)
         expected = block.state_dict()
         for key, template in expected.items():
-            source_key = source_layer_key(layer_index, key)
+            source_key = source_layer_key(layer_index, key, namespace)
             scale_key = source_key.removesuffix(".weight") + ".scale"
             if (native_kernels is not None and key.endswith(".weight")
                     and scale_key in self.weight_map and ".o_a_proj." not in key):
@@ -142,6 +161,11 @@ class V41Source:
             block.self_attn.v41_source_kernels = native_kernels
             from .v41_native import V41NativeAttention, V41NativeIndexer
             block.self_attn.__class__ = V41NativeAttention
+            if namespace == "mtp":
+                from .v41_native import V41NativeDSparkAttention
+                block.self_attn.__class__ = V41NativeDSparkAttention
+                with torch.device(device):
+                    block.self_attn.compress_rotary = DeepSeekV41RotaryEmbedding(config)
             if block.self_attn.indexer is not None:
                 block.self_attn.indexer.__class__ = V41NativeIndexer
                 block.self_attn.indexer.v41_source_kernels = native_kernels

@@ -134,6 +134,53 @@ class V41NativeAttention(DeepseekV41Attention):
 
 
 
+class V41NativeDSparkAttention(DeepseekV41Attention):
+    """Draft block attention over an explicit main-history window and all drafts.
+
+    main_x contains projected main features at absolute positions 0..P. Keeping
+    this input explicit makes repeated quantization replay independent of caches.
+    The caller must provide at least two main positions, as the source's P=0
+    path only seeds caches and never executes routed experts.
+    """
+
+    def forward(self, hidden_states, shared, *, main_x, **kwargs):
+        if kwargs.get("past_key_values") is not None or self.compress_ratio:
+            raise ValueError("dSpark replay requires explicit history and no decode cache")
+        batch, drafts, _ = hidden_states.shape
+        if main_x.ndim != 3 or main_x.shape[0] != batch or main_x.shape[1] < 2:
+            raise ValueError("dSpark needs matching batch and at least two main-history positions")
+        kernels = self.v41_source_kernels
+        length = main_x.shape[1]
+        win = self.sliding_window
+        # Only the last window is needed. Scatter to the reference's ring order
+        # so sparse softmax visits keys in exactly the same order.
+        positions = torch.arange(max(0, length - win), length, device=hidden_states.device)[None]
+        main = main_x[:, -win:]
+        cos, sin = self.compress_rotary(main, position_ids=positions, layer_type="main")
+        main_kv = reference_rotary(self.kv_norm(self.kv_proj(main)), cos, sin)
+        kernels.act_quant(main_kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
+        window = torch.zeros(batch, win, self.head_dim, device=main_kv.device, dtype=main_kv.dtype)
+        window.index_copy_(1, positions[0] % win, main_kv)
+        draft_positions = torch.arange(length, length + drafts, device=hidden_states.device)[None]
+        cos, sin = self.compress_rotary(hidden_states, position_ids=draft_positions, layer_type="main")
+        qr = self.q_a_norm(self.q_a_proj(hidden_states))
+        q = reference_rotary(self.q_b_proj(qr).view(batch, drafts, self.num_heads, self.head_dim), cos, sin)
+        kv = reference_rotary(self.kv_norm(self.kv_proj(hidden_states)), cos, sin)
+        kernels.act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
+        bank = torch.cat((window, kv), dim=1)
+        indices = torch.cat((torch.arange(min(win, length), device=q.device),
+                             win + torch.arange(drafts, device=q.device)))
+        indices = indices.to(torch.int32).view(1, 1, -1).expand(batch, drafts, -1).contiguous()
+        output = torch.empty_like(q)
+        for start in range(0, self.num_heads, 16):
+            output[:, :, start:start + 16] = kernels.sparse_attn(
+                q[:, :, start:start + 16].contiguous(), bank,
+                self.sinks[start:start + 16].contiguous(), indices, self.scaling)
+        output = reference_rotary(output, cos, sin, inverse=True)
+        grouped = output.reshape(batch, drafts, self.config.o_groups, -1)
+        return self.o_b_proj(self.o_a_proj(grouped).flatten(2)), None
+
+
 class V41NativeLinear(nn.Module):
     def __init__(self, weight, scale, kernels):
         super().__init__()
