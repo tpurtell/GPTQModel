@@ -25,6 +25,42 @@ def _digest(stream):
     return digest.hexdigest()
 
 
+def _encode_state(value, tensors):
+    # Module-level recursion: an inner recursive function forms a reference
+    # cycle through its closure and retains all copied tensor payloads until GC.
+    if isinstance(value, torch.Tensor):
+        name = f"tensor_{len(tensors)}"
+        tensors[name] = value.detach().to(device="cpu", copy=True).contiguous()
+        return ["tensor", name]
+    if isinstance(value, dict):
+        if any(type(key) not in (str, int) for key in value):
+            raise TypeError("frontier dictionary keys must be strings or integers")
+        return ["dict", [[_encode_state(key, tensors), _encode_state(item, tensors)] for key, item in value.items()]]
+    if isinstance(value, (tuple, list)):
+        return ["tuple" if isinstance(value, tuple) else "list", [_encode_state(item, tensors) for item in value]]
+    if value is None or type(value) in (str, int, float, bool):
+        return ["scalar", value]
+    raise TypeError(f"unsupported frontier value: {type(value).__name__}")
+
+
+def _decode_state(node, reader, used):
+    kind, payload = node
+    if kind == "tensor":
+        if payload in used:
+            raise ValueError("aliased frontier tensor reference")
+        used.add(payload)
+        return reader.get_tensor(payload).clone()
+    if kind == "dict":
+        return {_decode_state(key, reader, used): _decode_state(value, reader, used) for key, value in payload}
+    if kind == "tuple":
+        return tuple(_decode_state(value, reader, used) for value in payload)
+    if kind == "list":
+        return [_decode_state(value, reader, used) for value in payload]
+    if kind == "scalar":
+        return payload
+    raise ValueError("invalid frontier node")
+
+
 def _save_state(state, path, *, provenance, kind):
     """Publish an owned CPU snapshot by atomic rename; return its SHA-256.
 
@@ -40,22 +76,7 @@ def _save_state(state, path, *, provenance, kind):
         raise ValueError("provenance must round-trip through JSON unchanged")
     tensors = {}
 
-    def encode(value):
-        if isinstance(value, torch.Tensor):
-            name = f"tensor_{len(tensors)}"
-            tensors[name] = value.detach().to(device="cpu", copy=True).contiguous()
-            return ["tensor", name]
-        if isinstance(value, dict):
-            if any(type(key) not in (str, int) for key in value):
-                raise TypeError("frontier dictionary keys must be strings or integers")
-            return ["dict", [[encode(key), encode(item)] for key, item in value.items()]]
-        if isinstance(value, (tuple, list)):
-            return ["tuple" if isinstance(value, tuple) else "list", [encode(item) for item in value]]
-        if value is None or type(value) in (str, int, float, bool):
-            return ["scalar", value]
-        raise TypeError(f"unsupported frontier value: {type(value).__name__}")
-
-    manifest = json.dumps(dict(version=1, kind=kind, provenance=provenance, state=encode(state)),
+    manifest = json.dumps(dict(version=1, kind=kind, provenance=provenance, state=_encode_state(state, tensors)),
                           allow_nan=False, separators=(",", ":"))
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,24 +122,7 @@ def _load_state(path, *, expected_sha256, expected_provenance, kind):
                 raise ValueError("V4.1 frontier provenance mismatch")
             used = set()
 
-            def decode(node):
-                kind, payload = node
-                if kind == "tensor":
-                    if payload in used:
-                        raise ValueError("aliased frontier tensor reference")
-                    used.add(payload)
-                    return reader.get_tensor(payload).clone()
-                if kind == "dict":
-                    return {decode(key): decode(value) for key, value in payload}
-                if kind == "tuple":
-                    return tuple(decode(value) for value in payload)
-                if kind == "list":
-                    return [decode(value) for value in payload]
-                if kind == "scalar":
-                    return payload
-                raise ValueError("invalid frontier node")
-
-            state = decode(manifest["state"])
+            state = _decode_state(manifest["state"], reader, used)
             if used != set(reader.keys()):
                 raise ValueError("unreferenced frontier tensors")
     return state
