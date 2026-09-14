@@ -134,6 +134,16 @@ class V41NativeAttention(DeepseekV41Attention):
 
 
 
+def dspark_joint_ring(main_kv, anchors, window_size):
+    """Gather independent reference-order rings from one already-projected prefix."""
+    slots = torch.arange(window_size, device=main_kv.device)
+    history = anchors[:, None] - ((anchors[:, None] - slots) % window_size)
+    valid = history >= 0
+    window = main_kv[0, history.clamp_min(0)].masked_fill(~valid[..., None], 0)
+    indices = slots[None].expand(anchors.numel(), -1).masked_fill(~valid, -1)
+    return window, indices
+
+
 class V41NativeDSparkAttention(DeepseekV41Attention):
     """Draft block attention over an explicit main-history window and all drafts.
 
@@ -143,34 +153,52 @@ class V41NativeDSparkAttention(DeepseekV41Attention):
     path only seeds caches and never executes routed experts.
     """
 
-    def forward(self, hidden_states, shared, *, main_x, **kwargs):
+    def forward(self, hidden_states, shared, *, main_x, anchor_positions=None, **kwargs):
         if kwargs.get("past_key_values") is not None or self.compress_ratio:
             raise ValueError("dSpark replay requires explicit history and no decode cache")
         batch, drafts, _ = hidden_states.shape
-        if main_x.ndim != 3 or main_x.shape[0] != batch or main_x.shape[1] < 2:
+        joint = anchor_positions is not None
+        if main_x.ndim != 3 or main_x.shape[0] != (1 if joint else batch) or main_x.shape[1] < 2:
             raise ValueError("dSpark needs matching batch and at least two main-history positions")
         kernels = self.v41_source_kernels
         length = main_x.shape[1]
         win = self.sliding_window
         # Only the last window is needed. Scatter to the reference's ring order
         # so sparse softmax visits keys in exactly the same order.
-        positions = torch.arange(max(0, length - win), length, device=hidden_states.device)[None]
-        main = main_x[:, -win:]
+        if joint and (anchor_positions.shape != (batch,) or anchor_positions.dtype != torch.long
+                      or anchor_positions.min() < 1 or anchor_positions.max() >= length
+                      or not torch.all(anchor_positions[1:] > anchor_positions[:-1])):
+            raise ValueError("invalid joint dSpark anchor positions")
+        positions = torch.arange(0 if joint else max(0, length - win), length,
+                                 device=hidden_states.device)[None]
+        main = main_x if joint else main_x[:, -win:]
         cos, sin = self.compress_rotary(main, position_ids=positions, layer_type="main")
         main_kv = reference_rotary(self.kv_norm(self.kv_proj(main)), cos, sin)
         kernels.act_quant(main_kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
-        window = torch.zeros(batch, win, self.head_dim, device=main_kv.device, dtype=main_kv.dtype)
-        window.index_copy_(1, positions[0] % win, main_kv)
-        draft_positions = torch.arange(length, length + drafts, device=hidden_states.device)[None]
+        if joint:
+            # Project each main row once, then gather each anchor's ring in the
+            # same slot order as the reference cache. No future key is exposed.
+            anchors = anchor_positions.to(hidden_states.device)
+            window, main_indices = dspark_joint_ring(main_kv, anchors, win)
+            draft_positions = anchors[:, None] + 1 + torch.arange(drafts, device=hidden_states.device)
+        else:
+            window = torch.zeros(batch, win, self.head_dim, device=main_kv.device, dtype=main_kv.dtype)
+            window.index_copy_(1, positions[0] % win, main_kv)
+            draft_positions = torch.arange(length, length + drafts, device=hidden_states.device)[None]
         cos, sin = self.compress_rotary(hidden_states, position_ids=draft_positions, layer_type="main")
         qr = self.q_a_norm(self.q_a_proj(hidden_states))
         q = reference_rotary(self.q_b_proj(qr).view(batch, drafts, self.num_heads, self.head_dim), cos, sin)
         kv = reference_rotary(self.kv_norm(self.kv_proj(hidden_states)), cos, sin)
         kernels.act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
         bank = torch.cat((window, kv), dim=1)
-        indices = torch.cat((torch.arange(min(win, length), device=q.device),
-                             win + torch.arange(drafts, device=q.device)))
-        indices = indices.to(torch.int32).view(1, 1, -1).expand(batch, drafts, -1).contiguous()
+        if joint:
+            draft_indices = (win + torch.arange(drafts, device=q.device))[None].expand(batch, -1)
+            indices = torch.cat((main_indices, draft_indices), dim=-1)[:, None].expand(-1, drafts, -1)
+        else:
+            indices = torch.cat((torch.arange(min(win, length), device=q.device),
+                                 win + torch.arange(drafts, device=q.device)))
+            indices = indices.view(1, 1, -1).expand(batch, drafts, -1)
+        indices = indices.to(torch.int32).contiguous()
         output = torch.empty_like(q)
         for start in range(0, self.num_heads, 16):
             output[:, :, start:start + 16] = kernels.sparse_attn(

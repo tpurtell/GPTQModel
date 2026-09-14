@@ -36,6 +36,36 @@ class V41DSparkInput(nn.Module):
         return hidden, main_x
 
     @torch.no_grad()
+    def prepare_joint(self, target_features, token_ids, *, positions):
+        """One original prompt, all selected anchors, one projected main prefix."""
+        if (token_ids.ndim != 2 or token_ids.shape[0] != 1
+                or token_ids.dtype not in (torch.int32, torch.int64)):
+            raise ValueError("joint dSpark preparation requires one integer-token source prompt")
+        if (positions.ndim != 1 or positions.dtype != torch.long or not positions.numel()
+                or positions.min() < 1 or positions.max() + 1 >= token_ids.shape[1]
+                or not torch.all(positions[1:] > positions[:-1])):
+            raise ValueError("joint anchors must be sorted distinct eligible positions")
+        length = int(positions[-1]) + 1
+        features = []
+        for layer in self.target_layer_ids:
+            value = target_features[layer]
+            if value.ndim != 3 or value.shape[0] != 1 or value.shape[1] < length:
+                raise ValueError("joint dSpark input lacks the shared target prefix")
+            features.append(value[:, :length])
+        device = self.main_norm.weight.device
+        main = torch.cat([value.to(device) for value in features], dim=-1)
+        main_x = self.main_norm(self.main_proj(main))
+        draft_ids = torch.full((positions.numel(), self.block_size), self.noise_token_id,
+                               dtype=torch.long, device=device)
+        draft_ids[:, 0] = token_ids[0, positions.to(token_ids.device) + 1].to(device)
+        hidden = self.embed(draft_ids).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        pre = torch.zeros(*hidden.shape[:3], device=device, dtype=torch.float32)
+        pre[..., 0] = 1
+        return V41ReplayBatch(0, owned_tree(hidden, "cpu"), owned_tree(pre, "cpu"), {},
+                              {"main_x": owned_tree(main_x, "cpu"),
+                               "anchor_positions": owned_tree(positions, "cpu")}, {})
+
+    @torch.no_grad()
     def prepare(self, target_features, token_ids, *, position):
         """Build owned replay for one teacher-forced draft position.
 
