@@ -141,7 +141,8 @@ class V41Source:
             for layer in config.engram_layer_ids:
                 prefix = f"layers.{layer}.engram.embed"
                 tables[str(layer)] = DeepSeekV41MappedEmbedding(
-                    self.snapshot / self.weight_map[prefix + ".weight"], prefix)
+                    self.snapshot / self.weight_map[prefix + ".weight"], prefix,
+                    scale_path=self.snapshot / self.weight_map[prefix + ".scale"])
             with torch.device(device):
                 rotary = DeepSeekV41RotaryEmbedding(config)
             return V41MainInput(embedding, hash_state.to(device), rotary, tables, config).eval()

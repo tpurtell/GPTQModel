@@ -72,9 +72,9 @@ class DeepSeekV41RMSNorm(nn.Module):
 class DeepSeekV41MappedEmbedding(nn.Module):
     """Parameter-free PLE gather: file pages can be reclaimed independently."""
 
-    def __init__(self, path, prefix, *, max_gather_rows=65536):
+    def __init__(self, path, prefix, *, scale_path=None, max_gather_rows=65536):
         super().__init__()
-        self.table = MappedPLETable(path, prefix, max_gather_rows=max_gather_rows)
+        self.table = MappedPLETable(path, prefix, scale_path=scale_path, max_gather_rows=max_gather_rows)
         self.num_embeddings = self.table.rows
         self.embedding_dim = self.table.width
 
