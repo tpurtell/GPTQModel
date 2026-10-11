@@ -131,7 +131,11 @@ class ForwardExecutor:
             return nullcontext()
 
         should_use_lifecycle = getattr(self.looper, "_should_use_moe_lifecycle", None)
-        if callable(should_use_lifecycle) and not should_use_lifecycle(module, processor):
+        if callable(should_use_lifecycle) and not should_use_lifecycle(
+            module,
+            processor,
+            current_subset=current_subset,
+        ):
             return nullcontext()
 
         return self.looper.MoELifecycleContext(
@@ -374,7 +378,13 @@ class ForwardExecutor:
                 self.looper._set_processor_mask(processor, keep_mask)
 
                 if not preserve_module_devices:
-                    rehome_module_to_device(module, cur_layer_device, move_parameters=True, move_buffers=True)
+                    rehome_module_to_device(
+                        module,
+                        cur_layer_device,
+                        move_parameters=True,
+                        move_buffers=True,
+                        root_module=getattr(self.looper.gptq_model, "model", None),
+                    )
 
                 with self._moe_forward_context(
                     module=module,
@@ -558,6 +568,7 @@ class ForwardExecutor:
                 module,
                 devices,
                 progress_callback=progress_cb,
+                root_module=getattr(self.looper.gptq_model, "model", None),
             )
         finally:
             if replica_pb is not None:

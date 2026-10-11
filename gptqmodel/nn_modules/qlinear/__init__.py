@@ -1,7 +1,8 @@
-# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
-# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2026 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2026 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
+# AWQ reference: MIT Han Lab, MIT License, https://github.com/mit-han-lab/llm-awq
 import copy
 import math
 import os
@@ -34,6 +35,33 @@ from ...utils.safe import THREADPOOLCTL
 
 
 log = setup_logger()
+
+
+def input_rows(x: t.Tensor) -> int:
+    """Return the number of logical Linear rows in an arbitrary-rank input.
+
+    Linear treats every dimension before the final feature dimension as a
+    batch dimension, so a 4D input has ``B * S * T`` matrix rows.
+    """
+
+    if x.ndim == 0:
+        raise ValueError("Linear input must have at least one dimension")
+    return math.prod(x.shape[:-1])
+
+
+def empty_linear_output(x: t.Tensor, out_features: int) -> t.Tensor:
+    """Allocate an empty Linear output while preserving rank, dtype, device."""
+
+    shape = x.shape[:-1] + (out_features,)
+    if x.requires_grad:
+        # Keep the empty path connected to the input so callers can backprop
+        # through an empty batch just like through nn.Linear (with zero grad).
+        return x.sum(dim=-1, keepdim=True).expand(shape) * 0
+    return t.empty(
+        shape,
+        dtype=x.dtype,
+        device=x.device,
+    )
 
 
 # Packed quantized weights are unpacked through shift operations in several
@@ -217,6 +245,22 @@ class BaseQuantLinear(nn.Module):
         buffers = self.list_buffers()
         return buffers[0].device if buffers else None
 
+    def input_rows(self, x: t.Tensor) -> int:
+        return input_rows(x)
+
+    def empty_linear_output(self, x: t.Tensor) -> t.Tensor:
+        """Return an empty output for any-rank Linear input.
+
+        Applying an adapter is intentional: it preserves the same composition
+        semantics as the non-empty path while still avoiding a native M=0
+        kernel launch. Bias addition has no observable effect for zero elements.
+        """
+
+        out = empty_linear_output(x, self.out_features)
+        if self.adapter is not None:
+            out = self.adapter.apply(x=x, out=out)
+        return out
+
     def smooth_block_size(self) -> int:
         return -1
 
@@ -232,6 +276,27 @@ class BaseQuantLinear(nn.Module):
                 device=device,
                 lora_A=getattr(self, "lora_A", None),
                 lora_B=getattr(self, "lora_B", None))
+
+    # public/stable api exposed to external integrations (optimum, auto-round, ...)
+    def hf_pack(
+            self,
+            linear: nn.Module,
+            scales: t.Tensor,
+            zeros: Optional[t.Tensor] = None,
+            g_idx: Optional[t.Tensor] = None,
+            **kwargs,
+    ):
+        """Stable (`hf_`-prefixed) layer packing entry point.
+
+        Wraps :func:`gptqmodel.utils.packing.hf_pack_layer` so external
+        integrators never need to call the internal
+        ``pack``/``pack_block``/``pack_original`` implementations directly.
+        See that function for the full argument contract (``pack_impl``,
+        ``device``, ``post_init``, ...).
+        """
+        from ...utils.packing import hf_pack_layer
+
+        return hf_pack_layer(self, linear, scales, zeros, g_idx, **kwargs)
 
     def clear_autotune(self):
         self._autotune_complete = False
@@ -282,7 +347,7 @@ class BaseQuantLinear(nn.Module):
             pack_dtype:t.dtype=None,
             dtype: Optional[t.dtype]=None,
             dynamic:Optional[dict]=None,
-            device:Optional[DEVICE]=None,
+            device:Optional[DEVICE | t.device]=None,
             trainable:Optional[bool]=None,
             adapter:Optional[Adapter]=None,
     ) -> Tuple[
@@ -337,7 +402,7 @@ class BaseQuantLinear(nn.Module):
         *,
         pack_dtype:t.dtype=None,
         dtype: Optional[t.dtype]=None,
-        device:Optional[DEVICE]=None,
+        device:Optional[DEVICE | t.device]=None,
         trainable:Optional[bool]=None,
         adapter:Optional[Adapter]=None,
     ) -> Tuple[bool, Optional[Exception]]:
@@ -421,7 +486,7 @@ class BaseQuantLinear(nn.Module):
 
     @classmethod
     def _validate(cls, bits: int=4, group_size: int=128, desc_act: bool=False, sym: bool=False, pack_dtype:t.dtype=None, dtype: Optional[t.dtype]=None, dynamic:Optional[dict]=None, in_features:int=None,
-                  out_features:int=None, device:Optional[DEVICE]=None, trainable:Optional[bool]=None, adapter:Optional[Adapter]=None) -> Tuple[bool, Optional[Exception]]:
+                  out_features:int=None, device:Optional[DEVICE | t.device]=None, trainable:Optional[bool]=None, adapter:Optional[Adapter]=None) -> Tuple[bool, Optional[Exception]]:
         ok, err = cls._validate_shared(
             pack_dtype=pack_dtype,
             dtype=dtype,
@@ -446,10 +511,19 @@ class BaseQuantLinear(nn.Module):
         )
 
     @classmethod
-    def validate_device(cls, device: DEVICE):
-        assert isinstance(device, DEVICE)
+    def validate_device(cls, device: DEVICE | t.device):
+        # DEVICE declarations describe support families.  Keep concrete
+        # torch.device values intact for specialized kernels, while mapping
+        # them to a family for this common declaration check.
+        if isinstance(device, t.device):
+            try:
+                family = DEVICE(device.type)
+            except ValueError:
+                family = device.type
+        else:
+            family = device
 
-        if device not in cls.SUPPORTS_DEVICES:
+        if family not in cls.SUPPORTS_DEVICES:
             raise NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_DEVICES}`: actual device = `{device}`")
 
     # use optimize so we don't override native module.compile()
@@ -597,7 +671,7 @@ class GroupedQuantLinear(BaseQuantLinear):
 
     @classmethod
     def _validate(cls, bits: int=4, group_size: int=128, desc_act: bool=False, sym: bool=False, pack_dtype:t.dtype=None, dtype: Optional[t.dtype]=None, dynamic:Optional[dict]=None, in_features:int=None,
-                  out_features:int=None, device:Optional[DEVICE]=None, trainable:Optional[bool]=None, adapter:Optional[Adapter]=None) -> Tuple[bool, Optional[Exception]]:
+                  out_features:int=None, device:Optional[DEVICE | t.device]=None, trainable:Optional[bool]=None, adapter:Optional[Adapter]=None) -> Tuple[bool, Optional[Exception]]:
         ok, err = super()._validate(
             bits=bits,
             group_size=group_size,
@@ -796,7 +870,7 @@ class GPTQQuantLinear(PackedGroupedQuantLinear):
 
     @classmethod
     def _validate(cls, bits: int=4, group_size: int=128, desc_act: bool=False, sym: bool=False, pack_dtype:t.dtype=None, dtype: Optional[t.dtype]=None, dynamic:Optional[dict]=None, in_features:int=None,
-                  out_features:int=None, device:Optional[DEVICE]=None, trainable:Optional[bool]=None, adapter:Optional[Adapter]=None) -> Tuple[bool, Optional[Exception]]:
+                  out_features:int=None, device:Optional[DEVICE | t.device]=None, trainable:Optional[bool]=None, adapter:Optional[Adapter]=None) -> Tuple[bool, Optional[Exception]]:
         ok, err = super()._validate(
             bits=bits,
             group_size=group_size,
@@ -964,7 +1038,8 @@ class PackableQuantLinear(GPTQQuantLinear):
                 t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
                 self.wf_unsqueeze_zero  # self.wf.unsqueeze(0),
             ).to(self.dequant_dtype)
-            zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
+            zeros = t.bitwise_and(zeros, self.maxq).reshape(self.qzeros.shape[0], -1)
+            zeros = zeros[:, :self.scales.shape[1]]
 
             weight = t.bitwise_and(
                 _torch_right_shift(
@@ -1549,16 +1624,8 @@ class PackableQuantLinear(GPTQQuantLinear):
             qweight = np.zeros((math.ceil(int_weight.shape[0] * self.bits / self.pack_dtype_bits), int_weight.shape[1]),
                                dtype=self.pack_np_math_dtype)
             if self.bits in [2, 4, 8]:
-                if is_embedding:
-                    packed_rows = qweight.shape[0] * self.pack_factor
-                    if int_weight.shape[0] < packed_rows:
-                        int_weight = np.pad(
-                            int_weight,
-                            ((0, packed_rows - int_weight.shape[0]), (0, 0)),
-                            mode="constant",
-                        )
                 for row in range(qweight.shape[0]):
-                    for j in range(self.pack_factor):
+                    for j in range(min(self.pack_factor, int_weight.shape[0] - row * self.pack_factor)):
                         qweight[row] |= int_weight[row * self.pack_factor + j] << (self.bits * j)
             elif self.bits == 3 and not self.planar:
                 i = 0
@@ -1602,7 +1669,7 @@ class PackableQuantLinear(GPTQQuantLinear):
             qzeros = np.zeros((zeros.shape[0], math.ceil(zeros.shape[1] * self.bits / self.pack_dtype_bits)), dtype=self.pack_np_math_dtype)
             if self.bits in [2, 4, 8]:
                 for col in range(qzeros.shape[1]):
-                    for j in range(self.pack_factor):
+                    for j in range(min(self.pack_factor, zeros.shape[1] - col * self.pack_factor)):
                         qzeros[:, col] |= zeros[:, col * self.pack_factor + j] << (self.bits * j)
             elif self.bits == 3 and not self.planar:
                 i = 0
@@ -1668,12 +1735,12 @@ class AWQuantLinear(PackedGroupedQuantLinear):
         if register_buffers:
             self.register_buffer(
                 "qweight",
-                t.zeros((in_features, out_features // (self.pack_dtype_bits // self.bits)), dtype=self.pack_dtype),
+                t.zeros((in_features, math.ceil(out_features * self.bits / self.pack_dtype_bits)), dtype=self.pack_dtype),
             )
             self.register_buffer(
                 "qzeros",
                 t.zeros(
-                    (in_features // self.group_size, out_features // (self.pack_dtype_bits // self.bits)),
+                    (in_features // self.group_size, math.ceil(out_features * self.bits / self.pack_dtype_bits)),
                     dtype=self.pack_dtype,
                 ),
             )

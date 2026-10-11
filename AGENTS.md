@@ -1,6 +1,21 @@
+<!-- SPDX-FileCopyrightText: 2026 ModelCloud.ai
+SPDX-License-Identifier: Apache-2.0 -->
+
 # GPT-QModel agent guidance
 
 This file governs the whole repository in addition to any parent agent instructions.
+
+## Numerical oracle validation
+
+For any new or changed quantization math, weight packer, or inference kernel,
+read and follow `$gptqmodel-torch-oracle-numerics` in
+`.agents/skills/gptqmodel-torch-oracle-numerics/SKILL.md` before editing.
+
+For every MLX inference kernel, test FP16 and BF16 activations independently.
+Assert that each supported path returns the input activation dtype, and measure
+accuracy drift against an independent Torch oracle for both dtypes. Follow the
+skill's output-rounding guidance and report arithmetic error separately from
+the visible low-precision output error.
 
 ## Tokenizer normalization ownership
 

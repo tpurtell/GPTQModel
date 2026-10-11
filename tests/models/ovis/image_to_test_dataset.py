@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
+from gptqmodel.models.definitions.zdtaichu5 import ZDTaichu5QModel
 from gptqmodel.models.definitions.apertus import Apertus1p5QModel
 from gptqmodel.models.definitions.base_qwen2_5_omni import BaseQwen2_5_OmniGPTQ
 from gptqmodel.models.definitions.base_qwen2_vl import BaseQwen2VLGPTQ
@@ -10,11 +11,13 @@ from gptqmodel.models.definitions.cohere_compass import CohereCompassQModel
 from gptqmodel.models.definitions.deepseek_ocr2 import DeepSeekOCR2QModel
 from gptqmodel.models.definitions.deepseek_vl import DeepSeekVLQModel
 from gptqmodel.models.definitions.deepseek_vl_v2 import DeepSeekVLV2QModel
+from gptqmodel.models.definitions.diffusion_gemma import DiffusionGemmaQModel
 from gptqmodel.models.definitions.ernie4_5_vl_moe import Ernie4_5_VLMoeQModel
 from gptqmodel.models.definitions.hunyuan_vl import HunYuanVLQModel
 from gptqmodel.models.definitions.inkling import InklingMMQModel
 from gptqmodel.models.definitions.intern_s2_preview import InternS2PreviewQModel
 from gptqmodel.models.definitions.interns1 import InternS1QModel
+from gptqmodel.models.definitions.internvl import InternVLQModel
 from gptqmodel.models.definitions.internvl_chat import InternVLChatQModel
 from gptqmodel.models.definitions.lfm2_vl import LFM2VLQModel
 from gptqmodel.models.definitions.locateanything import LocateAnythingQModel
@@ -26,6 +29,7 @@ from gptqmodel.models.definitions.ovis import OvisQModel
 from gptqmodel.models.definitions.ovis2 import Ovis2QModel
 from gptqmodel.models.definitions.ovis2_5 import Ovis2_5QModel
 from gptqmodel.models.definitions.ovis2_6_moe import Ovis2_6_MoeQModel
+from gptqmodel.models.definitions.smolvlm import SmolVLMQModel
 from gptqmodel.models.definitions.unlimited_ocr import UnlimitedOCRQModel
 
 
@@ -235,16 +239,20 @@ def get_calib_dataset(model):
     if (
         isinstance(model, BaseQwen2VLGPTQ)
         or isinstance(model, BaseQwen3VLGPTQ)
+        or isinstance(model, DiffusionGemmaQModel)
         or isinstance(model, MiniCPMOQModel)
         or isinstance(model, MiniCPMVQModel)
         or isinstance(model, MiniCPMV4_6QModel)
         or isinstance(model, InternS1QModel)
         or isinstance(model, InternS2PreviewQModel)
+        or isinstance(model, InternVLQModel)
         or isinstance(model, InternVLChatQModel)
         or isinstance(model, InklingMMQModel)
         or isinstance(model, Ernie4_5_VLMoeQModel)
         or isinstance(model, LFM2VLQModel)
         or isinstance(model, MuseGlimmerQModel)
+        or isinstance(model, SmolVLMQModel)
+        or isinstance(model, ZDTaichu5QModel)
     ):
         return prepare_dataset(format_qwen2_vl_dataset, n_sample=20)
 

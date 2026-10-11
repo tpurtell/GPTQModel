@@ -234,16 +234,24 @@ class AwqMarlinLinear(AWQuantLinear):
         return True, None
 
     @classmethod
-    def validate_device(cls, device: DEVICE):
+    def validate_device(cls, device: DEVICE | torch.device):
         super().validate_device(device)
-        if device == DEVICE.CUDA:
+        if (device.type if isinstance(device, torch.device) else device) in ("cuda", DEVICE.CUDA):
             if IS_ROCM:
                 raise NotImplementedError("Marlin kernel is not supported on ROCm.")
-
-            if not _marlin_all_visible_devices_supported(
-                _AWQ_MARLIN_MIN_CAPABILITY
-            ):
-                raise NotImplementedError("Marlin kernel only supports compute capability >= 8.0.")
+            if isinstance(device, DEVICE):
+                if not _marlin_all_visible_devices_supported(_AWQ_MARLIN_MIN_CAPABILITY):
+                    raise NotImplementedError("Marlin kernel only supports compute capability >= 8.0.")
+                return
+            target = device if isinstance(device, torch.device) else device.to_torch_device()
+            try:
+                marlin_validate_runtime_device(
+                    target,
+                    min_capability=_AWQ_MARLIN_MIN_CAPABILITY,
+                    backend_name="AWQ Marlin",
+                )
+            except ValueError as exc:
+                raise NotImplementedError(str(exc)) from exc
 
     def post_init(self):
         device = self.qweight.device
@@ -342,6 +350,8 @@ class AwqMarlinLinear(AWQuantLinear):
         super().post_init()
 
     def forward(self, x: torch.Tensor):
+        if self.input_rows(x) == 0:
+            return self.empty_linear_output(x)
         assert self.workspace.numel() > 0, (
             "module.post_init() must be called before module.forward(). "
             "Use marlin_post_init() on the whole model."

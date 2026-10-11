@@ -26,6 +26,7 @@ from .cpp import (
     is_nvcc_compatible,
 )
 from .marlin_scalar_type import ScalarType
+from .marlin_scratch import active_marlin_scratch_context
 from .rocm import IS_ROCM
 
 
@@ -87,11 +88,18 @@ def marlin_validate_runtime_device(
     return capability
 
 
-def _marlin_environment_error() -> str:
+def _marlin_build_environment_error() -> str:
     if IS_ROCM:
         return "Marlin kernel is not supported on ROCm."
     if not torch.cuda.is_available():
         return "Marlin kernel requires CUDA."
+    return ""
+
+
+def _marlin_environment_error() -> str:
+    build_error = _marlin_build_environment_error()
+    if build_error:
+        return build_error
     try:
         major, minor = torch.cuda.get_device_capability()
     except Exception as exc:  # pragma: no cover - depends on host CUDA runtime
@@ -101,7 +109,9 @@ def _marlin_environment_error() -> str:
     return ""
 
 
-marlin_import_exception = _marlin_environment_error() or None
+# Import/JIT availability must not freeze the capability of whichever device
+# happened to be current. Exact capability checks run in validate_device().
+marlin_import_exception = _marlin_build_environment_error() or None
 
 
 def _marlin_root() -> Path:
@@ -234,7 +244,12 @@ def _marlin_extra_cuda_cflags() -> list[str]:
 _MARLIN_FP16_TORCH_OPS_EXTENSION = TorchOpsJitExtension(
     name=_MARLIN_FP16_OPS_NAME,
     namespace=_MARLIN_FP16_NAMESPACE,
-    required_ops=("gptq_marlin_gemm_fp16", "gptq_marlin_repack", "awq_marlin_repack"),
+    required_ops=(
+        "gptq_marlin_gemm_fp16",
+        "marlin_scratch_sizes",
+        "gptq_marlin_repack",
+        "awq_marlin_repack",
+    ),
     sources=lambda: _marlin_sources("fp16"),
     build_root_env="GPTQMODEL_MARLIN_FP16_BUILD_ROOT",
     default_build_root=lambda: default_torch_ops_build_root("marlin_fp16"),
@@ -252,7 +267,12 @@ _MARLIN_FP16_TORCH_OPS_EXTENSION = TorchOpsJitExtension(
 _MARLIN_BF16_TORCH_OPS_EXTENSION = TorchOpsJitExtension(
     name=_MARLIN_BF16_OPS_NAME,
     namespace=_MARLIN_BF16_NAMESPACE,
-    required_ops=("gptq_marlin_gemm_bf16", "gptq_marlin_repack", "awq_marlin_repack"),
+    required_ops=(
+        "gptq_marlin_gemm_bf16",
+        "marlin_scratch_sizes",
+        "gptq_marlin_repack",
+        "awq_marlin_repack",
+    ),
     sources=lambda: _marlin_sources("bf16"),
     build_root_env="GPTQMODEL_MARLIN_BF16_BUILD_ROOT",
     default_build_root=lambda: default_torch_ops_build_root("marlin_bf16"),
@@ -320,8 +340,25 @@ def _marlin_resolve_op(
     return _extension_api().op(_marlin_kernel_name_for_dtype(dtype), op_name)
 
 
+def marlin_scratch_sizes(
+        a: torch.Tensor,
+        size_m: int,
+        size_k: int,
+        use_fp32_reduce: bool,
+        has_act_order: bool,
+) -> Tuple[int, int]:
+    """Return ``(c_tmp_elements, a_tmp_elements)`` for one Marlin shape."""
+    op = _marlin_resolve_op(dtype=a.dtype, op_name="marlin_scratch_sizes")
+    sizes = op(a, size_m, size_k, use_fp32_reduce, has_act_order)
+    if hasattr(sizes, "tolist"):
+        sizes = sizes.tolist()
+    if not isinstance(sizes, (tuple, list)) or len(sizes) != 2:
+        raise RuntimeError(f"Marlin scratch size op returned invalid value: {sizes!r}")
+    return int(sizes[0]), int(sizes[1])
+
+
 # Validate marlin support
-def _validate_marlin_device_support() -> bool:
+def _validate_marlin_device_support(device: Optional[torch.device] = None) -> bool:
     """
     Validates if the current device is compatible for Marlin.
     ref: https://github.com/IST-DASLab/marlin?tab=readme-ov-file#requirements
@@ -331,7 +368,12 @@ def _validate_marlin_device_support() -> bool:
     """
     if IS_ROCM or not torch.cuda.is_available():
         return False
-    major, minor = torch.cuda.get_device_capability()
+    target = torch.device(device) if device is not None else None
+    major, minor = (
+        torch.cuda.get_device_capability(target)
+        if target is not None
+        else torch.cuda.get_device_capability()
+    )
     return _marlin_capability_supported(major, minor)
 
 
@@ -812,36 +854,82 @@ def gptq_marlin_gemm(a: torch.Tensor,
                      is_k_full: bool = True,
                      use_atomic_add: bool = False,
                      use_fp32_reduce: bool = False,
-                     is_zp_float: bool = False) -> torch.Tensor:
-    if _marlin_runtime_dtype(a.dtype) == torch.bfloat16:
-        op_name = "gptq_marlin_gemm_bf16"
+                     is_zp_float: bool = False,
+                     c_tmp: Optional[torch.Tensor] = None,
+                     a_tmp: Optional[torch.Tensor] = None) -> torch.Tensor:
+    # The context owns the lock workspace as well as the optional
+    # reduction/activation buffers for the duration of this call.
+    context = active_marlin_scratch_context()
+    context_borrowed = False
+    if context is not None:
+        if c_tmp is not None or a_tmp is not None:
+            raise ValueError(
+                "Explicit Marlin scratch cannot be mixed with MarlinScratchContext"
+            )
+        # The backend's empty-M short circuit must remain untouched.  This
+        # also avoids capacity queries and manager allocations for M == 0.
+        if a.ndim < 2 or a.shape[0] == 0 or a.shape[1] == 0:
+            context._check_owner()
+            use_owned_scratch = False
+        else:
+            has_act_order = bool(
+                g_idx is not None
+                and perm is not None
+                and g_idx.numel() > 0
+                and perm.numel() > 0
+            )
+            c_tmp, a_tmp, context_workspace = context.acquire(
+                a,
+                size_m=size_m,
+                size_k=size_k,
+                use_fp32_reduce=use_fp32_reduce,
+                has_act_order=has_act_order,
+            )
+            workspace = context_workspace
+            context_borrowed = True
+            use_owned_scratch = c_tmp is not None or a_tmp is not None
     else:
-        op_name = "gptq_marlin_gemm_fp16"
+        use_owned_scratch = c_tmp is not None or a_tmp is not None
 
-    op = _marlin_resolve_op(
-        dtype=a.dtype,
-        op_name=op_name,
-    )
-    return op(
-        a,
-        c,
-        b_q_weight,
-        b_bias,
-        b_scales,
-        global_scale,
-        b_zeros,
-        g_idx,
-        perm,
-        workspace,
-        b_q_type.id,
-        size_m,
-        size_n,
-        size_k,
-        is_k_full,
-        use_atomic_add,
-        use_fp32_reduce,
-        is_zp_float,
-    )
+    try:
+        if _marlin_runtime_dtype(a.dtype) == torch.bfloat16:
+            op_name = "gptq_marlin_gemm_bf16"
+        else:
+            op_name = "gptq_marlin_gemm_fp16"
+
+        op = _marlin_resolve_op(
+            dtype=a.dtype,
+            op_name=op_name,
+        )
+        arguments = (
+            a,
+            c,
+            b_q_weight,
+            b_bias,
+            b_scales,
+            global_scale,
+            b_zeros,
+            g_idx,
+            perm,
+            workspace,
+            b_q_type.id,
+            size_m,
+            size_n,
+            size_k,
+            is_k_full,
+            use_atomic_add,
+            use_fp32_reduce,
+            is_zp_float,
+        )
+        if use_owned_scratch:
+            # Keep the historical 18-argument ABI for the default path.  The
+            # appended arguments are only sent to extensions built with the
+            # caller-owned scratch ABI.
+            return op(*arguments, c_tmp, a_tmp)
+        return op(*arguments)
+    finally:
+        if context_borrowed:
+            context.release()
 
 
 # gptq_marlin

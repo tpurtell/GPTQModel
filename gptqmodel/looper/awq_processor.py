@@ -347,6 +347,23 @@ class AWQProcessor(LoopProcessor):
                 self._layer_states[layer_index] = state
         return state
 
+    def continuation_state_dict(self):
+        state = super().continuation_state_dict()
+        state["awq"] = {
+            "avg_losses": self.avg_losses,
+            "nsamples": self.nsamples,
+            "nsamples_total": self._nsamples_total,
+            "quant_batch_size": self._quant_batch_size,
+        }
+        return state
+
+    def load_continuation_state_dict(self, state):
+        super().load_continuation_state_dict(state)
+        self.avg_losses = state["awq"]["avg_losses"]
+        self.nsamples = state["awq"]["nsamples"]
+        self._nsamples_total = state["awq"]["nsamples_total"]
+        self._quant_batch_size = state["awq"]["quant_batch_size"]
+
     def _initialize_sample_counts(self) -> None:
         """Computes sample and token totals from the calibration dataset."""
 
@@ -2397,7 +2414,7 @@ class AWQProcessor(LoopProcessor):
         assert q_zeros.device == CPU
         assert q_scales.device == CPU
         quant_linear_cls = self._resolve_qlinear_kernel(module.full_name)
-        layers = find_modules(self.gptq_model.model)
+        layers = {module.full_name: self.gptq_model.model.get_submodule(module.full_name)}
         module_label = getattr(module, "full_name", getattr(module, "name", ""))
         parent_key = getattr(module, "full_name", getattr(module, "name", None))
         # replace module with quantized module
@@ -2424,6 +2441,7 @@ class AWQProcessor(LoopProcessor):
                     pack_dtype=self.qcfg.pack_dtype,
                     format=self.format,
                     register_buffers=False,
+                    dtype=module.weight.dtype,
                 )
         if timer is not None and create_start is not None:
             timer.record(
@@ -2432,11 +2450,12 @@ class AWQProcessor(LoopProcessor):
                 source=module_label,
             )
         # pack module
-        qModules = {
-            name: submodule
-            for name, submodule in find_modules(self.gptq_model.model, [quant_linear_cls]).items()
-            if name == module.full_name
-        }
+        qmodule = self.gptq_model.model.get_submodule(module.full_name)
+        qModules = (
+            {module.full_name: qmodule}
+            if isinstance(qmodule, quant_linear_cls)
+            else {}
+        )
         pack_start = time.perf_counter() if timer is not None else None
         with log_time_block(
                 "pack",

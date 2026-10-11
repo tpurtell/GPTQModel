@@ -4,11 +4,16 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import copy
+import hashlib
 import json
 import math
 import os.path
 import tempfile
+import threading
+import weakref
 from abc import ABC, abstractmethod
+from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from functools import total_ordering
@@ -200,6 +205,7 @@ class PreProcessorCode(str, Enum):
 _GGUF_BITS_ALIAS_INFO = {
     "q1_0": {"bits": 1, "version": "q", "variant": "0", "quality": None},
     "q1_0_g128": {"bits": 1, "version": "q", "variant": "0", "quality": "g128"},
+    "q2_0": {"bits": 2, "version": "q", "variant": "0", "quality": None},
     "q4_0": {"bits": 4, "version": "q", "variant": "0", "quality": None},
     "q8_0": {"bits": 8, "version": "q", "variant": "0", "quality": None},
     "q4_k": {"bits": 4, "version": "q", "variant": "k", "quality": None},
@@ -212,14 +218,16 @@ _GGUF_BITS_ALIAS_INFO = {
 }
 _GGUF_DEFAULT_BITS_ALIAS_BY_WIDTH = {
     1: "q1_0",
+    2: "q2_0",
     4: "q4_0",
     5: "q5_k_m",
     6: "q6_k",
     8: "q8_0",
 }
 _GGUF_APPROX_BITS_PER_WEIGHT_BY_ALIAS = {
-    "q1_0": 1.5,
+    "q1_0": 1.125,
     "q1_0_g128": 1.125,
+    "q2_0": 2.25,
     "q4_0": 4.5,
     "q8_0": 8.5,
     "q4_k": 4.5,
@@ -1173,6 +1181,11 @@ class AutoModuleDecoderConfig(BasePreProcessorConfig):
     code: ClassVar[str] = PreProcessorCode.AUTO_MODULE_DECODER.value
     source_dtype: str = "auto"
     target_dtype: Union[str, torch.dtype] = torch.bfloat16
+    # ``native`` is an optional first-pass execution view.  ``decode`` is the
+    # portable fallback used when a source dtype or wrapper is unavailable.
+    passthrough_forward_policy: str = "native"
+    # Saved artifacts must contain standard dense/W4 weights, never a wrapper.
+    passthrough_save_policy: str = "decode"
 
     def __post_init__(self):
         """Normalize the decoder payload into canonical string and dtype values."""
@@ -1195,12 +1208,28 @@ class AutoModuleDecoderConfig(BasePreProcessorConfig):
             )
         self.target_dtype = normalized_dtype
 
+        forward_policy = str(self.passthrough_forward_policy).strip().lower()
+        if forward_policy not in {"native", "decode"}:
+            raise ValueError(
+                "AutoModuleDecoderConfig: `passthrough_forward_policy` must be `native` or `decode`."
+            )
+        self.passthrough_forward_policy = forward_policy
+
+        save_policy = str(self.passthrough_save_policy).strip().lower()
+        if save_policy != "decode":
+            raise ValueError(
+                "AutoModuleDecoderConfig: `passthrough_save_policy` must be `decode`."
+            )
+        self.passthrough_save_policy = save_policy
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the decoder config with a stable dtype string payload."""
 
         payload = super().to_dict()
         payload["source_dtype"] = self.source_dtype
         payload["target_dtype"] = str(self.target_dtype).split(".")[-1]
+        payload["passthrough_forward_policy"] = self.passthrough_forward_policy
+        payload["passthrough_save_policy"] = self.passthrough_save_policy
         return payload
 
 
@@ -1209,6 +1238,17 @@ class TensorParallelPadderConfig(BasePreProcessorConfig):
     """Configure tensor-parallel-safe column padding derived from module weight shapes."""
 
     code: ClassVar[str] = PreProcessorCode.TENSOR_PARALLEL_PADDER.value
+
+
+@dataclass(frozen=True)
+class TelemetryConfig:
+    """Diagnostic controls; never part of quantization/resume algorithm identity."""
+
+    device: bool = False
+
+    def __post_init__(self):
+        if type(self.device) is not bool:
+            raise ValueError("TelemetryConfig.device must be a boolean")
 
 
 @dataclass
@@ -1258,6 +1298,301 @@ class HessianConfig:
                 raise ValueError("HessianConfig: `staging_dtype` must be float32, float16, or bfloat16.")
         else:
             raise ValueError("HessianConfig: `staging_dtype` must be a torch.dtype or string.")
+
+
+# Activation operand formats accepted by the W4A stream. `w4afp8` carries E4M3
+# codes with one FP32 scale per token; `w4a_nvfp4` carries E2M1 codes with one
+# E4M3 scale per 16-element block plus one FP32 global scale per tensor.
+W4A_ACTIVATION_MODES: Tuple[str, ...] = ("w4afp8", "w4a_nvfp4")
+# Legacy aliases (`lsq`, `lsq_headroom`, `lsq_grid`) are expanded by
+# `normalize_nvfp4_recipe` before this set is applied.
+W4A_NVFP4_RECIPES: Tuple[str, ...] = (
+    "nvidia",
+    "nvidia_headroom",
+    "four_six",
+    "least_squares",
+    "least_squares_headroom",
+    "least_squares_grid",
+)
+
+
+@dataclass
+class ActivationAttentionConfig:
+    """Activation policy for the attention projection group.
+
+    Attention defaults to the narrow-range FP8 operand. Every measured
+    configuration in this release puts attention on FP8 and the MLP on NVFP4:
+    the 4-bit activation grid is far more damaging on attention, and attention
+    is only about a sixth of the projection work in a Llama decoder.
+
+    Attributes:
+        mode: `w4afp8` (default) or `w4a_nvfp4`.
+        recipe: NVFP4 block-scale recipe. Only valid for `w4a_nvfp4`, and
+            inherited from the stream-level recipe when omitted.
+    """
+
+    mode: str = "w4afp8"
+    recipe: Optional[str] = None
+
+    def __post_init__(self):
+        if self.mode not in W4A_ACTIVATION_MODES:
+            raise ValueError(
+                f"ActivationAttentionConfig: `mode` must be one of {list(W4A_ACTIVATION_MODES)}."
+            )
+        if self.mode == "w4afp8":
+            if self.recipe is not None:
+                raise ValueError(
+                    "ActivationAttentionConfig: FP8 attention does not use an NVFP4 scale recipe."
+                )
+            return
+        from .activation_floatx import normalize_nvfp4_recipe
+
+        if self.recipe is None:
+            raise ValueError(
+                "ActivationAttentionConfig: NVFP4 attention requires a resolved `recipe`."
+            )
+        self.recipe = normalize_nvfp4_recipe(self.recipe)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the attention policy, omitting an absent FP8 recipe."""
+
+        payload: Dict[str, Any] = {"mode": self.mode}
+        if self.recipe is not None:
+            payload["recipe"] = self.recipe
+        return payload
+
+
+@dataclass
+class ActivationMlpConfig:
+    """Per-layer activation policy override for the MLP projection group.
+
+    `layers` names decoder layers whose MLP boundaries carry FP8 instead of the
+    stream default. The saved INT4 weight tensors are unchanged; only the
+    activation staging of the named layers moves. Promoting every layer is
+    equivalent to an all-FP8 MLP and is the ceiling this knob interpolates
+    toward.
+
+    Attributes:
+        mode: Always `w4afp8`; the stream default already carries the
+            wide-range operand, so promotion is the only direction offered.
+        layers: Non-empty decoder layer indices, sorted and de-duplicated.
+    """
+
+    mode: str = "w4afp8"
+    layers: Tuple[int, ...] = ()
+
+    def __post_init__(self):
+        if self.mode != "w4afp8":
+            raise ValueError(
+                "ActivationMlpConfig: `mode` only promotes layers to `w4afp8`; the stream "
+                "default already carries the wide-range operand."
+            )
+        if not isinstance(self.layers, (list, tuple)):
+            raise ValueError("ActivationMlpConfig: `layers` must be a list or tuple.")
+        layers = tuple(self.layers)
+        if (not layers
+                or any(isinstance(index, bool) or not isinstance(index, int) or index < 0
+                       for index in layers)
+                or len(set(layers)) != len(layers)):
+            raise ValueError(
+                "ActivationMlpConfig: `layers` must be a non-empty list of unique "
+                "non-negative decoder layer indices."
+            )
+        self.layers = tuple(sorted(layers))
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the MLP promotion policy."""
+
+        return {"mode": self.mode, "layers": list(self.layers)}
+
+
+@dataclass
+class ActivationConfig:
+    """W4A activation stream policy for GPTQ INT4 checkpoints.
+
+    Weights stay native GPTQ INT4 packed in INT32 tensors. `activation` selects
+    the operand format that selected Linear modules consume, and the transport
+    contract used between them.
+
+    Modes:
+        `w4afp8`: E4M3 codes with one FP32 scale per token.
+        `w4a_nvfp4`: E2M1 codes with one E4M3 scale per 16-element block plus
+            one FP32 global scale per tensor. For non-headroom recipes, the
+            RMSNorm code-reuse shortcut engages when the norm weights are
+            fused into the projections (Hadamard rotation), which the stream
+            validates at install time. Headroom recipes pack the normalized
+            operand with its calibrated scale even when the norms are fused.
+
+    A bare string (`activation="w4afp8"`) is shorthand for that mode. A dict
+    may add `recipe`, `attention`, `mlp`, and `global_scales`.
+
+    Attributes:
+        mode: Default activation format for both projection groups.
+        recipe: NVFP4 block-scale recipe. Only valid when `mode="w4a_nvfp4"`.
+            Defaults to `least_squares`.
+        attention: Optional per-group override for attention. See
+            `ActivationAttentionConfig`.
+        mlp: Optional per-layer override for the MLP. See `ActivationMlpConfig`.
+        global_scales: Optional producer-to-scale map of calibrated FP32 global
+            scales. Requires NVFP4.
+    """
+
+    mode: str = "w4afp8"
+    recipe: Optional[str] = None
+    attention: Optional[ActivationAttentionConfig] = None
+    mlp: Optional[ActivationMlpConfig] = None
+    global_scales: Optional[Dict[str, float]] = None
+
+    def __post_init__(self):
+        if self.mode not in W4A_ACTIVATION_MODES:
+            raise ValueError(
+                f"ActivationConfig: `mode` must be one of {list(W4A_ACTIVATION_MODES)}."
+            )
+        if self.mode == "w4afp8":
+            if self.recipe is not None:
+                raise ValueError("ActivationConfig: `w4afp8` does not use an NVFP4 scale recipe.")
+        else:
+            from .activation_floatx import normalize_nvfp4_recipe
+
+            if self.recipe is None:
+                self.recipe = "least_squares"
+            self.recipe = normalize_nvfp4_recipe(self.recipe)
+        for name in ("attention", "mlp"):
+            if getattr(self, name) is None:
+                continue
+            if self.mode != "w4a_nvfp4":
+                raise ValueError(
+                    f"ActivationConfig: `{name}` only refines an NVFP4 activation stream."
+                )
+        if self.global_scales is not None:
+            if self.mode != "w4a_nvfp4":
+                raise ValueError(
+                    "ActivationConfig: calibrated producer scales require NVFP4."
+                )
+            producer_recipes = {self.recipe}
+            if self.attention is not None and self.attention.mode == "w4a_nvfp4":
+                producer_recipes.add(self.attention.recipe)
+            if not producer_recipes <= {"nvidia", "four_six", "least_squares", "least_squares_grid"}:
+                raise ValueError(
+                    "ActivationConfig: producer global_scales cannot be combined with legacy "
+                    "headroom recipes."
+                )
+            self.global_scales = _normalize_activation_global_scales(self.global_scales)
+
+    @classmethod
+    def from_value(cls, value: Any) -> Optional["ActivationConfig"]:
+        """Normalize a string, dict, or existing config into an ActivationConfig.
+
+        Returns `None` for `None`, so callers can distinguish "no activation
+        stream" from a validation failure.
+        """
+
+        if value is None:
+            return None
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            payload: Dict[str, Any] = {"mode": value}
+            if value == "w4a_nvfp4":
+                payload["recipe"] = "least_squares"
+            return cls.from_dict(payload)
+        if not isinstance(value, dict):
+            raise ValueError(
+                "ActivationConfig: `activation` must be a mode string, a dict, or an ActivationConfig."
+            )
+        return cls.from_dict(value)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ActivationConfig":
+        """Validate and normalize a raw `activation` mapping."""
+
+        supported = {"mode", "recipe", "attention", "mlp", "global_scales"}
+        unknown = sorted(set(payload) - supported)
+        if unknown:
+            raise ValueError(
+                f"ActivationConfig: unsupported field(s) {unknown}. "
+                f"Supported fields are {sorted(supported)}."
+            )
+        if "mode" not in payload:
+            raise ValueError("ActivationConfig: `activation` must contain `mode`.")
+
+        mode = payload["mode"]
+
+        recipe = payload.get("recipe")
+        resolved_recipe = recipe
+        if mode == "w4a_nvfp4" and resolved_recipe is None:
+            resolved_recipe = "least_squares"
+
+        attention = payload.get("attention")
+        if attention is not None:
+            if not isinstance(attention, dict):
+                raise ValueError("ActivationConfig: `attention` must be a dict containing `mode`.")
+            unknown_attention = sorted(set(attention) - {"mode", "recipe"})
+            if unknown_attention:
+                raise ValueError(
+                    "ActivationConfig: `attention` only supports `mode` and `recipe`."
+                )
+            if "mode" not in attention:
+                raise ValueError("ActivationConfig: `attention` must contain `mode`.")
+            # An NVFP4 attention group inherits the stream recipe when it does
+            # not name one, so the two groups cannot silently disagree.
+            attention_payload = dict(attention)
+            if attention_payload["mode"] == "w4a_nvfp4" and "recipe" not in attention_payload:
+                attention_payload["recipe"] = resolved_recipe
+            attention = ActivationAttentionConfig(**attention_payload)
+
+        mlp = payload.get("mlp")
+        if mlp is not None:
+            if not isinstance(mlp, dict):
+                raise ValueError("ActivationConfig: `mlp` must be a dict containing `mode` and `layers`.")
+            unknown_mlp = sorted(set(mlp) - {"mode", "layers"})
+            if unknown_mlp:
+                raise ValueError("ActivationConfig: `mlp` only supports `mode` and `layers`.")
+            if "mode" not in mlp or "layers" not in mlp:
+                raise ValueError("ActivationConfig: `mlp` must contain `mode` and `layers`.")
+            mlp = ActivationMlpConfig(**mlp)
+
+        return cls(
+            mode=mode,
+            recipe=recipe,
+            attention=attention,
+            mlp=mlp,
+            global_scales=payload.get("global_scales"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to the canonical `quantize_config.json` payload."""
+
+        payload: Dict[str, Any] = {"mode": self.mode}
+        if self.recipe is not None:
+            payload["recipe"] = self.recipe
+        if self.attention is not None:
+            payload["attention"] = self.attention.to_dict()
+        if self.mlp is not None:
+            payload["mlp"] = self.mlp.to_dict()
+        if self.global_scales is not None:
+            payload["global_scales"] = dict(self.global_scales)
+        return payload
+
+
+def _normalize_activation_global_scales(scales: Any) -> Dict[str, float]:
+    """Validate a producer-to-scale map and round each value through FP32."""
+
+    if not isinstance(scales, dict) or not scales:
+        raise ValueError("ActivationConfig: global_scales must be a nonempty producer-to-scale mapping.")
+    normalized: Dict[str, float] = {}
+    for producer, scale in scales.items():
+        if (not isinstance(producer, str) or not producer.startswith("model.layers.")
+                or isinstance(scale, bool) or not isinstance(scale, (int, float))
+                or not math.isfinite(scale) or scale <= 0):
+            raise ValueError(
+                "ActivationConfig: producer names and positive finite global scales are required."
+            )
+        value = torch.tensor(scale, dtype=torch.float32).item()
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("ActivationConfig: global scale is outside the positive FP32 range.")
+        normalized[producer] = value
+    return normalized
 
 
 @dataclass
@@ -1562,17 +1897,521 @@ DYNAMIC_FIELD_SYNONYMS = {}
 # Sentinel used by the dynamic override cache to indicate no pattern matched.
 _DYNAMIC_NO_MATCH = object()
 
-# Global caches for dynamic override resolution.  The `dynamic` dict is treated
-# as immutable after config construction, so caching by `id(dynamic)` is safe
-# and lets cloned configs share compiled patterns and override lookups.
-_DYNAMIC_PATTERN_CACHE: Dict[int, List[Tuple[bool, Any, Dict[str, Any], Optional[str], int]]] = {}
-_DYNAMIC_OVERRIDE_CACHE: Dict[int, Dict[str, Any]] = {}
-# Exact-literal fast-path caches: a per-dynamic dict mapping literal module names
-# to their resolved override, and whether every pattern is an exact literal.
-_DYNAMIC_EXACT_LOOKUP_CACHE: Dict[int, Dict[str, Tuple[int, Union[Dict[str, Any], bool]]]] = {}
-_DYNAMIC_ALL_EXACT_CACHE: Dict[int, bool] = {}
-# Pre-separated regex patterns for mixed dynamic configs.
-_DYNAMIC_REGEX_PATTERN_CACHE: Dict[int, List[Tuple[int, bool, Any, Dict[str, Any]]]] = {}
+# Dynamic configurations are mutable user data.  These wrappers provide an
+# O(1) mutation token so the exact-pattern fast path can remain O(1) per lookup
+# without ever reusing a result after an in-place edit.
+class _TrackedDict(dict):
+    """Dict whose nested edits advance one shared root mutation version."""
+
+    def __init__(self, *args, _root=None, **kwargs):
+        dict.__init__(self)
+        self._root = _root if _root is not None else self
+        if self._root is self:
+            self._mutation_version = 0
+            self._dynamic_lock = threading.RLock()
+        if args or kwargs:
+            source = dict(*args, **kwargs)
+            for key, value in source.items():
+                dict.__setitem__(self, key, _track_dynamic_value(value, self._root))
+
+    def _touch(self):
+        # Nested tracked containers point at the same root, so any edit
+        # invalidates fingerprints computed for the complete dynamic config.
+        self._root._mutation_version += 1
+
+    def __eq__(self, other):
+        return dict.__eq__(self, other)
+
+    __hash__ = None
+
+    def __setitem__(self, key, value):
+        with self._root._dynamic_lock:
+            dict.__setitem__(self, key, _track_dynamic_value(value, self._root))
+            self._touch()
+
+    def __delitem__(self, key):
+        with self._root._dynamic_lock:
+            dict.__delitem__(self, key)
+            self._touch()
+
+    def clear(self):
+        with self._root._dynamic_lock:
+            if self:
+                dict.clear(self)
+                self._touch()
+
+    def pop(self, key, *args):
+        with self._root._dynamic_lock:
+            value = dict.pop(self, key, *args)
+            self._touch()
+            return value
+
+    def popitem(self):
+        with self._root._dynamic_lock:
+            value = dict.popitem(self)
+            self._touch()
+            return value
+
+    def setdefault(self, key, default=None):
+        with self._root._dynamic_lock:
+            if key in self:
+                return self[key]
+            self[key] = default
+            return self[key]
+
+    def update(self, *args, **kwargs):
+        with self._root._dynamic_lock:
+            source = dict(*args, **kwargs)
+            for key, value in source.items():
+                self[key] = value
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def __deepcopy__(self, memo):
+        with self._root._dynamic_lock:
+            payload = {copy.deepcopy(key, memo): copy.deepcopy(value, memo) for key, value in self.items()}
+            result = _track_dynamic_value(payload, None)
+            memo[id(self)] = result
+            return result
+
+    def __reduce__(self):
+        # Default dict-subclass unpickling inserts items before restoring
+        # ``_root``, so __setitem__ would try to touch a missing root. Rebuild
+        # the complete tracked subtree from plain containers instead.
+        with self._root._dynamic_lock:
+            return (_track_dynamic_value, (_untrack_dynamic_value(self), None))
+
+
+class _TrackedList(list):
+    """List counterpart to ``_TrackedDict`` for nested dynamic values."""
+
+    def __init__(self, iterable=(), *, _root=None):
+        self._root = _root
+        if self._root is None:
+            self._root = self
+            self._mutation_version = 0
+            self._dynamic_lock = threading.RLock()
+        list.__init__(self, (_track_dynamic_value(value, self._root) for value in iterable))
+
+    def _touch(self):
+        # Use the root token so edits below a dynamic mapping are visible to
+        # the same cache-key check as edits to the mapping itself.
+        self._root._mutation_version += 1
+
+    def __eq__(self, other):
+        return list.__eq__(self, other)
+
+    def __ne__(self, other):
+        return list.__ne__(self, other)
+
+    def __setitem__(self, index, value):
+        with self._root._dynamic_lock:
+            if isinstance(index, slice):
+                value = [_track_dynamic_value(item, self._root) for item in value]
+            else:
+                value = _track_dynamic_value(value, self._root)
+            list.__setitem__(self, index, value)
+            self._touch()
+
+    def __delitem__(self, index):
+        with self._root._dynamic_lock:
+            list.__delitem__(self, index)
+            self._touch()
+
+    def append(self, value):
+        with self._root._dynamic_lock:
+            list.append(self, _track_dynamic_value(value, self._root))
+            self._touch()
+
+    def extend(self, values):
+        with self._root._dynamic_lock:
+            list.extend(self, (_track_dynamic_value(value, self._root) for value in values))
+            self._touch()
+
+    def __iadd__(self, values):
+        self.extend(values)
+        return self
+
+    def __imul__(self, count):
+        with self._root._dynamic_lock:
+            list.__imul__(self, count)
+            self._touch()
+            return self
+
+    def insert(self, index, value):
+        with self._root._dynamic_lock:
+            list.insert(self, index, _track_dynamic_value(value, self._root))
+            self._touch()
+
+    def pop(self, index=-1):
+        with self._root._dynamic_lock:
+            value = list.pop(self, index)
+            self._touch()
+            return value
+
+    def remove(self, value):
+        with self._root._dynamic_lock:
+            list.remove(self, value)
+            self._touch()
+
+    def clear(self):
+        with self._root._dynamic_lock:
+            if self:
+                list.clear(self)
+                self._touch()
+
+    def reverse(self):
+        with self._root._dynamic_lock:
+            list.reverse(self)
+            self._touch()
+
+    def sort(self, *args, **kwargs):
+        with self._root._dynamic_lock:
+            list.sort(self, *args, **kwargs)
+            self._touch()
+
+    def __deepcopy__(self, memo):
+        with self._root._dynamic_lock:
+            result = _track_dynamic_value([copy.deepcopy(value, memo) for value in self], None)
+            memo[id(self)] = result
+            return result
+
+    def __reduce__(self):
+        with self._root._dynamic_lock:
+            return (_track_dynamic_value, (_untrack_dynamic_value(self), None))
+
+
+def _untrack_dynamic_value(value):
+    if isinstance(value, dict):
+        return {key: _untrack_dynamic_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_untrack_dynamic_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_untrack_dynamic_value(item) for item in value)
+    return value
+
+
+def _track_dynamic_value(value, root):
+    # Preserve the user's container shape while sharing one mutation counter
+    # across every mutable descendant.
+    if isinstance(value, dict):
+        tracked = _TrackedDict(_root=root)
+        root = tracked._root
+        for key, item in value.items():
+            dict.__setitem__(tracked, key, _track_dynamic_value(item, root))
+        return tracked
+    if isinstance(value, (list, tuple)):
+        tracked = _TrackedList(_root=root)
+        root = tracked._root
+        for item in value:
+            list.append(tracked, _track_dynamic_value(item, root))
+        return tracked if isinstance(value, list) else tuple(tracked)
+    return value
+
+
+class _BoundedLRUCache(OrderedDict):
+    """Bounded LRU map; callers serialize access with the cache lock."""
+
+    def __init__(self, maxsize: int):
+        super().__init__()
+        self.maxsize = int(maxsize)
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.peak_size = 0
+
+    def ensure_capacity(self, capacity: int) -> None:
+        """Grow for the largest configured working set; never shrink later."""
+        if capacity < 1:
+            raise ValueError("cache capacity must be positive")
+        self.maxsize = max(self.maxsize, int(capacity))
+
+    def resize(self, capacity: int) -> None:
+        """Release entries beyond a departed model's reservation."""
+        if capacity < 1:
+            raise ValueError("cache capacity must be positive")
+        self.maxsize = int(capacity)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+            self.evictions += 1
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.hits += 1
+        super().__delitem__(key)
+        super().__setitem__(key, value)
+        return value
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            self.misses += 1
+            return default
+
+    def clear(self):
+        super().clear()
+        self.hits = self.misses = self.evictions = self.peak_size = 0
+        identity_cache = globals().get("_DYNAMIC_IDENTITY_CACHE")
+        if identity_cache is not None and self is not identity_cache:
+            OrderedDict.clear(identity_cache)
+
+    def __setitem__(self, key, value):
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+            self.evictions += 1
+        self.peak_size = max(self.peak_size, len(self))
+
+
+_DYNAMIC_PATTERN_CACHE_MAXSIZE = 256
+_DYNAMIC_OVERRIDE_CACHE_MAXSIZE = 8192
+_DYNAMIC_EXACT_LOOKUP_CACHE_MAXSIZE = 256
+_DYNAMIC_ALL_EXACT_CACHE_MAXSIZE = 256
+_DYNAMIC_REGEX_PATTERN_CACHE_MAXSIZE = 256
+_DYNAMIC_IDENTITY_CACHE_MAXSIZE = 128
+
+# All five public/internal caches are bounded and keyed by content
+# fingerprints.  The identity cache below is only a bounded acceleration layer;
+# correctness always requires object identity *and* a mutation token match.
+_DYNAMIC_PATTERN_CACHE = _BoundedLRUCache(_DYNAMIC_PATTERN_CACHE_MAXSIZE)
+_DYNAMIC_OVERRIDE_CACHE = _BoundedLRUCache(_DYNAMIC_OVERRIDE_CACHE_MAXSIZE)
+_DYNAMIC_EXACT_LOOKUP_CACHE = _BoundedLRUCache(_DYNAMIC_EXACT_LOOKUP_CACHE_MAXSIZE)
+_DYNAMIC_ALL_EXACT_CACHE = _BoundedLRUCache(_DYNAMIC_ALL_EXACT_CACHE_MAXSIZE)
+_DYNAMIC_REGEX_PATTERN_CACHE = _BoundedLRUCache(_DYNAMIC_REGEX_PATTERN_CACHE_MAXSIZE)
+_DYNAMIC_IDENTITY_CACHE = _BoundedLRUCache(_DYNAMIC_IDENTITY_CACHE_MAXSIZE)
+# Always acquire a tracked root's lock before this shared-plan lock. Matching
+# runs after the shared lock is released, so separate configs can match in parallel.
+_DYNAMIC_CACHE_LOCK = threading.RLock()
+
+
+def _dynamic_lock_for(dynamic):
+    """Serialize one tracked configuration, or the standalone fallback."""
+    if isinstance(dynamic, _TrackedDict):
+        return dynamic._root._dynamic_lock
+    return _DYNAMIC_CACHE_LOCK
+
+
+def _dynamic_capacity_for(module_count: int) -> int:
+    target = max(_DYNAMIC_OVERRIDE_CACHE_MAXSIZE, (module_count * 5 + 3) // 4)
+    return 1 << (target - 1).bit_length()
+
+
+def _reserved_dynamic_capacity(root) -> int:
+    module_count = sum(count for _, count in root._dynamic_model_working_sets.values())
+    return max(
+        getattr(root, "_dynamic_manual_capacity", _DYNAMIC_OVERRIDE_CACHE_MAXSIZE),
+        _dynamic_capacity_for(module_count),
+    )
+
+
+def configure_dynamic_override_cache(*, module_count: int,
+                                     layer_count: Optional[int] = None,
+                                     expert_count: Optional[int] = None,
+                                     dynamic=None) -> int:
+    """Reserve 25% headroom for a tracked config or standalone fallback."""
+    if module_count < 0:
+        raise ValueError("module_count must be non-negative")
+    capacity = _dynamic_capacity_for(module_count)
+    with _dynamic_lock_for(dynamic):
+        cache = _dynamic_override_cache_for(dynamic)
+        if isinstance(dynamic, _TrackedDict):
+            root = dynamic._root
+            root._dynamic_manual_capacity = max(
+                getattr(root, "_dynamic_manual_capacity", _DYNAMIC_OVERRIDE_CACHE_MAXSIZE), capacity,
+            )
+        cache.ensure_capacity(capacity)
+        capacity = cache.maxsize
+    log.debug(
+        "Dynamic cache: modules=%s layers=%s experts/layer=%s override capacity=%s",
+        module_count, layer_count, expert_count, capacity,
+    )
+    return capacity
+
+
+def _dynamic_override_cache_for(dynamic) -> _BoundedLRUCache:
+    """Tie resolved results to a tracked dynamic mapping's lifetime."""
+    if not isinstance(dynamic, _TrackedDict):
+        return _DYNAMIC_OVERRIDE_CACHE
+    root = dynamic._root
+    with root._dynamic_lock:
+        cache = getattr(root, "_dynamic_override_cache", None)
+        if cache is None:
+            cache = _BoundedLRUCache(_DYNAMIC_OVERRIDE_CACHE_MAXSIZE)
+            root._dynamic_override_cache = cache
+        reservations = getattr(root, "_dynamic_model_working_sets", None)
+        if reservations:
+            # Prune under the root lock on access. A weakref callback acquiring
+            # this lock could deadlock if GC ran while another lock was held.
+            expired = [model_id for model_id, (model_ref, _) in reservations.items() if model_ref() is None]
+            if expired:
+                for model_id in expired:
+                    del reservations[model_id]
+                cache.resize(_reserved_dynamic_capacity(root))
+        return cache
+
+
+def _reserve_dynamic_model_working_set(dynamic, model, module_count: int) -> int:
+    """Cover all live models sharing one config; prune dead model reservations."""
+    root = dynamic._root
+    with root._dynamic_lock:
+        cache = _dynamic_override_cache_for(dynamic)
+        if not hasattr(root, "_dynamic_model_working_sets"):
+            root._dynamic_model_working_sets = {}
+        model_id = id(model)
+        try:
+            model_ref = weakref.ref(model)
+        except TypeError:
+            cache.ensure_capacity(_dynamic_capacity_for(module_count))
+            return cache.maxsize
+        root._dynamic_model_working_sets[model_id] = (model_ref, module_count)
+        cache.resize(_reserved_dynamic_capacity(root))
+        return cache.maxsize
+
+
+def configure_dynamic_override_cache_for_model(
+    model, quantize_config, *, layer_modules=None, layer_prefixes=None,
+) -> int:
+    """Size for physical modules and the expanded dynamic module plan."""
+    dynamic = getattr(quantize_config, "dynamic", None)
+    if not dynamic or not hasattr(model, "named_modules"):
+        return _dynamic_override_cache_for(dynamic).maxsize
+    prefixes = set(layer_prefixes or ())
+    seen_containers = set()
+    physical_count = layer_count = 0
+    # Include aliased paths: callers address modules by name, not by identity.
+    for name, module in model.named_modules(remove_duplicate=False):
+        physical_count += bool(name)
+        if name in prefixes and id(module) not in seen_containers:
+            seen_containers.add(id(module))
+            layer_count += len(module) if isinstance(module, torch.nn.ModuleList) else 1
+
+    # full_layer_modules() expands MoE placeholders even when Transformers keeps
+    # the experts in fused tensors and named_modules() exposes no expert leaves.
+    relative_names = {
+        name.split(":", 1)[0]
+        for group in (layer_modules or ()) for name in group if name
+    }
+    logical_count = len(relative_names) * (layer_count + 1)
+    working_set = max(physical_count, logical_count)
+    if isinstance(dynamic, _TrackedDict):
+        capacity = _reserve_dynamic_model_working_set(dynamic, model, working_set)
+        log.debug(
+            "Dynamic cache: modules=%s layers=%s override capacity=%s",
+            working_set, layer_count, capacity,
+        )
+    else:
+        capacity = configure_dynamic_override_cache(
+            module_count=working_set, layer_count=layer_count, dynamic=dynamic,
+        )
+    log.debug("Dynamic cache: physical modules=%s logical paths=%s", physical_count, logical_count)
+    with _dynamic_lock_for(dynamic):
+        exact_rules = sum(
+            _extract_literal_regex_pattern(pattern[2:] if pattern.startswith(("-:", "+:")) else pattern)
+            is not None
+            for pattern in dynamic
+        )
+        rule_count = len(dynamic)
+    log.debug(
+        "Dynamic cache: dynamic rules=%s regex rules=%s exact rules=%s",
+        rule_count, rule_count - exact_rules, exact_rules,
+    )
+    return capacity
+
+
+def dynamic_override_cache_stats(dynamic=None) -> Dict[str, int]:
+    """Return counters for one tracked config, or the standalone fallback."""
+    with _dynamic_lock_for(dynamic):
+        cache = _dynamic_override_cache_for(dynamic)
+        return {
+            "hits": cache.hits,
+            "misses": cache.misses,
+            "evictions": cache.evictions,
+            "peak_size": cache.peak_size,
+            "size": len(cache),
+            "maxsize": cache.maxsize,
+        }
+
+
+def log_dynamic_override_cache_stats(
+    stats_before: Optional[Dict[str, int]] = None, *, dynamic=None,
+) -> None:
+    stats = dynamic_override_cache_stats(dynamic)
+    before = stats_before or {"hits": 0, "misses": 0, "evictions": 0}
+    hits = stats["hits"] - before["hits"]
+    misses = stats["misses"] - before["misses"]
+    evictions = stats["evictions"] - before["evictions"]
+    lookups = hits + misses
+    hit_rate = 100 * hits / lookups if lookups else 0
+    log.debug("Dynamic cache (configuration since snapshot): lookups=%s hits=%s misses=%s evictions=%s "
+              "size=%s peak_size=%s capacity=%s hit_rate=%.2f%%",
+              lookups, hits, misses, evictions, stats["size"],
+              stats["peak_size"], stats["maxsize"], hit_rate)
+
+
+def _dynamic_value_fingerprint(value):
+    """Return a hashable, ordered fingerprint that preserves nested value types."""
+    if isinstance(value, Mapping):
+        # Mapping insertion order is significant: the first matching pattern
+        # wins, including for an otherwise equivalent reordered dictionary.
+        return ("mapping", tuple(
+            (_dynamic_value_fingerprint(key), _dynamic_value_fingerprint(item))
+            for key, item in value.items()
+        ), None, None)
+    if isinstance(value, list):
+        return ("list", tuple(_dynamic_value_fingerprint(item) for item in value), None, None)
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_dynamic_value_fingerprint(item) for item in value), None, None)
+    if isinstance(value, set):
+        return ("set", tuple(sorted((_dynamic_value_fingerprint(item) for item in value), key=repr)), None, None)
+    if isinstance(value, frozenset):
+        return (
+            "frozenset",
+            tuple(sorted((_dynamic_value_fingerprint(item) for item in value), key=repr)),
+            None,
+            None,
+        )
+    if isinstance(value, Enum):
+        enum_type = type(value)
+        return (
+            "enum",
+            enum_type.__module__,
+            enum_type.__qualname__,
+            _dynamic_value_fingerprint(value.value),
+        )
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return (type(value).__name__, value, None, None)
+    value_type = type(value)
+    return ("object", value_type.__module__, value_type.__qualname__, repr(value))
+
+
+def _dynamic_fingerprint(dynamic):
+    # The canonical representation preserves order, nested content, and value
+    # types before hashing it into a compact cache key.
+    canonical = repr(_dynamic_value_fingerprint(dynamic)).encode("utf-8")
+    return hashlib.sha256(canonical).digest()
+
+
+def _dynamic_cache_key(dynamic):
+    if isinstance(dynamic, _TrackedDict):
+        with dynamic._root._dynamic_lock:
+            identity_key = id(dynamic)
+            version = dynamic._root._mutation_version
+            with _DYNAMIC_CACHE_LOCK:
+                record = _DYNAMIC_IDENTITY_CACHE.get(identity_key)
+                if record is not None and record[0]() is dynamic and record[1] == version:
+                    # Identity and version checks keep this acceleration safe.
+                    return record[2]
+                fingerprint = _dynamic_fingerprint(dynamic)
+                _DYNAMIC_IDENTITY_CACHE[identity_key] = (weakref.ref(dynamic), version, fingerprint)
+                return fingerprint
+    # Untracked mappings are still correct; they simply pay fingerprint cost
+    # because arbitrary in-place mutations cannot expose a safe O(1) token.
+    return _dynamic_fingerprint(dynamic)
 _MODULE_INCLUDE_PATTERN_CACHE: Dict[Tuple[str, ...], Tuple[Any, ...]] = {}
 
 def _extract_literal_regex_pattern(raw: str) -> Optional[str]:
@@ -1610,40 +2449,51 @@ def _extract_literal_regex_pattern(raw: str) -> Optional[str]:
     return "".join(out)
 
 
-def _get_dynamic_patterns(dynamic: Dict[str, Dict[str, Any]]) -> List[Tuple[bool, Any, Dict[str, Any], Optional[str], int]]:
-    """Return compiled PCRE patterns (plus optional exact literal) for a dynamic dict, caching by object id."""
+def _get_dynamic_patterns(dynamic: Dict[str, Dict[str, Any]]):
+    """Return a stable compiled matching plan for this dynamic mapping."""
 
-    cache_key = id(dynamic)
-    patterns = _DYNAMIC_PATTERN_CACHE.get(cache_key)
-    if patterns is not None:
-        return patterns
+    with _dynamic_lock_for(dynamic):
+        cache_key = _dynamic_cache_key(dynamic)
+        with _DYNAMIC_CACHE_LOCK:
+            patterns = _DYNAMIC_PATTERN_CACHE.get(cache_key)
+            exact_lookup = _DYNAMIC_EXACT_LOOKUP_CACHE.get(cache_key)
+            all_exact = _DYNAMIC_ALL_EXACT_CACHE.get(cache_key)
+            regex_patterns = _DYNAMIC_REGEX_PATTERN_CACHE.get(cache_key)
+            if (patterns is not None and exact_lookup is not None
+                    and all_exact is not None and regex_patterns is not None):
+                return exact_lookup, all_exact, regex_patterns
 
-    patterns = []
-    exact_lookup: Dict[str, Tuple[int, Union[Dict[str, Any], bool]]] = {}
-    regex_patterns: List[Tuple[int, bool, Any, Dict[str, Any]]] = []
-    all_exact = True
-    if dynamic is not None:
-        for index, (pattern, overrides) in enumerate(dynamic.items()):
-            is_negative = pattern.startswith("-:")
-            raw = pattern[2:] if pattern.startswith(("-:", "+:")) else pattern
-            exact_literal = _extract_literal_regex_pattern(raw)
-            if exact_literal is None:
-                all_exact = False
-                try:
-                    compiled = pcre.compile(raw)
-                except Exception as exc:
-                    raise ValueError(f"QuantizeConfig: invalid dynamic pattern `{pattern}`") from exc
-                regex_patterns.append((index, is_negative, compiled, overrides))
-            else:
-                compiled = None
-                if exact_literal not in exact_lookup:
-                    exact_lookup[exact_literal] = (index, False if is_negative else dict(overrides))
-            patterns.append((is_negative, compiled, overrides, exact_literal, index))
-    _DYNAMIC_PATTERN_CACHE[cache_key] = patterns
-    _DYNAMIC_EXACT_LOOKUP_CACHE[cache_key] = exact_lookup
-    _DYNAMIC_ALL_EXACT_CACHE[cache_key] = all_exact
-    _DYNAMIC_REGEX_PATTERN_CACHE[cache_key] = regex_patterns
-    return patterns
+            patterns = []
+            exact_lookup = {}
+            regex_patterns = []
+            all_exact = True
+            if dynamic is not None:
+                for index, (pattern, overrides) in enumerate(dynamic.items()):
+                    # Cache entries own snapshots, so later edits cannot change them.
+                    override_snapshot = copy.deepcopy(dict(overrides))
+                    is_negative = pattern.startswith("-:")
+                    raw = pattern[2:] if pattern.startswith(("-:", "+:")) else pattern
+                    exact_literal = _extract_literal_regex_pattern(raw)
+                    if exact_literal is None:
+                        all_exact = False
+                        try:
+                            compiled = pcre.compile(raw)
+                        except Exception as exc:
+                            raise ValueError(f"QuantizeConfig: invalid dynamic pattern `{pattern}`") from exc
+                        regex_patterns.append((index, is_negative, compiled, override_snapshot))
+                    else:
+                        compiled = None
+                        if exact_literal not in exact_lookup:
+                            exact_lookup[exact_literal] = (
+                                index,
+                                False if is_negative else override_snapshot,
+                            )
+                    patterns.append((is_negative, compiled, override_snapshot, exact_literal, index))
+            _DYNAMIC_PATTERN_CACHE[cache_key] = patterns
+            _DYNAMIC_EXACT_LOOKUP_CACHE[cache_key] = exact_lookup
+            _DYNAMIC_ALL_EXACT_CACHE[cache_key] = all_exact
+            _DYNAMIC_REGEX_PATTERN_CACHE[cache_key] = regex_patterns
+            return exact_lookup, all_exact, regex_patterns
 
 
 def _get_module_include_patterns(patterns: Tuple[str, ...]) -> Tuple[Any, ...]:
@@ -1669,39 +2519,48 @@ def _resolve_dynamic_override(
 ) -> Union[Dict[str, Any], bool, None]:
     """Return the first matching dynamic override dict, False for negative, or None."""
 
+    def clone_result(value):
+        # Dynamic configs with equal content intentionally share cache entries.
+        # Never expose a cached mutable payload to callers, including nested
+        # containers returned by dynamic_get(module, key).
+        if value is None or value is False:
+            return value
+        return copy.deepcopy(value)
+
     if dynamic is None:
         return None
 
-    cache_key = id(dynamic)
-    override_cache = _DYNAMIC_OVERRIDE_CACHE.setdefault(cache_key, {})
-    cached = override_cache.get(module_name, _DYNAMIC_NO_MATCH)
-    if cached is not _DYNAMIC_NO_MATCH:
-        return cached
+    with _dynamic_lock_for(dynamic):
+        cache_key = _dynamic_cache_key(dynamic)
+        override_cache = _dynamic_override_cache_for(dynamic)
+        lookup_key = (cache_key, module_name)
+        cached = override_cache.get(lookup_key, _DYNAMIC_NO_MATCH)
+        if cached is not _DYNAMIC_NO_MATCH:
+            return clone_result(cached)
 
-    _get_dynamic_patterns(dynamic)
+        exact_lookup, all_exact, regex_patterns = _get_dynamic_patterns(dynamic)
+        # Fast path: every pattern is an exact literal module name.
+        if all_exact:
+            exact_entry = exact_lookup.get(module_name)
+            matched = exact_entry[1] if exact_entry is not None else None
+            override_cache[lookup_key] = matched
+            return clone_result(matched)
 
-    # Fast path: every pattern is an exact literal module name.
-    if _DYNAMIC_ALL_EXACT_CACHE.get(cache_key, False):
-        exact_entry = _DYNAMIC_EXACT_LOOKUP_CACHE[cache_key].get(module_name)
+        # Mixed fallback: find the earliest matching pattern among exact
+        # literals (O(1) lookup) and ordered regex patterns.
+        exact_entry = exact_lookup.get(module_name)
+        best_index = exact_entry[0] if exact_entry is not None else None
         matched = exact_entry[1] if exact_entry is not None else None
-        override_cache[module_name] = matched
-        return matched
 
-    # Mixed fallback: find the earliest matching pattern among exact literals
-    # (O(1) lookup) and ordered regex patterns.
-    exact_entry = _DYNAMIC_EXACT_LOOKUP_CACHE[cache_key].get(module_name)
-    best_index = exact_entry[0] if exact_entry is not None else None
-    matched = exact_entry[1] if exact_entry is not None else None
+        for index, is_negative, compiled, overrides in regex_patterns:
+            if best_index is not None and index > best_index:
+                break
+            if compiled.match(module_name):
+                matched = False if is_negative else copy.deepcopy(dict(overrides))
+                break
 
-    for index, is_negative, compiled, overrides in _DYNAMIC_REGEX_PATTERN_CACHE[cache_key]:
-        if best_index is not None and index > best_index:
-            break
-        if compiled.match(module_name):
-            matched = False if is_negative else dict(overrides)
-            break
-
-    override_cache[module_name] = matched
-    return matched
+        override_cache[lookup_key] = matched
+        return clone_result(matched)
 
 def dict_scale_dtype_to_str(d: Dict[str, Any]) -> None:
     """
@@ -2335,6 +3194,8 @@ def _normalize_bitsandbytes_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _resolve_export_quant_method(format_value: FORMAT, fallback_method: Optional[METHOD] = None) -> METHOD:
+    if format_value == FORMAT.BITBLAS and fallback_method == METHOD.AWQ:
+        return METHOD.AWQ
     if format_value == FORMAT.MARLIN:
         if fallback_method is None:
             raise ValueError("QuantizeConfig: FORMAT.MARLIN requires an explicit quantization method family.")
@@ -2508,11 +3369,17 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
     # Serialized/exported checkpoint layout. This is the authoritative post-quantization format.
     format: FORMAT = field(default=FORMAT.GPTQ)
 
+    # Input quantization for selected GPTQ Linear modules. Saved weights remain
+    # ordinary INT32-packed GPTQ tensors; this only selects the activation path.
+    activation: Optional[Union[str, Dict[str, Any]]] = field(default=None)
+
     # properties that do not directly contribute to quantization or inference should be placed in meta
     meta: Optional[Dict] = field(default=None)
 
     # normalized to DEVICE after passing to load()
     device: Optional[Union[str, torch.device]] = field(default=None)
+
+    telemetry: Union[TelemetryConfig, Dict[str, Any]] = field(default_factory=TelemetryConfig)
 
     # gptq was originally designed to pack quantized weights inside INT32 dtypes
     # allowing using different dtypes used for packing quantized weights
@@ -2626,6 +3493,52 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
     @property
     def runtime_bits(self):
         return self.bits
+
+    @property
+    def activation_mode(self) -> Optional[str]:
+        return self.activation["mode"] if self.activation else None
+
+    @property
+    def activation_recipe(self) -> Optional[str]:
+        if not self.activation or self.activation["mode"] != "w4a_nvfp4":
+            return None
+        return self.activation.get("recipe", "least_squares")
+
+    @property
+    def activation_attention_mode(self) -> Optional[str]:
+        if not self.activation:
+            return None
+        attention = self.activation.get("attention")
+        return attention["mode"] if attention else None
+
+    @property
+    def activation_attention_recipe(self) -> Optional[str]:
+        if not self.activation:
+            return None
+        attention = self.activation.get("attention")
+        if not attention or attention["mode"] != "w4a_nvfp4":
+            return None
+        return attention.get("recipe")
+
+    @property
+    def activation_mlp_fp8_layers(self) -> Optional[Tuple[int, ...]]:
+        if not self.activation:
+            return None
+        mlp = self.activation.get("mlp")
+        if not mlp:
+            return None
+        return tuple(mlp["layers"])
+
+    @property
+    def activation_global_scales(self) -> Optional[Dict[str, float]]:
+        return self.activation.get("global_scales") if self.activation else None
+
+    def __setattr__(self, name, value):
+        # Wrap assignment as well as construction so later ``config.dynamic =``
+        # edits receive the same mutation tracking as the initial value.
+        if name == "dynamic" and value is not None and isinstance(value, dict) and not isinstance(value, _TrackedDict):
+            value = _track_dynamic_value(value, None)
+        super().__setattr__(name, value)
 
     def _resolve_checkpoint_format(self) -> FORMAT:
         self.format = _normalize_format(self.format)
@@ -2750,6 +3663,22 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
         elif not isinstance(self.desc_act, bool):
             self.desc_act = bool(self.desc_act)
 
+        if self.activation is not None:
+            activation = ActivationConfig.from_value(self.activation)
+            if (self.method != METHOD.GPTQ or format_family not in (FORMAT.GPTQ, FORMAT.GPTQ_V2)
+                    or self.bits != 4 or self.group_size != 128 or not self.sym
+                    or self.desc_act or self.pack_dtype != torch.int32 or self.lm_head):
+                raise ValueError(
+                    "QuantizeConfig: W4A activation stream requires GPTQ INT4, symmetric group_size=128, "
+                    "desc_act=False, INT32 packing, GPTQ/GPTQ_V2 format, and lm_head=False."
+                )
+            for layer, override in (self.dynamic or {}).items():
+                if override is False:
+                    continue
+                if isinstance(override, dict) and any(key in override for key in ("bits", "sym", "group_size", "desc_act")):
+                    raise ValueError(f"QuantizeConfig: W4A activation stream does not support weight-layout override `{layer}`.")
+            self.activation = activation.to_dict()
+
         if self.meta is not None:
             if not isinstance(self.meta, dict):
                 raise ValueError("QuantizeConfig: `meta` must be a dictionary")
@@ -2760,6 +3689,10 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             self.meta = {}
 
         self.adapter = normalize_adapter(self.adapter)
+        if isinstance(self.telemetry, dict):
+            self.telemetry = TelemetryConfig(**self.telemetry)
+        elif not isinstance(self.telemetry, TelemetryConfig):
+            raise ValueError("telemetry must be a TelemetryConfig or dictionary")
 
         # Rotation fuses orthogonal transforms into the weights and requires
         # materialized tensors; meta-device/shell loading cannot be used.
@@ -2982,6 +3915,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
 
         meta_payload = normalized.get(META_FIELD)
         meta_field_map = {
+            "telemetry": "telemetry",
             "fallback": "fallback",
             "hessian": "hessian",
             "gptaq": "gptaq",
@@ -3121,6 +4055,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             }
 
         meta_payload["offload_to_disk"] = self.offload_to_disk
+        meta_payload["telemetry"] = asdict(self.telemetry)
         meta_payload["offload_to_disk_path"] = self.offload_to_disk_path
         meta_payload["pack_impl"] = self.pack_impl
         meta_payload["gc_mode"] = self.gc_mode.value if isinstance(self.gc_mode, GcMode) else self.gc_mode
@@ -3146,6 +4081,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             "group_size": self.group_size,
             "desc_act": self.desc_act,
             "lm_head": self.lm_head,
+            "activation": self.activation,
             METHOD_FIELD_CODE: self.method,
             QUANT_METHOD_FIELD: self.method,
             FORMAT_FIELD_CODE: self.format,

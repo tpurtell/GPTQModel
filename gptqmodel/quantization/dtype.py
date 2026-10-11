@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 from ..utils.torch import HAS_NPU
+from ..utils.logger import setup_logger
+
+
+log = setup_logger()
 
 
 try:
@@ -42,6 +47,8 @@ __all__ = [
     "dequantize_fp8",
     "dequantize_f8_e4m3",
     "dequantize_f4_e2m1",
+    "decode_e8m0_scale",
+    "quark_floatx_formats",
     "is_fp4_packed_dtype",
 ]
 
@@ -73,12 +80,74 @@ _FP8_FORMAT_CODES = {
     getattr(torch, "float8_e5m2fnuz", None): 3,
     getattr(torch, "float8_e8m0fnu", None): 4,
 }
+
+@lru_cache(maxsize=1)
+def _warn_torch_only_fp4_fallback() -> None:
+    """Log the optional TorchAO fallback cost once per process."""
+    log.warn(
+        "NVFP4 decode: TorchAO is unavailable; using the Torch-only fallback. "
+        "Per-module decoding may be slower. Install torchao for the optimized path."
+    )
+
+
 def available_float8_dtype_names() -> tuple[str, ...]:
     return _FLOAT8_DTYPE_NAMES
 
 
 def available_float8_dtypes() -> tuple[torch.dtype, ...]:
     return _FLOAT8_DTYPES
+
+
+def decode_e8m0_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Decode OCP MX E8M0 scale bytes to FP32 powers of two.
+
+    E8M0 is often serialized as uint8 rather than a PyTorch float8 dtype.
+    The all-ones byte represents NaN, not a very large finite scale.
+    """
+
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if scale.dtype == torch.uint8:
+        encoded = scale
+    elif e8m0_dtype is not None and scale.dtype == e8m0_dtype:
+        encoded = scale.view(torch.uint8)
+    else:
+        raise TypeError(f"E8M0 scale must use uint8 or float8_e8m0fnu storage, got {scale.dtype}.")
+    exponent = encoded.to(torch.int32) - 127
+    decoded = torch.ldexp(torch.ones_like(encoded, dtype=torch.float32), exponent)
+    return torch.where(encoded == 255, torch.full_like(decoded, float("nan")), decoded)
+
+
+def quark_floatx_formats(config: dict) -> frozenset[str]:
+    """Read Quark's global and per-layer weight encoding declarations."""
+
+    if not isinstance(config, dict):
+        return frozenset()
+    formats: set[str] = set()
+
+    def visit(spec: object) -> None:
+        if not isinstance(spec, dict):
+            return
+        weight = spec.get("weight", spec)
+        if not isinstance(weight, dict):
+            return
+        value = str(weight.get("dtype") or weight.get("fmt") or "").lower()
+        scale = str(weight.get("scale_format") or weight.get("scale_fmt") or "").lower()
+        block = weight.get("block_size") or weight.get("weight_block_size")
+        group = weight.get("group_size")
+        is_mx = scale in {"e8m0", "ue8m0"} and (group == 32 or block in ([1, 32], (1, 32)))
+        if "fp4" in value:
+            formats.add("mxfp4" if is_mx else "nvfp4")
+        elif "fp8" in value or value in {"e4m3", "e5m2"}:
+            formats.add("mxfp8" if is_mx else "fp8")
+
+    visit(config)
+    visit(config.get("global_quant_config"))
+    for group_key in ("layer_quant_config", "layer_type_quant_config"):
+        groups = config.get(group_key)
+        if isinstance(groups, dict):
+            for group in groups.values():
+                visit(group)
+    return frozenset(formats)
 
 
 def available_float4_packed_dtype_names() -> tuple[str, ...]:
@@ -320,26 +389,29 @@ def _dequantize_f4_reference(
     if not orig_shape:
         raise ValueError("Tensor must have at least one dimension")
 
-    expanded_shape = orig_shape[:-1] + [orig_shape[-1] * 2]
     if unpack_uint4 is not None and f4_unpacked_to_f32 is not None:
-        unpacked = unpack_uint4(tensor.reshape(-1)).view(*expanded_shape)
+        unpacked = unpack_uint4(tensor.reshape(-1))
+        expanded_shape = orig_shape[:-1] + [orig_shape[-1] * 2]
+        unpacked = unpacked.view(*expanded_shape)
         result = f4_unpacked_to_f32(unpacked).to(target_dtype)
     else:
-        # Keep floatx source decoding available in free-threaded environments
-        # where TorchAO does not publish a compatible wheel. E2M1 stores the
-        # first logical value in the low nibble.
-        unpacked = torch.empty(expanded_shape, dtype=torch.uint8, device=tensor.device)
-        unpacked[..., 0::2] = tensor & 0x0F
-        unpacked[..., 1::2] = (tensor >> 4) & 0x0F
-        codebook = torch.tensor(
-            [
-                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-            ],
+        _warn_torch_only_fp4_fallback()
+
+        # NVFP4 packs the first logical value in the low nibble and the
+        # second in the high nibble.  E2M1 has the sixteen values below; keep
+        # this fallback independent of TorchAO so native ModelOpt checkpoints
+        # remain usable in minimal GPTQModel installations.
+        lookup = torch.tensor(
+            (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0),
             dtype=target_dtype,
             device=tensor.device,
         )
-        result = codebook[unpacked.to(torch.long)]
+        packed = tensor.contiguous().view(torch.uint8)
+        expanded_shape = orig_shape[:-1] + [orig_shape[-1] * 2]
+        result = torch.empty(*expanded_shape, dtype=target_dtype, device=tensor.device)
+        result[..., 0::2] = lookup[(packed & 0x0F).to(torch.long)]
+        result[..., 1::2] = lookup[(packed >> 4).to(torch.long)]
 
     if scale is not None:
         scale_tensor = _expand_scale(scale.to(result.dtype), result, axis_hint=axis)

@@ -790,6 +790,15 @@ class _LazyWeightConverter:
                 yield _LazyWeightRenaming(source_pattern, target_pattern)
 
 
+@dataclass(frozen=True)
+class _LazyCheckpointAssembly:
+    """Describe how per-expert checkpoint tensors become one runtime tensor."""
+
+    groups: tuple[tuple[int, ...], ...]
+    merge_dim: int
+    concat_dim: Optional[int]
+
+
 class LazyTurtle:
     """Checkpoint-backed shell materializer for local dense checkpoints.
 
@@ -821,6 +830,11 @@ class LazyTurtle:
         target_model: Optional[nn.Module] = None,
     ) -> None:
         self.config = copy.deepcopy(config)
+        # Some tests and lightweight loaders pass a minimal config object.
+        # Keep the target model's type available for model-specific aliases.
+        self._model_type = getattr(self.config, "model_type", None)
+        if self._model_type is None:
+            self._model_type = getattr(getattr(target_model, "config", None), "model_type", None)
         self._model_init_kwargs = dict(model_init_kwargs or {})
         self.model_local_path, self._weight_map = self._resolve_checkpoint_source(
             model_local_path=model_local_path,
@@ -1291,6 +1305,7 @@ class LazyTurtle:
         require_class_match: bool = True,
         verify_shapes: bool = True,
         tie_after: bool = True,
+        skip_module_types: tuple[type, ...] = (),
     ) -> int:
         del require_class_match, verify_shapes
 
@@ -1312,6 +1327,8 @@ class LazyTurtle:
         try:
             with self._lock, torch.inference_mode():
                 for idx, (qname, shell_sub) in enumerate(modules):
+                    if isinstance(shell_sub, skip_module_types):
+                        continue
                     module_label = qname or "<root>"
                     draw_progress = (
                         idx % progress_interval == 0
@@ -1878,7 +1895,66 @@ class LazyTurtle:
         for candidate in initial_candidates:
             apply_chain(candidate, forward_chain)
             apply_chain(candidate, reverse_chain)
+
+        # Some Qwen4 text checkpoints store PLE tensors at the model root even
+        # though the runtime module lives inside its decoder layer.
+        for candidate in tuple(candidates):
+            root_alias = self._qwen4_exp_root_checkpoint_alias(candidate)
+            if root_alias is not None:
+                add(root_alias)
+
+        # DeepSeek-V4 has two overlapping conversion rules for the indexer:
+        # the generic rule swaps `indexer.compressor` with
+        # `compressor.indexer`, while the leaf rule renames `wq_b` to
+        # `q_b_proj`.  Applying either rule independently (or in either
+        # declared order) misses the checkpoint spelling used by the model:
+        # `indexer.compressor.wq_b`.  Add the composed form explicitly so
+        # lazy lookup follows the same model-specific compatibility aliases
+        # as the eager Transformers loader.
+        for candidate in tuple(candidates):
+            deepseek_v4_alias = self._deepseek_v4_compressor_indexer_alias(candidate)
+            if deepseek_v4_alias is not None:
+                add(deepseek_v4_alias)
         return candidates
+
+    def _deepseek_v4_compressor_indexer_alias(self, name: str) -> Optional[str]:
+        """Map the nested DeepSeek-V4 indexer projection to its checkpoint key."""
+
+        if self._model_type != "deepseek_v4":
+            return None
+
+        marker = ".compressor.indexer.q_b_proj."
+        if marker not in name:
+            return None
+        return name.replace(marker, ".indexer.compressor.wq_b.", 1)
+
+    def _qwen4_exp_root_checkpoint_alias(self, name: str) -> Optional[str]:
+        """Map a layer-local Qwen4 PLE tensor to its root checkpoint key."""
+
+        if getattr(self.config, "model_type", None) not in {"qwen4_exp", "qwen4_exp_text"}:
+            return None
+
+        parts = name.split(".")
+        for index, part in enumerate(parts[:-3]):
+            if (
+                part != "layers"
+                or index + 4 >= len(parts)
+                or not parts[index + 1].isdigit()
+                or parts[index + 2 : index + 4] != ["ple", "ple_embedding"]
+            ):
+                continue
+
+            suffix = parts[index + 4 :]
+            if suffix and suffix[0] == "ngram_embedding":
+                # N-gram shards use model.ngram_embedding.* at checkpoint root.
+                root_name = "ngram_embedding"
+                suffix = suffix[1:]
+            else:
+                # PLE buffers use model.ple_embedding.* at checkpoint root.
+                root_name = "ple_embedding"
+            return ".".join(parts[:index] + [root_name] + suffix)
+
+        return None
 
     def _converter_direct_alias_candidates(self, name: str) -> list[str]:
         if not name:
@@ -1908,6 +1984,77 @@ class LazyTurtle:
                     if aliased not in candidates:
                         candidates.append(aliased)
         return candidates
+
+    def _is_qwen4_exp_ngram_embedding(self, module_path: str, rel_name: str) -> bool:
+        """Return whether this is the Qwen4 PLE n-gram embedding table."""
+
+        config = self.config
+        model_type = getattr(config, "model_type", None)
+        if model_type not in {"qwen4_exp", "qwen4_exp_text"}:
+            return False
+        return self._join_tensor_name(module_path, rel_name).endswith(
+            ".ple.ple_embedding.ngram_embedding.weight"
+        )
+
+    def _can_zero_pad_qwen4_exp_ngram_embedding(
+        self,
+        module_path: str,
+        rel_name: str,
+        source_shape: tuple[int, ...],
+        target_shape: tuple[int, ...],
+        concat_dim: int,
+    ) -> bool:
+        """Allow a shorter Qwen4 checkpoint table to keep the shell shape."""
+
+        return (
+            concat_dim == 0
+            and self._is_qwen4_exp_ngram_embedding(module_path, rel_name)
+            and len(source_shape) == len(target_shape)
+            and source_shape[1:] == target_shape[1:]
+            and source_shape[0] < target_shape[0]
+        )
+
+    def _append_qwen4_exp_ngram_padding(
+        self,
+        *,
+        module_path: str,
+        rel_name: str,
+        parts: list[torch.Tensor],
+        target_shape: Optional[tuple[int, ...]],
+        concat_dim: int,
+    ) -> bool:
+        """Pad rows unused by checkpoints with fixed per-head vocab sizes.
+
+        Current Transformers derives prime-sized heads, which can make its
+        embedding shell slightly larger than an older fixed-size checkpoint.
+        """
+
+        if not parts or target_shape is None or concat_dim >= parts[0].ndim:
+            return False
+
+        source_shape = list(parts[0].shape)
+        for part in parts[1:]:
+            if part.ndim != len(source_shape) or any(
+                left != right
+                for axis, (left, right) in enumerate(zip(source_shape, part.shape))
+                if axis != concat_dim
+            ):
+                return False
+            source_shape[concat_dim] += part.shape[concat_dim]
+        source_shape = tuple(source_shape)
+        if not self._can_zero_pad_qwen4_exp_ngram_embedding(
+            module_path,
+            rel_name,
+            source_shape,
+            target_shape,
+            concat_dim,
+        ):
+            return False
+
+        padding_shape = list(target_shape)
+        padding_shape[0] -= source_shape[0]
+        parts.append(parts[0].new_zeros(padding_shape))
+        return True
 
     @staticmethod
     def _fused_checkpoint_requests(
@@ -2249,13 +2396,14 @@ class LazyTurtle:
         self,
         module_path: str,
         rel_name: str,
-    ) -> Optional[tuple[list[str], int]]:
+    ) -> Optional[tuple[list[str], int | _LazyCheckpointAssembly]]:
         """Resolve one fused runtime tensor backed by several split checkpoint tensors."""
 
         combined_name = self._join_tensor_name(module_path, rel_name)
 
         for converter in self._runtime_to_checkpoint_converters:
-            if "Concatenate" not in converter.operation_names:
+            operation_names = converter.operation_names
+            if "Concatenate" not in operation_names and "MergeModulelist" not in operation_names:
                 continue
             if len(converter.source_patterns) != 1:
                 continue
@@ -2263,6 +2411,85 @@ class LazyTurtle:
             runtime_pattern = converter.source_patterns[0]
             if _LazyWeightRenaming(runtime_pattern, runtime_pattern).rename_source_key(combined_name)[1] is None:
                 continue
+
+            merge_operation = next(
+                (
+                    operation
+                    for operation in converter.operations
+                    if type(operation).__name__ == "MergeModulelist"
+                ),
+                None,
+            )
+            if merge_operation is not None:
+                # MergeModulelist first stacks each wildcard source pattern by
+                # expert index. A following Concatenate then joins those
+                # stacked projection groups, e.g. w1/w3 -> gate_up_proj.
+                source_groups: list[list[str]] = []
+                for checkpoint_pattern in converter.target_patterns:
+                    renamed, matched_pattern = _LazyWeightRenaming(
+                        runtime_pattern,
+                        checkpoint_pattern,
+                    ).rename_source_key(combined_name)
+                    if matched_pattern is None or renamed == combined_name or "*" not in renamed:
+                        source_groups = []
+                        break
+
+                    source_indices = self._checkpoint_indices_for_wildcard_pattern(renamed)
+                    if not source_indices:
+                        source_groups = []
+                        break
+
+                    resolved_group: list[str] = []
+                    for source_index in source_indices:
+                        source_name = renamed.replace("*", str(source_index), 1)
+                        resolved_name = next(
+                            (
+                                candidate
+                                for candidate in self._all_runtime_to_checkpoint_candidates(source_name)
+                                if candidate in self._weight_map
+                            ),
+                            None,
+                        )
+                        if resolved_name is None:
+                            resolved_group = []
+                            break
+                        resolved_group.append(resolved_name)
+
+                    if not resolved_group:
+                        source_groups = []
+                        break
+                    source_groups.append(resolved_group)
+
+                if source_groups:
+                    group_size = len(source_groups[0])
+                    if all(len(group) == group_size for group in source_groups):
+                        flattened_names: list[str] = []
+                        groups: list[tuple[int, ...]] = []
+                        for group in source_groups:
+                            start = len(flattened_names)
+                            flattened_names.extend(group)
+                            groups.append(tuple(range(start, len(flattened_names))))
+
+                        concat_operation = next(
+                            (
+                                operation
+                                for operation in converter.operations
+                                if type(operation).__name__ == "Concatenate"
+                            ),
+                            None,
+                        )
+                        return flattened_names, _LazyCheckpointAssembly(
+                            groups=tuple(groups),
+                            merge_dim=getattr(merge_operation, "dim", 0),
+                            concat_dim=(
+                                getattr(concat_operation, "dim", 0)
+                                if concat_operation is not None
+                                else None
+                            ),
+                        )
+
+                if "Concatenate" not in operation_names:
+                    continue
 
             concat_operation = next(
                 operation
@@ -2316,6 +2543,32 @@ class LazyTurtle:
             return checkpoint_names, concat_dim
 
         return None
+
+    @staticmethod
+    def _assembly_concat_dim(assembly: int | _LazyCheckpointAssembly) -> Optional[int]:
+        if isinstance(assembly, _LazyCheckpointAssembly):
+            return assembly.concat_dim
+        return assembly
+
+    @staticmethod
+    def _assemble_checkpoint_tensor_parts(
+        parts: list[torch.Tensor],
+        assembly: int | _LazyCheckpointAssembly,
+    ) -> torch.Tensor:
+        """Apply ordinary concatenation or MergeModulelist-style assembly."""
+
+        if not isinstance(assembly, _LazyCheckpointAssembly):
+            return torch.cat(parts, dim=assembly).contiguous()
+
+        merged_groups = [
+            torch.stack([parts[index] for index in group], dim=assembly.merge_dim).contiguous()
+            for group in assembly.groups
+        ]
+        if assembly.concat_dim is None:
+            if len(merged_groups) != 1:
+                raise ValueError("MergeModulelist assembly without Concatenate produced multiple groups")
+            return merged_groups[0]
+        return torch.cat(merged_groups, dim=assembly.concat_dim).contiguous()
 
     def _materialization_device_for_tensor(
         self,
@@ -2634,6 +2887,36 @@ class LazyTurtle:
                     tensors[rel_name] = handler.get_tensor(full_name)
         return tensors
 
+    def _decode_mimo_checkpoint_tensor(
+        self,
+        full_name: str,
+        tensor: torch.Tensor,
+        *,
+        target_dtype: Optional[torch.dtype],
+    ) -> torch.Tensor:
+        """Decode MiMo storage before shape checks and dense shell copies."""
+
+        from .mimo import decode_mimo_weight, is_mimo_encoded_weight
+
+        if not is_mimo_encoded_weight(self.config, full_name, tensor):
+            return tensor
+
+        def lookup(name: str) -> Optional[torch.Tensor]:
+            shard = self._weight_map.get(name)
+            if shard is None:
+                return None
+            source_path = os.path.join(self.model_local_path, shard)
+            with safe_open(source_path, framework="pt", device="cpu") as handler:
+                return handler.get_tensor(name)
+
+        return decode_mimo_weight(
+            self.config,
+            full_name,
+            tensor,
+            lookup,
+            target_dtype=target_dtype,
+        )
+
     def _copy_checkpoint_tensors_into_submodule(
         self,
         *,
@@ -2657,7 +2940,7 @@ class LazyTurtle:
         missing_nonpersistent_buffers: list[tuple[str, str]] = []
 
         grouped_names: Dict[str, list[tuple[str, str, str, Optional[int], Optional[int], Optional[int]]]] = {}
-        concat_entries: list[tuple[str, str, list[str], int]] = []
+        concat_entries: list[tuple[str, str, list[str], int | _LazyCheckpointAssembly]] = []
         for rel_name in t_params:
             concat_source = self._resolve_concat_checkpoint_tensor_sources(module_path, rel_name)
             if concat_source is not None:
@@ -2756,10 +3039,26 @@ class LazyTurtle:
                             shard, module_path=module_path
                         )
                         with safe_open(shard_path, framework="pt", device="cpu") as handler:
-                            parts.append(handler.get_tensor(full_name))
+                            parts.append(self._decode_mimo_checkpoint_tensor(
+                                full_name,
+                                handler.get_tensor(full_name),
+                                target_dtype=(
+                                    target_tensor.dtype
+                                    if target_tensor is not None else None
+                                ),
+                            ))
 
+                    assembly_concat_dim = self._assembly_concat_dim(concat_dim)
+                    if assembly_concat_dim is not None:
+                        self._append_qwen4_exp_ngram_padding(
+                            module_path=module_path,
+                            rel_name=rel_name,
+                            parts=parts,
+                            target_shape=expected_shape,
+                            concat_dim=assembly_concat_dim,
+                        )
                     try:
-                        tensor = torch.cat(parts, dim=concat_dim).contiguous()
+                        tensor = self._assemble_checkpoint_tensor_parts(parts, concat_dim)
                     except Exception as exc:
                         raise RuntimeError(
                             self._materialization_issue_message(
@@ -2856,7 +3155,14 @@ class LazyTurtle:
                                 rel_name=rel_name,
                                 modules_by_name=modules_by_name,
                             )
-                            checkpoint_tensor = handler.get_tensor(full_name)
+                            checkpoint_tensor = self._decode_mimo_checkpoint_tensor(
+                                full_name,
+                                handler.get_tensor(full_name),
+                                target_dtype=(
+                                    target_tensor.dtype
+                                    if target_tensor is not None else None
+                                ),
+                            )
                             tensor = self._transform_checkpoint_tensor(
                                 checkpoint_tensor,
                                 expert_index=expert_index,
@@ -3100,8 +3406,14 @@ class LazyTurtle:
         *,
         shell_sub: nn.Module,
         module_path: str,
-        param_cache: Dict[tuple[str, Optional[int], Optional[int], Optional[int], torch.dtype, bool], nn.Parameter],
-        buffer_cache: Dict[tuple[str, Optional[int], Optional[int], Optional[int], torch.dtype], torch.Tensor],
+        param_cache: Dict[
+            tuple[str, Optional[int], Optional[int], Optional[int | _LazyCheckpointAssembly], torch.dtype, bool],
+            nn.Parameter,
+        ],
+        buffer_cache: Dict[
+            tuple[str, Optional[int], Optional[int], Optional[int | _LazyCheckpointAssembly], torch.dtype],
+            torch.Tensor,
+        ],
         device: Optional[torch.device] = None,
     ) -> int:
         synced = 0
@@ -3131,10 +3443,23 @@ class LazyTurtle:
                             shard, module_path=module_path
                         )
                         with safe_open(source_path, framework="pt", device="cpu") as handler:
-                            parts.append(handler.get_tensor(full_name))
+                            parts.append(self._decode_mimo_checkpoint_tensor(
+                                full_name,
+                                handler.get_tensor(full_name),
+                                target_dtype=shell_param.dtype,
+                            ))
 
+                    assembly_concat_dim = self._assembly_concat_dim(concat_dim)
+                    if assembly_concat_dim is not None:
+                        self._append_qwen4_exp_ngram_padding(
+                            module_path=module_path,
+                            rel_name=name,
+                            parts=parts,
+                            target_shape=tuple(shell_param.shape),
+                            concat_dim=assembly_concat_dim,
+                        )
                     try:
-                        source_param = torch.cat(parts, dim=concat_dim).contiguous()
+                        source_param = self._assemble_checkpoint_tensor_parts(parts, concat_dim)
                     except Exception as exc:
                         raise RuntimeError(self._materialization_issue_message(
                             phase="direct-meta sync",
@@ -3194,7 +3519,11 @@ class LazyTurtle:
                     shard, module_path=module_path
                 )
                 with safe_open(source_path, framework="pt", device="cpu") as handler:
-                    checkpoint_param = handler.get_tensor(full_name)
+                    checkpoint_param = self._decode_mimo_checkpoint_tensor(
+                        full_name,
+                        handler.get_tensor(full_name),
+                        target_dtype=shell_param.dtype,
+                    )
                 source_param = self._transform_checkpoint_tensor(
                     checkpoint_param,
                     expert_index=expert_index,
@@ -3270,10 +3599,14 @@ class LazyTurtle:
                             shard, module_path=module_path
                         )
                         with safe_open(source_path, framework="pt", device="cpu") as handler:
-                            parts.append(handler.get_tensor(full_name))
+                            parts.append(self._decode_mimo_checkpoint_tensor(
+                                full_name,
+                                handler.get_tensor(full_name),
+                                target_dtype=shell_buffer.dtype,
+                            ))
 
                     try:
-                        source_buffer = torch.cat(parts, dim=concat_dim).contiguous()
+                        source_buffer = self._assemble_checkpoint_tensor_parts(parts, concat_dim)
                     except Exception as exc:
                         raise RuntimeError(self._materialization_issue_message(
                             phase="direct-meta sync",
@@ -3331,7 +3664,11 @@ class LazyTurtle:
                     shard, module_path=module_path
                 )
                 with safe_open(source_path, framework="pt", device="cpu") as handler:
-                    checkpoint_buffer = handler.get_tensor(full_name)
+                    checkpoint_buffer = self._decode_mimo_checkpoint_tensor(
+                        full_name,
+                        handler.get_tensor(full_name),
+                        target_dtype=shell_buffer.dtype,
+                    )
                 source_buffer = self._transform_checkpoint_tensor(
                     checkpoint_buffer,
                     expert_index=expert_index,
@@ -3390,8 +3727,11 @@ def alias_from_turtle_for_submodule(
     device: torch.device,
     non_blocking: bool = False,
     module_path: Optional[str] = None,
+    tie_weights: bool = True,
 ) -> torch.nn.Module:
     # Lazy turtle supports materialization from checkpoint storage into CPU or accelerator devices.
+    # A model may intentionally defer tie_weights() until both a capture branch
+    # and its checkpoint-owner branch have been materialized.
     assert device not in [None, torch.device("meta")]
     if not hasattr(turtle_model, "materialize_submodule"):
         raise TypeError(
@@ -3404,6 +3744,7 @@ def alias_from_turtle_for_submodule(
         device=device,
         non_blocking=non_blocking,
         module_path=module_path,
+        tie_weights=tie_weights,
     )
 
 
@@ -3437,6 +3778,7 @@ def alias_all_from_turtle_if_meta(
     require_class_match: bool = True,
     verify_shapes: bool = True,
     tie_after: bool = True,
+    skip_module_types: tuple[type, ...] = (),
 ) -> int:
     """
     Materialize any remaining direct meta tensors in `shell_model` from the lazy turtle source.
@@ -3453,4 +3795,5 @@ def alias_all_from_turtle_if_meta(
         require_class_match=require_class_match,
         verify_shapes=verify_shapes,
         tie_after=tie_after,
+        **({"skip_module_types": skip_module_types} if skip_module_types else {}),
     )

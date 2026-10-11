@@ -66,7 +66,7 @@ from .ctx import ctx
 from .device import get_device
 from .hf import get_hf_config_dtype
 from .hub import hf_hub_download, model_info
-from .importer import select_quant_linear
+from .importer import select_quant_linear, validate_quant_linear
 from .logger import log_time_block, setup_logger
 from .model_dequant import _correct_gptq_v1_qzeros, _revert_gptq_v1_qzeros_correction
 from .torch import HAS_CUDA, torch_empty_cache
@@ -158,6 +158,8 @@ MoETopKState = List[Tuple[nn.Module, str, int]]
 MOE_TOPK_FIELD_NAMES = [
     "top_k",
     "moe_k", # ernie4_5_vl_moe
+    # K2 Horizon's MoVA router uses this name instead of ``top_k``.
+    "num_experts_per_tok",
 ]
 
 MOE_NUM_EXPERTS_FIELD_NAMES = [
@@ -614,9 +616,11 @@ def create_quant_module(
     if issubclass(linear_cls, GPTQQuantLinear):
         tmp_init_kwargs.setdefault("format", format)
 
-    # when loading a quantized model, device is the target passed through the GPT-QModel load path
-    # check in_features and out_features validate
-    _, err = linear_cls.validate(
+    # Keep concrete device ordinals through per-module validation.  The shared
+    # selector cache validates every target in a multi-GPU selector and lets
+    # device-sensitive kernels query the capability of that exact target.
+    _, err = validate_quant_linear(
+        linear_cls,
         bits=validate_bits,
         group_size=tmp_group_size,
         desc_act=tmp_desc_act,
@@ -625,7 +629,7 @@ def create_quant_module(
         dtype=dtype,
         in_features=in_features,
         out_features=out_features,
-        device=DEVICE(device) if isinstance(device, str) else device,
+        device=device,
         adapter=adapter, # TODO FIX ME..need to pass Eora if loaded
     )
     if err is not None:
@@ -1444,6 +1448,18 @@ def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeCon
         elif isinstance(submodule, BaseQuantLinear):
             submodule.post_init()
 
+    if quantize_config is not None and quantize_config.activation_mode in {"w4afp8", "w4a_nvfp4"}:
+        from ..nn_modules.qlinear.w4a_llama_stream import install_w4a_llama_stream
+
+        install_w4a_llama_stream(
+            model, quantize_config.activation_mode, quantize_config.activation_recipe,
+            global_scales=quantize_config.activation_global_scales,
+            attention_mode=quantize_config.activation_attention_mode,
+            attention_recipe=quantize_config.activation_attention_recipe,
+            mlp_fp8_layers=quantize_config.activation_mlp_fp8_layers,
+            fused_norms=bool(quantize_config.rotation),
+        )
+
     torch_empty_cache()
 
     return model
@@ -1652,6 +1668,7 @@ def check_requires_version(requires_version, current_version):
 class MODALITY(str, Enum):
     TEXT = "text"
     IMAGE_TO_TEXT = "image_to_text"
+    VIDEO_TO_TEXT = "video_to_text"
     # TEXT_TO_IMAGE = "text_to_image"
 
 
@@ -1759,6 +1776,15 @@ def _resolve_offload_entry(
         shape = tuple(entry["shape"])
     else:
         shape = shape_hint
+
+    if resolved_dtype != dtype or shape != shape_hint:
+        name = f"{module_path}.{leaf}" if module_path else leaf
+        index_path = os.path.join(module_dir, "index.json")
+        raise ValueError(
+            f"Offload metadata mismatch for tensor '{name}' in '{index_path}': "
+            f"expected dtype {dtype} and shape {shape_hint}, "
+            f"found dtype {resolved_dtype} and shape {shape}."
+        )
 
     safetensors_file = entry.get("safetensors_file")
     if safetensors_file:
@@ -1975,7 +2001,9 @@ def get_state_dict_for_save(
     return state_dict
 
 
-def _checkpoint_tensor_keys(checkpoint: str | os.PathLike) -> Optional[set[str]]:
+def _checkpoint_tensor_keys(
+    checkpoint: str | os.PathLike, *, verify_shards: bool = False,
+) -> Optional[set[str]]:
     # accelerate.load_checkpoint_in_model() does not return the checkpoint key
     # set. Read only metadata/index keys here so tie_weights() can distinguish
     # tensors that were truly absent from tensors that were loaded separately.
@@ -1987,6 +2015,16 @@ def _checkpoint_tensor_keys(checkpoint: str | os.PathLike) -> Optional[set[str]]
                 index = json.load(f)
             weight_map = index.get("weight_map", index)
             if isinstance(weight_map, dict):
+                if verify_shards:
+                    keys = set()
+                    for shard in set(weight_map.values()):
+                        shard_keys = _checkpoint_tensor_keys(
+                            os.path.join(os.path.dirname(checkpoint), shard),
+                        )
+                        if shard_keys is None:
+                            return None
+                        keys.update(shard_keys)
+                    return keys
                 return set(weight_map)
             return None
 
@@ -2008,12 +2046,34 @@ def _checkpoint_tensor_keys(checkpoint: str | os.PathLike) -> Optional[set[str]]
     if len(index_files) != 1:
         return None
 
-    with open(os.path.join(checkpoint, index_files[0]), encoding="utf-8") as f:
-        index = json.load(f)
-    weight_map = index.get("weight_map", index)
-    if isinstance(weight_map, dict):
-        return set(weight_map)
-    return None
+    return _checkpoint_tensor_keys(
+        os.path.join(checkpoint, index_files[0]), verify_shards=verify_shards,
+    )
+
+
+def validate_checkpoint_qweights(
+    model: nn.Module, checkpoint: str | os.PathLike, format: FORMAT,
+) -> None:
+    if format not in (FORMAT.GPTQ, FORMAT.GPTQ_V2):
+        return
+
+    checkpoint_keys = _checkpoint_tensor_keys(checkpoint, verify_shards=True)
+    if checkpoint_keys is None:
+        return
+
+    # A shared quantized module can be saved under any one of its aliases.
+    module_keys = collections.defaultdict(set)
+    for name, module in model.named_modules(remove_duplicate=False):
+        if isinstance(module, GPTQQuantLinear):
+            module_keys[id(module)].add(f"{name}.qweight" if name else "qweight")
+    missing = sorted(
+        min(keys) for keys in module_keys.values() if not keys & checkpoint_keys
+    )
+    if missing:
+        raise ValueError(
+            f"Missing required quantized weights in checkpoint {os.fspath(checkpoint)!r}: "
+            + ", ".join(missing)
+        )
 
 
 def _tie_weights_after_checkpoint_load(model, checkpoint: str | os.PathLike | None) -> None:
@@ -2422,22 +2482,51 @@ def has_any_attr(obj, names):
 def find_moe_routing_modules(model):
     modules = []
     for module in model.modules():
-        if has_any_attr(module, MOE_TOPK_FIELD_NAMES) and \
-                has_any_attr(module, MOE_NUM_EXPERTS_FIELD_NAMES):
+        if has_any_attr(module, MOE_TOPK_FIELD_NAMES) and _get_local_expert_count(module):
             modules.append(module)
     return modules
+
+
+def _get_local_expert_count(module: nn.Module) -> Optional[int]:
+    """Return the expert cardinality owned by one router module.
+
+    Most MoE implementations expose ``num_experts`` directly.  K2 Horizon's
+    MoVA value router instead owns an ``nn.ModuleList`` called ``v_experts``;
+    deriving its local count is important because the model also contains a
+    separate 100-expert MLP router.
+    """
+    for name in MOE_NUM_EXPERTS_FIELD_NAMES:
+        value = getattr(module, name, None)
+        if isinstance(value, int) and value > 0:
+            return value
+
+    experts = getattr(module, "v_experts", None)
+    if experts is not None:
+        try:
+            count = len(experts)
+        except TypeError:
+            count = 0
+        if count > 0:
+            return count
+    return None
 
 
 def set_moe_topk(model: nn.Module, new_topk: int) -> MoETopKState:
     routers = find_moe_routing_modules(model)
     state: MoETopKState = []
     for r in routers:
+        local_count = _get_local_expert_count(r)
+        if local_count is None:
+            continue
         for name in MOE_TOPK_FIELD_NAMES:
             if hasattr(r, name):
                 old = getattr(r, name)
                 assert isinstance(old, int)
                 state.append((r, name, old))
-                setattr(r, name, new_topk)
+                # A global override is resolved independently for every
+                # router.  In particular, an override of 100 means all 100
+                # MLP experts but only the 64 local MoVA value experts.
+                setattr(r, name, min(new_topk, local_count))
                 break
     return state
 

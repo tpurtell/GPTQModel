@@ -34,17 +34,53 @@ from ..nn_modules.converter import MODULE_CONVERTER_MAP
 from ..nn_modules.hooked_linear import replace_module_with_hooked_legacy
 from ..quantization.config import GcMode, QuantizeEmbed
 from ..utils.device import get_device, get_device_new
+from ..utils.device_telemetry import capture_device_telemetry
 from ..utils.logger import live_renderables_suppressed, log_time_block, setup_logger
-from ..utils.looper_helpers import find_last_quantized_layer_index, normalize_device_like
+from ..utils.looper_helpers import (
+    find_last_quantized_layer_index,
+    normalize_device_like,
+)
 from ..utils.model import find_modules, get_layer_name, get_module
 from ..utils.offload import offload_to_disk
 from ..utils.torch import CPU, torch_empty_cache, torch_sync
 from .input_cache import TensorLifetimeDiagnostic
+from .extension import LoopStep
 from .stage_subset import SubsetPlan, build_layer_subset_plans, run_subset_stage
-
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only
     from .module_looper import ModuleLooper
+
+
+def _log_cuda_memory_diagnostics(log, layer_index) -> None:
+    """One line per visible CUDA device: allocator-active vs allocator-reserved bytes.
+
+    Diagnostic for layer-over-layer GPU memory growth: `nvidia-smi`/process RSS
+    only show *reserved* memory (what the CUDA caching allocator has claimed
+    from the driver and is holding, whether or not anything is using it right
+    now), not what is actually *active* (live tensors). If `active` stays flat
+    while `reserved` keeps climbing layer over layer, the cause is allocator
+    fragmentation/churn, not a genuine reference-counting leak of some tensor
+    nobody is freeing. If both climb together, that points back to a real leak.
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        for idx in range(torch.cuda.device_count()):
+            stats = torch.cuda.memory_stats(idx)
+            active = stats.get("active_bytes.all.current", 0) / (1024 ** 3)
+            reserved = stats.get("reserved_bytes.all.current", 0) / (1024 ** 3)
+            retries = stats.get("num_alloc_retries", 0)
+            log.info(
+                "MemDiag: layer=%s cuda:%s active=%.2fGiB reserved=%.2fGiB gap=%.2fGiB alloc_retries=%s",
+                layer_index,
+                idx,
+                active,
+                reserved,
+                reserved - active,
+                retries,
+            )
+    except Exception as exc:  # pragma: no cover - diagnostics must never break the run
+        log.debug("MemDiag: failed to collect CUDA memory stats: %s", exc)
 
 
 def _should_drain_finalize_futures_synchronously(
@@ -65,6 +101,7 @@ def _should_drain_finalize_futures_synchronously(
     weights, activations, and packing state across layer boundaries. In
     practice, the overlap is not worth the allocator pressure risk, so
     multi-device runs drain per-layer finalizers synchronously.
+
     """
     if (
         looper.gptq_model.quantize_config.wait_for_submodule_finalizers
@@ -73,6 +110,14 @@ def _should_drain_finalize_futures_synchronously(
         )
         is not None
     ):
+        return True
+
+    # W4A finalization creates the packed GPTQ module that post-init later
+    # expands into its reusable hardware operand.  Do not overlap those
+    # allocations with the next layer's Hessians and activation replay cache;
+    # on unified-memory devices that overlap can exceed the process cgroup even
+    # though either lifecycle phase fits on its own.
+    if looper.gptq_model.quantize_config.activation_mode in {"w4afp8", "w4a_nvfp4"}:
         return True
 
     quant_devices = getattr(looper, "_quant_devices", None) or []
@@ -91,7 +136,7 @@ def _should_empty_cache_after_sync_finalize(
     *,
     finalize_tasks,
 ) -> bool:
-    """Release CUDA cache after synchronous ParoQuant finalization when offload is active.
+    """Release CUDA cache after memory-heavy synchronous finalization.
 
     Disk offload correctly moves finalized modules out of the live model path,
     but CUDA's allocator can still hold onto the just-freed pools across layer
@@ -99,7 +144,15 @@ def _should_empty_cache_after_sync_finalize(
     previous layer no longer needs those weights on device. A cache release at
     the synchronous boundary keeps layer-scope memory flat without changing the
     quantization objective.
+
+    W4A calibration also replays the complete calibration corpus after each
+    layer. On unified-memory CUDA devices, retaining those released allocator
+    blocks causes the process cgroup charge to ratchet upward once per layer.
+    W4A therefore always releases the allocator cache at its already
+    synchronous layer boundary.
     """
+    if looper.gptq_model.quantize_config.activation_mode in {"w4afp8", "w4a_nvfp4"}:
+        return True
     if not getattr(looper.gptq_model.quantize_config, "offload_to_disk", False):
         return False
     return any(isinstance(process, ParoQuantProcessor) for process, *_ in finalize_tasks)
@@ -186,7 +239,16 @@ def _replay_layer_outputs(
     replay_plan: Optional[SubsetPlan] = None,
     force_serial: Optional[bool] = None,
 ) -> List[List[torch.Tensor]]:
-    """Replay one layer forward to materialize outputs for the next layer."""
+    """Replay one layer forward to materialize outputs for the next layer.
+
+    ``force_serial`` overrides data-parallel forward dispatch. Resume replay
+    passes this: running several batches through torch's dynamo-instrumented
+    eval-frame hook from multiple free-threading workers at once has been
+    observed to livelock (every worker spins inside the frame-evaluation
+    shim, 0% GPU util, no forward progress). Serial execution avoids the
+    concurrent entry entirely; the cost is bounded to the handful of already-
+    quantized layers being fast-forwarded, not the run's main quant loop.
+    """
 
     if replay_plan is None:
         replay_batch_count, replay_row_counts, replay_total_rows = _collect_layer_forward_progress(
@@ -405,7 +467,12 @@ def run_layer_stage(
         if enabled and name
     }
     layer_index_offset = 1 if quant_input_embeddings else 0
+
+    extensions = getattr(looper, "extensions", None)
     for layer_index in pb:
+        if layer_index < getattr(looper, "start_step", 0):
+            continue
+        boundary_futures = []
         # Iterate over every transformer layer (plus lm_head when enabled) as
         # progress-bar controlled units of work.
         if looper._check_loop_stop():
@@ -506,6 +573,8 @@ def run_layer_stage(
                 layer_count - 1 if not is_embeddings_module else layer_title.replace("Quantizing ", ""),
                 layer_title,
             )
+        # Emit diagnostics even when live progress logs are disabled.
+        _log_cuda_memory_diagnostics(log, layer_index if not is_lm_head_module else "lm_head")
 
         should_quantize_layer = getattr(looper.gptq_model, "should_quantize_layer", None)
         if callable(should_quantize_layer) and not should_quantize_layer(
@@ -514,6 +583,7 @@ def run_layer_stage(
             layer_index,
             looper.gptq_model.quantize_config,
         ):
+            # Excluded layers have no bundles and remain skipped on resume.
             continue
 
         module = looper.gptq_model.pre_quantize(module)
@@ -725,6 +795,11 @@ def run_layer_stage(
             continue
 
         for p_index, processor in enumerate(looper.processors):
+            if looper.gptq_model.quantize_config.activation_mode in {"w4afp8", "w4a_nvfp4"}:
+                from .native_processor import NativeProcessor
+                from ..nn_modules.qlinear.w4a_llama_replay import set_w4a_replay_enabled
+
+                set_w4a_replay_enabled(module, not isinstance(processor, NativeProcessor))
             # Each processor contributes a quantization phase; walk them in
             # order so their caches and side effects line up with the pipeline.
             processor.log_call_count = 0  # reset
@@ -1133,6 +1208,10 @@ def run_layer_stage(
                                                 model=looper.gptq_model.model,
                                                 module=target_module,
                                                 disk_path=offload_path,
+                                                # The on-disk bundle is the only record a
+                                                # resumed run can restore from, so never
+                                                # skip it for small modules.
+                                                force=True,
                                             )
                                         if region_timer is not None and offload_start is not None:
                                             region_timer.record(
@@ -1173,6 +1252,7 @@ def run_layer_stage(
                         layer_idx,
                     )
                     finalize_futures.append((future, index, module_label, process, layer_idx))
+                    boundary_futures.append(future)
 
                 finalize_futures_snapshot = list(finalize_futures)
 
@@ -1216,7 +1296,13 @@ def run_layer_stage(
                     finalize_count_local,
                     layer_idx_for_callback,
                 ):
-                    """Consumes finalize futures, updating progress and surfacing errors."""
+                    """Consumes finalize futures, updating progress and surfacing errors.
+
+                    Returns True only if every future completed successfully —
+                    callers must not treat the layer as a durable resume point
+                    otherwise (a failed future means some module was never
+                    packed/offloaded even though the loop-stop is deferred).
+                    """
 
                     completed_local = 0
                     try:
@@ -1228,7 +1314,7 @@ def run_layer_stage(
                             except BaseException as exc:
                                 log.exception("Submodule finalize task raised an exception")
                                 looper._request_loop_stop(exc)
-                                return
+                                return False
 
                             if isinstance(result, finalize_progress_cls):
                                 module_label = result.module_label
@@ -1257,6 +1343,7 @@ def run_layer_stage(
                             submodule_finalized=True,
                             raise_in_place=False,
                         )
+                    return True
 
                 if finalize_futures_snapshot:
                     drain_sync = _should_drain_finalize_futures_synchronously(
@@ -1285,12 +1372,16 @@ def run_layer_stage(
                             looper,
                             finalize_tasks=finalize_tasks,
                         ):
-                            torch_empty_cache(device=cur_layer_device, gc=False, sync=True)
+                            is_w4a = looper.gptq_model.quantize_config.activation_mode in {
+                                "w4afp8",
+                                "w4a_nvfp4",
+                            }
+                            torch_empty_cache(device=cur_layer_device, gc=is_w4a, sync=True)
                     else:
                         # Asynchronous (current/default behavior): drain in background thread
                         # This allows next layer to start while current layer finalizes
                         finalizer_thread = threading.Thread(
-                            target=_drain_finalize_futures,
+                            target=capture_device_telemetry(_drain_finalize_futures),
                             args=(
                                 [future for future, *_ in finalize_futures_snapshot],
                                 finalize_pb,
@@ -1335,9 +1426,27 @@ def run_layer_stage(
                         layer_index=layer_index,
                         layer_name=layer_descriptor,
                     )
+        if extensions:
+            step_kind = (
+                "input_embeddings" if is_input_embeddings_module else
+                "output_embeddings" if is_output_embeddings_module else
+                "lm_head" if is_lm_head_module else "layer"
+            )
+            extensions.publish(
+                LoopStep(step_kind, model_layer_index, layer_name or step_kind),
+                boundary_futures,
+            )
 
         if durable_progress_logs:
             log.info(
                 "StageLayer: handoff complete for layer=%s",
                 layer_index if not is_lm_head_module else "lm_head",
             )
+
+        # `layer_index - 1`'s cached output (e.g. this model's DSA-style
+        # indexer top-k indices, threaded via reuse_kv) is only ever read
+        # during layer_index's own forward/quantize/replay work above, which
+        # has just finished. Evict it now -- otherwise shared_kv_cache_dict
+        # grows by one entry per layer for the whole run and is never
+        # reclaimed (harmless per-entry, but unbounded over many layers).
+        shared_kv_cache_dict.pop(layer_index - 1, None)

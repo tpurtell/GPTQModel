@@ -4,25 +4,35 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import copy
+import sys
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
 from torch.nn import Module
 
-from ..looper.loop_processor import DTYPE_SIZE_COLUMN, ExecutionConfig, MODULE_FEATURE_COLUMN, LoopProcessor
+from ..looper.loop_processor import DTYPE_SIZE_COLUMN, MODULE_FEATURE_COLUMN, ExecutionConfig, LoopProcessor
 from ..looper.named_module import NamedModule
 from ..models import BaseQModel
 from ..models._const import DEVICE
-from ..models.writer import (PROCESS_LOG_FWD_TIME, PROCESS_LOG_LAYER, PROCESS_LOG_MODULE, PROCESS_LOG_NAME,
-                             PROCESS_LOG_TIME, QUANT_LOG_DAMP, QUANT_LOG_LOSS, QUANT_LOG_NSAMPLES)
+from ..models.writer import (
+    PROCESS_LOG_FWD_TIME,
+    PROCESS_LOG_LAYER,
+    PROCESS_LOG_MODULE,
+    PROCESS_LOG_NAME,
+    PROCESS_LOG_TIME,
+    QUANT_LOG_DAMP,
+    QUANT_LOG_LOSS,
+    QUANT_LOG_NSAMPLES,
+)
 from ..nn_modules.qlinear.qqq import QQQLinear, QQQTorchLinear
 from ..quantization.config import METHOD, QuantizeConfig, resolve_quant_format
-from ..utils.fallback import normalize_fallback
 from ..quantization.qqq import QQQ
 from ..utils.backend import BACKEND
-from ..utils.logger import setup_logger, log_time_block
-from ..utils.model import create_quant_module, find_modules, move_to, pack_module
+from ..utils.fallback import normalize_fallback
+from ..utils.logger import log_time_block, setup_logger
+from ..utils.model import create_quant_module, move_to, pack_module
 from ..utils.torch import CPU
+
 
 log = setup_logger()
 
@@ -60,6 +70,8 @@ class QQQProcessor(LoopProcessor):
         self.avg_losses = []
 
     def _quant_linear_kernel(self):
+        if sys.platform == "darwin":
+            return QQQTorchLinear, BACKEND.QQQ_TORCH
         device = self.qcfg.device
         if isinstance(device, DEVICE):
             return (QQQTorchLinear, BACKEND.QQQ_TORCH) if device == DEVICE.NPU else (QQQLinear, BACKEND.QQQ)
@@ -238,6 +250,8 @@ class QQQProcessor(LoopProcessor):
             with self.lock:
                 module.state.update({
                     "w_wq_diff": w_wq_diff,
+                    # EoRA may rematerialize the module before consuming this.
+                    "wq": wq.detach().to(device=CPU, copy=True),
                 })
 
         # with torch_streamCtx(DEVICE_0_STREAM):
@@ -252,7 +266,10 @@ class QQQProcessor(LoopProcessor):
         """Creates the quantized module and packs the saved QQQ tensors into it."""
 
         # generate complete, safe to move to cpu
-        module.weight.data = move_to(module.weight.data, device=CPU) # large weights is slow to init on cpu
+        if self.calculate_w_wq_diff:
+            module.weight.data = module.state.pop("wq").to(CPU)
+        else:
+            module.weight.data = move_to(module.weight.data, device=CPU)
         module.state.pop("w", None) # no need for original weights now
 
         # cleanup all memory or states vars persistently added by this processor
@@ -265,7 +282,7 @@ class QQQProcessor(LoopProcessor):
             q_g_idx = module.state.pop("q_g_idx")
             q_scales_extra = module.state.pop("q_scales_extra")
 
-        layers = find_modules(model.model)
+        layers = {module.full_name: model.model.get_submodule(module.full_name)}
         module_label = getattr(module, "full_name", getattr(module, "name", ""))
         quant_linear_cls, backend = self._quant_linear_kernel()
 
@@ -294,11 +311,12 @@ class QQQProcessor(LoopProcessor):
             )
 
         # pack module
-        qModules = {
-            name: submodule
-            for name, submodule in find_modules(model.model, [quant_linear_cls]).items()
-            if name == module.full_name
-        }
+        qmodule = model.model.get_submodule(module.full_name)
+        qModules = (
+            {module.full_name: qmodule}
+            if isinstance(qmodule, quant_linear_cls)
+            else {}
+        )
         with log_time_block(
             "pack",
             logger=log,

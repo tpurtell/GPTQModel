@@ -928,7 +928,11 @@ def _run_single_subset_pass(
     if looper.gptq_model and hasattr(looper.gptq_model, 'moe_lifecycle_hooks'):
         hooks = looper.gptq_model.moe_lifecycle_hooks
         if hooks is not None:
-            moe_block = hooks.get_moe_block(module, looper.gptq_model.__class__)
+            moe_block = hooks.get_moe_block_for_subset(
+                module,
+                looper.gptq_model,
+                current_subset=subset,
+            )
             if moe_block is not None:
                 # Get the full name/path of the MoE block
                 for mod_name, mod in module.named_modules():
@@ -1102,6 +1106,40 @@ def _run_single_subset_pass(
                 looper._current_subset = None
             else:
                 looper._current_subset = subset
+            begin_scale_probe = getattr(processor, "begin_activation_scale_probe", None)
+            end_scale_probe = getattr(processor, "end_activation_scale_probe", None)
+            probing_scales = bool(
+                getattr(getattr(processor, "qcfg", None), "activation_mode", None) == "w4a_nvfp4"
+                and callable(begin_scale_probe)
+                and begin_scale_probe(subset, layer=module)
+            )
+            if probing_scales:
+                try:
+                    looper._run_forward_batches(
+                        module=module,
+                        processor=processor,
+                        current_subset=None if disable_moe_hooks else subset,
+                        ordered_module_names=subset_names,
+                        layer_inputs=layer_inputs,
+                        layer_input_kwargs=layer_input_kwargs,
+                        position_ids=position_ids,
+                        attention_masks=attention_masks,
+                        cur_layer_device=cur_layer_device,
+                        is_lm_head_module=is_lm_head_module,
+                        shared_kv_cache_dict={},
+                        layer_index=layer_index,
+                        need_outputs=False,
+                        reuse_kv=False,
+                        progress_pb=None,
+                        progress_title=f"{forward_msg} (NVFP4 scale probe)",
+                        progress_stage="NVFP4 scale probe",
+                        progress_rows_per_batch=forward_row_counts,
+                        progress_total_rows=plan.forward_total_rows,
+                        force_serial=plan.subset_forward_serial,
+                        preserve_module_devices=preserve_devices,
+                    )
+                finally:
+                    end_scale_probe(subset, layer=module)
             with capture_context:
                 forward_outputs = looper._run_forward_batches(
                     module=module,

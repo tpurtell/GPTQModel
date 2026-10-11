@@ -24,6 +24,7 @@ from transformers.models.auto.tokenization_auto import get_tokenizer_config
 
 from ..adapter.adapter import HF_ADAPTER_FILE_NAME, HF_ADAPTER_WEIGHT_KEY_PREFIX, Lora
 from ..adapter.peft import LoraConfig
+from ..nn_modules.qlinear import BaseQuantLinear
 from ..quantization.config import (
     FORMAT,
     META_FIELD_ACT_GROUP_AWARE,
@@ -46,6 +47,7 @@ from ..utils.exllamav3 import build_exllamav3_tensor_storage
 from ..utils.exl3_error_ledger import write_exl3_error_ledger
 from ..utils.hf import (
     _normalize_legacy_tied_weights_keys,
+    ensure_qwen_drive_registered,
     prepare_remote_code_compat,
     sanitize_generation_config_file,
     sanitize_model_config,
@@ -497,6 +499,49 @@ def _resolve_out_of_model_source_files(
         for filename in os.listdir(model_local_path)
         if filename.endswith(".safetensors") and isfile(join(model_local_path, filename))
     )
+
+
+def _load_native_w4a_for_save(model: torch.nn.Module, checkpoint: str, *, activation_mode: str) -> None:
+    """Load native checkpoint tensors exactly into a CPU serialization shell.
+
+    Generic CPU GPTQ linears do not declare NVFP4 calibration buffers. Register
+    those buffers for NVFP4 before loading. Both W4A modes assign tensors rather
+    than casting checkpoint values to the shell's FP16 dtype, which can change
+    or overflow BF16 tensors. Runtime weight caches and producer buffers remain
+    absent from the native checkpoint.
+    """
+    if activation_mode == "w4a_nvfp4":
+        for module in model.modules():
+            if isinstance(module, BaseQuantLinear):
+                module.register_buffer("activation_global_scale_bits", torch.ones((), dtype=torch.float32).view(torch.int32))
+    if checkpoint.endswith(".index.json"):
+        with open(checkpoint, encoding="utf-8") as handle:
+            index = json.load(handle)
+        files = [join(os.path.dirname(checkpoint), name) for name in sorted(set(index["weight_map"].values()))]
+    elif checkpoint.endswith(".safetensors"):
+        files = [checkpoint]
+    else:
+        raise ValueError("W4A export requires a safetensors file or shard index")
+    expected, seen = set(model.state_dict()), set()
+    for path in files:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            values = {name: handle.get_tensor(name) for name in handle.keys()}
+        if seen.intersection(values):
+            raise ValueError("Duplicate native W4A tensor across checkpoint shards")
+        result = model.load_state_dict(values, strict=False, assign=True)
+        if result.unexpected_keys:
+            raise ValueError(f"Unrecognized native W4A tensors: {result.unexpected_keys}")
+        seen.update(values)
+    model.tie_weights()
+    # A tied tensor can legitimately be omitted from safetensors. Every other
+    # parameter/buffer must have been loaded, including the calibration bits.
+    state = model.state_dict()
+    def storage_key(value):
+        return value.data_ptr(), value.dtype, tuple(value.shape)
+    restored_storage = {storage_key(state[name]) for name in seen}
+    missing = sorted(name for name in expected - seen if storage_key(state[name]) not in restored_storage)
+    if missing:
+        raise ValueError(f"Missing native W4A checkpoint tensors: {missing}")
 
 
 def _load_tensors_by_selectors(
@@ -1442,7 +1487,7 @@ def ModelWriter(cls):
         if runtime_config is not None and hasattr(runtime_config, "tie_word_embeddings"):
             model_config["tie_word_embeddings"] = bool(runtime_config.tie_word_embeddings)
         with open(config_path, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(model_config, indent=2, sort_keys=True) + "\n")
+            handle.write(json.dumps(model_config, indent=2) + "\n")
 
         if self.trust_remote_code:
             copy_py_files(save_dir, model_id_or_path=self.model_local_path)
@@ -1662,6 +1707,20 @@ def ModelWriter(cls):
 
         # Save `quantize_config.json`
         quantize_config.save_pretrained(save_dir)
+
+        if quantize_config.dynamic:
+            # Transformers sorts nested keys, but dynamic rules use first-match order.
+            quant_config_path = os.path.join(save_dir, "quantize_config.json")
+            with open(quant_config_path, "r", encoding="utf-8") as handle:
+                saved_quant_config = json.load(handle)
+            config_path = os.path.join(save_dir, "config.json")
+            with open(config_path, "r", encoding="utf-8") as handle:
+                saved_config = json.load(handle)
+            saved_config["quantization_config"]["dynamic"] = (
+                saved_quant_config["dynamic"]
+            )
+            with open(config_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(saved_config, indent=2) + "\n")
 
         log.info("Model: Saved quantized config metadata to `%s`.", save_dir)
 
@@ -1905,6 +1964,7 @@ def ModelWriter(cls):
 
     def get_model_with_quantize(self, qcfg, model_id_or_path):
 
+        ensure_qwen_drive_registered(model_id_or_path)
         config = AutoConfig.from_pretrained(
             model_id_or_path,
             trust_remote_code=True,
@@ -1947,15 +2007,18 @@ def ModelWriter(cls):
                 device=DEVICE.CPU,
             )
 
-        load_checkpoint_in_model_then_tie_weights(
-            model,
-            dtype=torch.float16,
-            # This is very hacky but works due to https://github.com/huggingface/accelerate/blob/bd72a5f1a80d5146554458823f8aeda0a9db5297/src/accelerate/utils/modeling.py#L292
-            checkpoint=self.checkpoint_file_name,
-            # device_map=device_map,
-            # offload_state_dict=True,
-            # offload_buffers=True,
-        )
+        if qcfg.activation_mode in {"w4afp8", "w4a_nvfp4"}:
+            _load_native_w4a_for_save(model, self.checkpoint_file_name, activation_mode=qcfg.activation_mode)
+        else:
+            load_checkpoint_in_model_then_tie_weights(
+                model,
+                dtype=torch.float16,
+                # This is very hacky but works due to https://github.com/huggingface/accelerate/blob/bd72a5f1a80d5146554458823f8aeda0a9db5297/src/accelerate/utils/modeling.py#L292
+                checkpoint=self.checkpoint_file_name,
+                # device_map=device_map,
+                # offload_state_dict=True,
+                # offload_buffers=True,
+            )
         torch_empty_cache()
         return model
 

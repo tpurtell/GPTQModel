@@ -25,10 +25,11 @@ from .deepseek_v4 import DeepSeekV4QModel
 from .deepseek_ocr2 import DeepSeekOCR2QModel
 from .deepseek_vl import DeepSeekVLQModel
 from .deepseek_vl_v2 import DeepSeekVLV2QModel
+from .diffusion_gemma import DiffusionGemmaQModel
 from .dots1 import Dots1QModel
 from .dream import DreamQModel
 from .exaone import ExaOneQModel
-from .exaone4 import Exaone4QModel
+from .exaone4 import Exaone4QModel, Exaone4_5QModel
 from .ernie4_5 import Ernie4_5QModel
 from .ernie4_5_moe import Ernie4_5_MoeQModel
 from .ernie4_5_vl_moe import Ernie4_5_VLMoeQModel
@@ -47,6 +48,7 @@ from .gpt_bigcode import GptBigCodeQModel
 from .gpt_neo import GptNeoQModel
 from .gpt_neox import GPTNeoXQModel
 from .gptj import GptJQModel
+from .granitemoe import GraniteMoeQModel
 from .grinmoe import GrinMoeQModel
 from .hrm_text import HrmTextQModel
 from .hunyuan_v1_dense import HunYuanDenseV1QModel
@@ -60,7 +62,9 @@ from .internlm import InternLMQModel
 from .internlm2 import InternLM2QModel
 from .intern_s2_preview import InternS2PreviewQModel
 from .interns1 import InternS1QModel
+from .internvl import InternVLQModel
 from .internvl_chat import InternVLChatQModel
+from .k2_horizon import K2HorizonGPTQ, K2HorizonQModel
 from .lfm2_vl import LFM2VLQModel
 from .mage_vl import MageVLQModel
 from .llama4 import Llama4QModel, Llama4TextQModel
@@ -79,10 +83,13 @@ from .mobilellm import MobileLLMQModel
 from .moss import MossQModel
 from .mpt import MptQModel
 from .muse_glimmer import MuseGlimmerQModel
+from .nanbeige import NanbeigeQModel
 from .nemotron_labs_diffusion import NemotronLabsDiffusionQModel
 from .nemotron_h_puzzle import NemotronHPuzzleQModel
 from .olmo3 import Olmo3QModel
+from .olmoe import OlmoeQModel
 from .opt import OptQModel
+from .ouro import OuroQModel
 from .ovis import OvisQModel
 from .ovis2_5 import Ovis2_5QModel
 from .ovis2_6_moe import Ovis2_6_MoeQModel
@@ -96,19 +103,25 @@ from .qwen2_moe import Qwen2MoeQModel
 from .qwen2_vl import Qwen2VLQModel
 from .qwen3 import Qwen3QModel
 from .qwen3_moe import Qwen3MoeQModel
-from .qwen3_vl import Qwen3_VLQModel
-from .qwen4_exp import Qwen4ExpQModel
+from .qwen_drive import QwenDriveQModel
+from .qwen3_vl import Qwen3_VLQModel, Qwen3_VL_MoeQModel
+from .qwen4_exp import Qwen4ExpQModel, Qwen4ExpTextQModel
 from .rw import RwgQModel
+from .smolvlm import SmolVLMQModel
 from .solar_open import SolarOpenQModel
 from .solar_open2 import SolarOpen2QModel
+from .spark2_5 import Spark2_5QModel
 from .starcoder2 import Starcoder2QModel
 from .telechat2 import TeleChat2QModel
 from .unlimited_ocr import UnlimitedOCRQModel
+from .xing4_0 import Xing4_0QModel
 from .xverse import XverseQModel
 from .falcon_h1 import FalconH1QModel
 from .falcon_mamba import FalconMambaQModel
+from .jamba import JambaQModel
 from .zamba import ZambaQModel
 from .zamba2 import Zamba2QModel
+from .zdtaichu5 import ZDTaichu5QModel
 from .pangu_alpha import PanguAlphaQModel
 from .longcat_flash import LongCatFlashQModel
 from .locateanything import LocateAnythingQModel
@@ -121,6 +134,7 @@ from .nemotron_h import NemotronHQModel
 from .qwen3_omni_moe import Qwen3OmniMoeGPTQ
 from .mistral3 import Mistral3GPTQ
 from .afmoe import AfMoeQModel
+from .agnes import AgnesQModel
 from .glm4v import Glm4vGPTQ
 from .glm4v_moe import Glm4vMoeQModel, Glm4vMoeTextQModel
 from .voxtral import VoxtralGPTQ

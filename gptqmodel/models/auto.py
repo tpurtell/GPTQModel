@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
-# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2026 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2026 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 # ruff: noqa: I001
@@ -64,7 +64,9 @@ from ..utils.hub import list_repo_files  # noqa: E402
 from ..utils.model import find_modules  # noqa: E402
 from ..utils.torch import torch_empty_cache  # noqa: E402
 from .base import BaseQModel  # noqa: E402
+from .loader import native_floatx_source_format  # noqa: E402
 from .definitions.afmoe import AfMoeQModel  # noqa: E402
+from .definitions.agnes import AgnesQModel  # noqa: E402
 from .definitions.apertus import Apertus1p5QModel, Apertus1p5TextQModel, ApertusQModel  # noqa: E402
 from .definitions.axk2 import AXK2QModel  # noqa: E402
 from .definitions.baichuan import BaiChuanQModel  # noqa: E402
@@ -86,13 +88,14 @@ from .definitions.deepseek_v4 import DeepSeekV4QModel  # noqa: E402
 from .definitions.deepseek_ocr2 import DeepSeekOCR2QModel  # noqa: E402
 from .definitions.deepseek_vl import DeepSeekVLQModel  # noqa: E402
 from .definitions.deepseek_vl_v2 import DeepSeekVLV2QModel  # noqa: E402
+from .definitions.diffusion_gemma import DiffusionGemmaQModel  # noqa: E402
 from .definitions.dots1 import Dots1QModel  # noqa: E402
 from .definitions.dream import DreamQModel  # noqa: E402
 from .definitions.ernie4_5 import Ernie4_5QModel  # noqa: E402
 from .definitions.ernie4_5_moe import Ernie4_5_MoeQModel  # noqa: E402
 from .definitions.ernie4_5_vl_moe import Ernie4_5_VLMoeQModel  # noqa: E402
 from .definitions.exaone import ExaOneQModel  # noqa: E402
-from .definitions.exaone4 import Exaone4QModel  # noqa: E402
+from .definitions.exaone4 import Exaone4QModel, Exaone4_5QModel  # noqa: E402
 from .definitions.falcon_h1 import FalconH1QModel  # noqa: E402
 from .definitions.falcon_mamba import FalconMambaQModel  # noqa: E402
 from .definitions.gemma2 import Gemma2QModel  # noqa: E402
@@ -115,6 +118,7 @@ from .definitions.gpt_neo import GptNeoQModel  # noqa: E402
 from .definitions.gpt_neox import GPTNeoXQModel  # noqa: E402
 from .definitions.gpt_oss import GPTOSSGPTQ  # noqa: E402
 from .definitions.gptj import GptJQModel  # noqa: E402
+from .definitions.granitemoe import GraniteMoeQModel
 from .definitions.granitemoehybrid import GraniteMoeHybridQModel
 from .definitions.grinmoe import GrinMoeQModel  # noqa: E402
 from .definitions.hrm_text import HrmTextQModel  # noqa: E402
@@ -129,7 +133,10 @@ from .definitions.internlm import InternLMQModel  # noqa: E402
 from .definitions.internlm2 import InternLM2QModel  # noqa: E402
 from .definitions.intern_s2_preview import InternS2PreviewQModel  # noqa: E402
 from .definitions.interns1 import InternS1QModel  # noqa: E402
+from .definitions.internvl import InternVLQModel  # noqa: E402
 from .definitions.internvl_chat import InternVLChatQModel  # noqa: E402
+from .definitions.jamba import JambaQModel  # noqa: E402
+from .definitions.k2_horizon import K2HorizonQModel  # noqa: E402
 from .definitions.klear import KlearQModel  # noqa: E402
 from .definitions.kimi_k25 import KimiK25QModel  # noqa: E402
 from .definitions.laguna import LagunaQModel  # noqa: E402
@@ -160,12 +167,15 @@ from .definitions.mobilellm import MobileLLMQModel  # noqa: E402
 from .definitions.moss import MossQModel  # noqa: E402
 from .definitions.mpt import MptQModel  # noqa: E402
 from .definitions.muse_glimmer import MuseGlimmerQModel  # noqa: E402
+from .definitions.nanbeige import NanbeigeQModel  # noqa: E402
 from .definitions.nemotron_labs_diffusion import NemotronLabsDiffusionQModel  # noqa: E402
 from .definitions.nemotron_h import NemotronHQModel  # noqa: E402
 from .definitions.nemotron_h_puzzle import NemotronHPuzzleQModel  # noqa: E402
 from .definitions.nemotron_omni import NemotronOmniQModel  # noqa: E402
 from .definitions.olmo3 import Olmo3QModel  # noqa: E402
+from .definitions.olmoe import OlmoeQModel  # noqa: E402
 from .definitions.opt import OptQModel  # noqa: E402
+from .definitions.ouro import OuroQModel  # noqa: E402
 from .definitions.ovis import OvisQModel  # noqa: E402
 from .definitions.ovis2 import Ovis2QModel  # noqa: E402
 from .definitions.ovis2_5 import Ovis2_5QModel  # noqa: E402
@@ -185,15 +195,19 @@ from .definitions.qwen3 import Qwen3QModel  # noqa: E402
 from .definitions.qwen3_moe import Qwen3MoeQModel  # noqa: E402
 from .definitions.qwen3_next import Qwen3NextGPTQ  # noqa: E402
 from .definitions.qwen3_omni_moe import Qwen3OmniMoeGPTQ
-from .definitions.qwen3_vl import Qwen3_VLQModel
-from .definitions.qwen4_exp import Qwen4ExpQModel  # noqa: E402
+from .definitions.qwen3_vl import Qwen3_VLQModel, Qwen3_VL_MoeQModel
+from .definitions.qwen_drive import QwenDriveQModel  # noqa: E402
+from .definitions.qwen4_exp import Qwen4ExpQModel, Qwen4ExpTextQModel  # noqa: E402
 from .definitions.rw import RwgQModel  # noqa: E402
 from .definitions.solar_open import SolarOpenQModel  # noqa: E402
 from .definitions.solar_open2 import SolarOpen2QModel  # noqa: E402
+from .definitions.smolvlm import SmolVLMQModel  # noqa: E402
+from .definitions.spark2_5 import Spark2_5QModel  # noqa: E402
 from .definitions.starcoder2 import Starcoder2QModel  # noqa: E402
 from .definitions.telechat2 import TeleChat2QModel
 from .definitions.unlimited_ocr import UnlimitedOCRQModel  # noqa: E402
 from .definitions.voxtral import VoxtralGPTQ  # noqa: E402
+from .definitions.xing4_0 import Xing4_0QModel  # noqa: E402
 from .definitions.xverse import XverseQModel  # noqa: E402
 from .definitions.zamba import ZambaQModel  # noqa: E402
 from .definitions.zamba2 import Zamba2QModel  # noqa: E402
@@ -205,19 +219,23 @@ if TRANSFORMERS_SUPPORTS_QWEN3_5:
     from .definitions.qwen3_5_moe import Qwen3_5_MoeQModel  # noqa: E402
     from .definitions.qwen3_5_moe_text import Qwen3_5_MoeTextQModel  # noqa: E402
     from .definitions.qwen3_5_text import Qwen3_5TextQModel  # noqa: E402
+    from .definitions.zdtaichu5 import ZDTaichu5QModel  # noqa: E402
 else:
     Qwen3_5QModel = None
     Qwen3_5_MoeQModel = None
     Qwen3_5_MoeTextQModel = None
     Qwen3_5TextQModel = None
+    ZDTaichu5QModel = None
 
 
 MODEL_MAP = {
     "dots3_note": Dots3NoteQModel,
+    "agnes": AgnesQModel,
     "apertus": ApertusQModel,
     "apertus1p5": Apertus1p5QModel,
     "apertus1p5_text": Apertus1p5TextQModel,
     "axk2": AXK2QModel,
+    "diffusion_gemma": DiffusionGemmaQModel,
     "dream": DreamQModel,
     "bloom": BloomQModel,
     "brumby": BrumbyQModel,
@@ -231,6 +249,7 @@ MODEL_MAP = {
     "gpt2": GPT2QModel,
     "llama": LlamaQModel,
     "smollm3": LlamaQModel,  # llama-compatible quantization module tree
+    "smolvlm": SmolVLMQModel,
     "llama4": Llama4QModel,
     "llama4_text": Llama4TextQModel,
     "opt": OptQModel,
@@ -262,16 +281,20 @@ MODEL_MAP = {
     "internlm2": InternLM2QModel,
     "intern_s2_preview": InternS2PreviewQModel,
     "interns1": InternS1QModel,
+    "internvl": InternVLQModel,
     "internvl_chat": InternVLChatQModel,
     "hrm_text": HrmTextQModel,
     "hunyuan_v1_dense": HunYuanDenseV1QModel,
     "hunyuan_v1_moe": HunYuanMoEV1QModel,
     "hunyuan_vl": HunYuanVLQModel,
     "hy_v3": HYV3QModel,
+    "jamba": JambaQModel,
+    "k2_horizon": K2HorizonQModel,
     "qwen": QwenQModel,
     "mistral": LlamaQModel, # 100% llama clone
     "yi": LlamaQModel, # 100% llama clone
     "xverse": XverseQModel,
+    "xing4_0": Xing4_0QModel,
     "deci": DeciLMQModel,
     "nemotron-nas": DeciLMQModel,
     "stablelm_epoch": LlamaQModel, # 100% llama clone
@@ -280,6 +303,7 @@ MODEL_MAP = {
     "mixtral": MixtralQModel,
     "qwen2": Qwen2QModel,
     "qwen3": Qwen3QModel,
+    "qwen_drive": QwenDriveQModel,
     "longllama": LlamaQModel,  # 100% llama clone
     "gemma": LlamaQModel, # 100% llama clone
     "gemma2": Gemma2QModel,
@@ -305,6 +329,7 @@ MODEL_MAP = {
     "minimax_m2": MiniMaxM2GPTQ,
     "minimax_m3_vl": MiniMaxM3VLGPTQ,
     "muse_glimmer": MuseGlimmerQModel,
+    "nanbeige": NanbeigeQModel,
     "ministral3": Ministral3GPTQ,
     "qwen2_moe": Qwen2MoeQModel,
     "qwen3_moe": Qwen3MoeQModel,
@@ -316,7 +341,9 @@ MODEL_MAP = {
     "qwen2_5_omni": Qwen2_5_OmniGPTQ,
     "qwen3_omni_moe": Qwen3OmniMoeGPTQ,
     "qwen3_vl": Qwen3_VLQModel,
+    "qwen3_vl_moe": Qwen3_VL_MoeQModel,
     "qwen4_exp": Qwen4ExpQModel,
+    "qwen4_exp_text": Qwen4ExpTextQModel,
     "dbrx": DbrxQModel,
     "dbrx_converted": DbrxConvertedQModel,
     "deepseek_v2": DeepSeekV2QModel,
@@ -329,17 +356,22 @@ MODEL_MAP = {
     "dots1": Dots1QModel,
     "exaone": ExaOneQModel,
     "exaone4": Exaone4QModel,
+    "exaone4_5": Exaone4_5QModel,
+    "exaone4_5_text": Exaone4QModel,
     "grinmoe": GrinMoeQModel,
     "mllama": MLlamaQModel,
     "mllama_text_model": MLlamaTextQModel,
     "marin": Qwen3QModel,
     "mage_vl": MageVLQModel,
     "granite": LlamaQModel, # 100% llama clone
+    "granitemoe": GraniteMoeQModel,
     "granitemoehybrid": GraniteMoeHybridQModel,
     "mobilellm": MobileLLMQModel,
     "hymba": HymbaQModel,
     "olmo2": LlamaQModel, # 100% llama clone
     "olmo3": Olmo3QModel,
+    "olmoe": OlmoeQModel,
+    "ouro": OuroQModel,
     "ovis": OvisQModel,
     "ovis2": Ovis2QModel,
     "ovis2_5": Ovis2_5QModel,
@@ -361,6 +393,7 @@ MODEL_MAP = {
     "seed_oss": LlamaQModel, # 100% llama clone
     "solar_open": SolarOpenQModel,
     "solar_open2": SolarOpen2QModel,
+    "spark2_5": Spark2_5QModel,
     "gpt_oss": GPTOSSGPTQ,
     "longcat_flash": LongCatFlashQModel,
     "locateanything": LocateAnythingQModel,
@@ -388,6 +421,9 @@ if Qwen3_5QModel is not None:
 if Qwen3_5_MoeQModel is not None:
     MODEL_MAP["qwen3_5_moe"] = Qwen3_5_MoeQModel
     MODEL_MAP["qwen3_5_moe_text"] = Qwen3_5_MoeTextQModel
+
+if ZDTaichu5QModel is not None:
+    MODEL_MAP["zdtaichu5_0"] = ZDTaichu5QModel
 
 SUPPORTED_MODELS = list(MODEL_MAP.keys())
 
@@ -542,6 +578,17 @@ class GPTQModel:
             "use `from_quantized()` for inference with a post-quantized model."
         )
 
+    @staticmethod
+    def quantize_mlx(model_id_or_path: str, output_path: str, method: str = "gptq", **kwargs):
+        """Quantize a dense model directly in MLX and save an MLX-LM checkpoint.
+
+        This Apple silicon path uses a fused Metal GPTQ update or MLX-LM's
+        native AWQ implementation. It does not load a Torch model.
+        """
+        from ..quantization.mlx_native import quantize_mlx
+
+        return quantize_mlx(model_id_or_path, output_path, method=method, **kwargs)
+
     @classmethod
     def load(
             cls,
@@ -586,10 +633,15 @@ class GPTQModel:
             )
 
         if (
-            model_cfg is not None
-            and _is_supported_quantization_config(model_cfg)
-            and not _uses_auto_module_decoder(quantize_config)
+            quantize_config is not None
+            and model_cfg is not None
+            and native_floatx_source_format(model_cfg, model_local_path=model_id_or_path) is not None
         ):
+            log.info(
+                "Loader: treating native FP8/NVFP4 checkpoint as a source model for new quantization."
+            )
+        elif (model_cfg is not None and _is_supported_quantization_config(model_cfg)
+              and not _uses_auto_module_decoder(quantize_config)):
             # only if the model is quantized or compatible with gptqmodel should we set is_quantized to true
             is_gptqmodel_quantized = True
         else:
@@ -668,7 +720,14 @@ class GPTQModel:
             trust_remote_code=trust_remote_code,
             **_get_config_load_kwargs(model_init_kwargs),
         )
-        if _is_supported_quantization_config(config) and not _uses_auto_module_decoder(quantize_config):
+        if (
+            quantize_config is not None
+            and native_floatx_source_format(config, model_local_path=model_id_or_path) is not None
+        ):
+            log.info(
+                "Loader: treating native FP8/NVFP4 checkpoint as a source model for new quantization."
+            )
+        elif _is_supported_quantization_config(config) and not _uses_auto_module_decoder(quantize_config):
             log.warn("Model is already quantized, will use `from_quantized` to load quantized model.\n"
                            "If you want to quantize the model, please pass un_quantized model path or id, and use "
                            "`from_pretrained` with `quantize_config`.")
@@ -780,7 +839,7 @@ class GPTQModel:
                 raise ValueError(
                     "MLX not installed. Please install via `pip install gptqmodel[mlx] --no-build-isolation`.")
 
-            mlx_weights, mlx_config = convert_gptq_to_mlx_weights(model_id_or_path, gptq_model, gptq_config,
+            mlx_weights, mlx_config = convert_gptq_to_mlx_weights(gptq_model.model_local_path or model_id_or_path, gptq_model, gptq_config,
                                                                   gptq_model.lm_head)
 
             save_model(target_path, mlx_weights, donate_model=True)

@@ -25,7 +25,7 @@ import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -33,7 +33,7 @@ from torch import nn
 from torch.nn import Module
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from ..looper.loop_processor import DTYPE_SIZE_COLUMN, ExecutionConfig, MODULE_FEATURE_COLUMN, LoopProcessor
+from ..looper.loop_processor import DTYPE_SIZE_COLUMN, MODULE_FEATURE_COLUMN, ExecutionConfig, LoopProcessor
 from ..looper.named_module import NamedModule
 from ..models import BaseQModel
 from ..models.writer import (
@@ -43,20 +43,24 @@ from ..models.writer import (
     PROCESS_LOG_NAME,
     PROCESS_LOG_TIME,
     PROCESS_USED_MEMORY,
+    QUANT_LOG_DAMP,
     QUANT_LOG_LOSS,
     QUANT_LOG_NSAMPLES,
-    QUANT_LOG_DAMP,
 )
 from ..nn_modules.hooked_linear import HookedLinear
 from ..nn_modules.qlinear.paroquant import ParoLinear
 from ..quantization.config import FORMAT, METHOD, QuantizeConfig, resolve_quant_format
+from ..quantization.mlx_paroquant_optimize import (
+    optimize_paroquant_linear_mlx_to_torch,
+    paroquant_mlx_optimization_available,
+)
 from ..quantization.paroquant.optimization import (
-    _ParoQuantOptimLinear,
     _activate_stage_params,
     _normalize_group_size,
     _normalize_opt_impl,
     _normalize_opt_optimizer,
     _normalize_quantizer_impl,
+    _ParoQuantOptimLinear,
     _quantizer_sym_for_impl,
     _resolve_best_state_snapshot_dtype,
     _result_from_model,
@@ -69,7 +73,6 @@ from ..utils.fallback import normalize_fallback
 from ..utils.logger import log_time_block, setup_logger
 from ..utils.model import (
     create_quant_module,
-    find_modules,
     get_module_by_name_prefix,
     move_to,
     nested_move_to,
@@ -80,6 +83,7 @@ from ..utils.model import (
 from ..utils.module_locks import parent_module_lock
 from ..utils.paroquant import prewarm_paroquant_rotation_extension
 from ..utils.torch import CPU, torch_empty_cache
+
 
 log = setup_logger()
 
@@ -256,6 +260,15 @@ class ParoQuantProcessor(LoopProcessor):
         self._runtime_prewarmed = False
         self.fallback = qcfg.fallback
 
+    def continuation_state_dict(self):
+        state = super().continuation_state_dict()
+        state["clean_group_layer_inputs"] = self._clean_group_layer_inputs
+        return state
+
+    def load_continuation_state_dict(self, state):
+        super().load_continuation_state_dict(state)
+        self._clean_group_layer_inputs = state["clean_group_layer_inputs"]
+
     def set_calibration_dataset(self, calibration_dataset):
         """Reject runtime dataset swaps because capture state is tied to the processor."""
         raise NotImplementedError("ParoQuantProcessor's calibration_dataset cannot be modified")
@@ -323,6 +336,8 @@ class ParoQuantProcessor(LoopProcessor):
             if entry is None:
                 entry = {"inputs": []}
                 self.tasks[module_name] = entry
+            batch_index = self.current_batch_index()
+            entry.setdefault("input_batch_indices", []).append(batch_index)
             entry.setdefault("inputs", []).append(feature)
 
     def _ensure_task_bucket(self, module_name: str, layer_index: int) -> None:
@@ -343,12 +358,16 @@ class ParoQuantProcessor(LoopProcessor):
         for name in list(state.modules):
             entry = self.tasks.get(name) or {}
             tensors: List[torch.Tensor] = entry.get("inputs", [])  # type: ignore[arg-type]
+            indices = entry.get("input_batch_indices", [])
+            if len(indices) == len(tensors) and all(index is not None for index in indices):
+                tensors = [tensor for _, tensor in sorted(zip(indices, tensors), key=lambda item: item[0])]
             if not tensors:
                 features[name] = torch.empty(0)
                 continue
             try:
                 features[name] = torch.cat(tensors, dim=0)
                 entry["inputs"] = [features[name]]
+                entry.pop("input_batch_indices", None)
             except RuntimeError:
                 features[name] = tensors[0]
         return features
@@ -400,6 +419,7 @@ class ParoQuantProcessor(LoopProcessor):
                 w_wq_diff = original_weight.to(dtype=torch.float32) - pseudo_weight.to(dtype=torch.float32)
             with self.lock:
                 module.state["w_wq_diff"] = w_wq_diff
+                module.state["wq"] = pseudo_weight.detach().to(device=CPU, copy=True)
 
         module.weight.data = pseudo_weight
 
@@ -442,6 +462,62 @@ class ParoQuantProcessor(LoopProcessor):
         if inputs.numel() == 0:
             inputs = torch.empty((0, weight.shape[1]), dtype=weight.dtype, device=weight.device)
         module_seed = self._module_seed(module.layer_index, module.full_name)
+
+        use_mlx = (
+            inputs.numel() > 0
+            and weight.device.type in {"cpu", "mps"}
+            and paroquant_mlx_optimization_available()
+            and self._opt_scope_mode() == "module"
+            and self.qcfg.opt_stage_impl == "fast"
+            and not self._gradient_checkpointing_enabled()
+        )
+        if use_mlx:
+            normalized_group_size = _normalize_group_size(group_size, weight.shape[1])
+            normalized_pair_impl = _normalize_opt_impl(self.qcfg.opt_pair_impl, field="pair_impl")
+            pair_builder = (
+                build_random_rotation_buffers_reference
+                if normalized_pair_impl == "reference"
+                else build_random_rotation_buffers
+            )
+            pairs, theta_mask = pair_builder(
+                in_features=weight.shape[1],
+                group_size=normalized_group_size,
+                krot=self.qcfg.krot,
+                pair_ratio=self.qcfg.opt_pair_ratio,
+                seed=module_seed,
+                device=weight.device,
+            )
+            result = optimize_paroquant_linear_mlx_to_torch(
+                weight=weight,
+                bias=bias,
+                inputs=inputs,
+                pairs=pairs,
+                theta_mask=theta_mask,
+                bits=bits,
+                group_size=normalized_group_size,
+                symmetric=_quantizer_sym_for_impl(sym, self.qcfg.opt_quantizer_impl),
+                train_rows=self.qcfg.opt_train_samples,
+                val_rows=self.qcfg.opt_validation_samples,
+                batch_size=self.qcfg.opt_batch_size,
+                rotation_epochs=self.qcfg.opt_rotation_epochs,
+                finetune_epochs=self.qcfg.opt_finetune_epochs,
+                rotation_lr=self.qcfg.opt_rotation_lr,
+                weight_lr=self.qcfg.opt_weight_lr,
+                quantizer_lr=self.qcfg.opt_quantizer_lr,
+                optimizer_name=getattr(self.qcfg, "opt_optimizer", "adamw"),
+                optimizer_weight_decay=float(getattr(self.qcfg, "opt_weight_decay", 0.01)),
+                optimizer_betas=tuple(getattr(self.qcfg, "opt_betas", (0.9, 0.95))),
+                optimizer_eps=float(getattr(self.qcfg, "opt_eps", 1e-10)),
+                optimizer_amsgrad=bool(getattr(self.qcfg, "opt_amsgrad", False)),
+                sgd_momentum=float(getattr(self.qcfg, "opt_sgd_momentum", 0.0)),
+                sgd_dampening=float(getattr(self.qcfg, "opt_sgd_dampening", 0.0)),
+                sgd_nesterov=bool(getattr(self.qcfg, "opt_sgd_nesterov", False)),
+                best_state_dtype=getattr(self.qcfg, "opt_best_state_dtype", "fp32"),
+                scale_clamp_min=self.qcfg.opt_channel_scale_clamp_min,
+                scale_clamp_max=self.qcfg.opt_channel_scale_clamp_max,
+            )
+            self._apply_optimization_result(module, result, original_weight)
+            return result.train_loss, result.val_loss
 
         with torch.inference_mode(False), torch.enable_grad():
             result = optimize_paroquant_linear(
@@ -937,13 +1013,14 @@ class ParoQuantProcessor(LoopProcessor):
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         cache: bool = True,
+        layer_inputs: Optional[List[torch.Tensor]] = None,
     ) -> Dict[str, Any]:
         """Refresh grouped replay kwargs so real decoder layers can be replayed safely."""
         target_device = x.device
 
         prepared_cache_key = None
         prepared_cache = None
-        if cache and not x.requires_grad:
+        if cache and not any(t.requires_grad for t in (layer_inputs or [x])):
             prepared_cache = getattr(self, "_group_forward_prepared_cache", None)
             if prepared_cache is None:
                 prepared_cache = {}
@@ -951,6 +1028,7 @@ class ParoQuantProcessor(LoopProcessor):
             prepared_cache_key = (
                 id(layer),
                 id(x),
+                tuple(id(t) for t in layer_inputs) if layer_inputs is not None else (),
                 id(input_kwargs),
                 id(attention_mask) if attention_mask is not None else 0,
                 id(position_ids) if position_ids is not None else 0,
@@ -1064,6 +1142,14 @@ class ParoQuantProcessor(LoopProcessor):
                 module_kwargs["position_ids"] = _LayerShardLoader._tensor_to_device(position_ids, target_device)
 
         module_kwargs["use_cache"] = False
+        prepare_replay_kwargs = getattr(self.gptq_model, "prepare_layer_replay_kwargs", None)
+        if prepare_replay_kwargs is not None:
+            module_kwargs = prepare_replay_kwargs(
+                layer=layer,
+                layer_input=layer_inputs if layer_inputs is not None else [x],
+                additional_inputs=module_kwargs,
+                target_device=target_device,
+            )
         module_kwargs = self._normalize_group_runtime_metadata(module_kwargs)
         if prepared_cache_key is not None and prepared_cache is not None:
             prepared_cache[prepared_cache_key] = dict(module_kwargs)
@@ -1486,6 +1572,7 @@ class ParoQuantProcessor(LoopProcessor):
         additional_inputs = self._prepare_group_forward_kwargs(
             layer,
             x=inputs[0],
+            layer_inputs=inputs,
             input_kwargs=input_kwargs,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1522,6 +1609,7 @@ class ParoQuantProcessor(LoopProcessor):
         additional_inputs = self._prepare_group_forward_kwargs(
             layer,
             x=inputs[0],
+            layer_inputs=inputs,
             input_kwargs=replay_batch.input_kwargs,
             attention_mask=replay_batch.attention_mask,
             position_ids=replay_batch.position_ids,
@@ -2409,6 +2497,7 @@ class ParoQuantProcessor(LoopProcessor):
                 entry = self.tasks.get(module_name)
                 if entry is not None and entry.get("layer_index") == layer_index:
                     entry["inputs"] = []
+                    entry.pop("input_batch_indices", None)
         state.modules.clear()
         state.pending_modules.clear()
         state.processed_subsets.clear()
@@ -2541,6 +2630,7 @@ class ParoQuantProcessor(LoopProcessor):
         module.stream_sync()
         with self.lock:
             module.state.pop("w_wq_diff", None)
+            module.state.pop("wq", None)
             pack_weight = module.state.pop("pack_weight").clone()
             q_zeros = module.state.pop("q_zeros").clone()
             q_scales = module.state.pop("q_scales").clone()
@@ -2550,7 +2640,7 @@ class ParoQuantProcessor(LoopProcessor):
 
         module.weight.data = move_to(pack_weight, device=CPU)
         quant_linear_cls = self._resolve_qlinear_kernel(module.full_name)
-        layers = find_modules(model.model)
+        layers = {module.full_name: model.model.get_submodule(module.full_name)}
         module_label = getattr(module, "full_name", getattr(module, "name", ""))
 
         with log_time_block(
@@ -2577,11 +2667,12 @@ class ParoQuantProcessor(LoopProcessor):
                     init_kwargs=self.qcfg.quant_linear_init_kwargs(),
                 )
 
-        qmodules = {
-            name: submodule
-            for name, submodule in find_modules(model.model, [quant_linear_cls]).items()
-            if name == module.full_name
-        }
+        qmodule = model.model.get_submodule(module.full_name)
+        qmodules = (
+            {module.full_name: qmodule}
+            if isinstance(qmodule, quant_linear_cls)
+            else {}
+        )
         with log_time_block(
             "pack",
             logger=log,

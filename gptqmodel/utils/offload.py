@@ -85,8 +85,12 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * itemsize
 
 
-def _bundle_module_state_dict(module: nn.Module, offload_dir: str) -> dict:
+def _bundle_module_state_dict(module: nn.Module, offload_dir: str, index_dir: Optional[str] = None) -> dict:
+    """Serialize module state into offload_dir. index_dir is the directory
+    the index.json should reference -- pass the final destination when writing
+    into a temporary directory that will be atomically renamed into place."""
     bundle_path = os.path.join(offload_dir, "module.safetensors")
+    index_bundle_path = os.path.join(index_dir, "module.safetensors") if index_dir else bundle_path
     index: dict[str, dict] = {}
     tensors: dict[str, torch.Tensor] = {}
 
@@ -99,7 +103,7 @@ def _bundle_module_state_dict(module: nn.Module, offload_dir: str) -> dict:
             entry = {
                 "dtype": str(cpu_tensor.dtype).replace("torch.", ""),
                 "shape": list(cpu_tensor.shape),
-                "safetensors_file": os.path.abspath(bundle_path),
+                "safetensors_file": os.path.abspath(index_bundle_path),
                 "weight_name": key,
             }
             index[key] = entry
@@ -281,11 +285,14 @@ def offload_to_safetensors_reference(
     return index
 
 
-def offload_to_disk(module: List[str] | nn.Module, model: nn.Module, disk_path: str = "."):
-    _offload_to_disk_impl(module=module, model=model, disk_path=disk_path)
+def offload_to_disk(module: List[str] | nn.Module, model: nn.Module, disk_path: str = ".", force: bool = False):
+    """Offload module state to disk. force=True also writes modules below the
+    small-module threshold -- required when the on-disk bundle is the only
+    durable record (e.g. quantized modules that a resumed run must restore)."""
+    _offload_to_disk_impl(module=module, model=model, disk_path=disk_path, force=force)
 
 
-def _offload_to_disk_impl(module: List[str] | nn.Module, model: nn.Module, disk_path: str = "."):
+def _offload_to_disk_impl(module: List[str] | nn.Module, model: nn.Module, disk_path: str = ".", force: bool = False):
     assert module is not None
     assert model is not None
 
@@ -299,7 +306,7 @@ def _offload_to_disk_impl(module: List[str] | nn.Module, model: nn.Module, disk_
                 m = m.module
 
             full_name = get_module_fullname(model=model, module=m)
-            _offload_disk(module=m, name=full_name, disk_path=disk_path)
+            _offload_disk(module=m, name=full_name, disk_path=disk_path, force=force)
     else:
         # unwrap named module
         if isinstance(module, NamedModule):
@@ -308,7 +315,7 @@ def _offload_to_disk_impl(module: List[str] | nn.Module, model: nn.Module, disk_
 
         full_name = get_module_fullname(model=model, module=module)
 
-        _offload_disk(module=module, name=full_name, disk_path=disk_path)
+        _offload_disk(module=module, name=full_name, disk_path=disk_path, force=force)
 
     if hasattr(module, "config") and hasattr(module, "tie_weights") and getattr(module.config,
                                              "tie_word_embeddings", False):
@@ -322,12 +329,15 @@ def _offload_to_disk_impl(module: List[str] | nn.Module, model: nn.Module, disk_
 #_OFFLOAD_SAFE = ThreadSafe(sys.modules[__name__])
 #offload_to_disk = _OFFLOAD_SAFE.offload_to_disk
 
-def _offload_disk(module: nn.Module, name: str, disk_path: str = "."):
+def _offload_disk(module: nn.Module, name: str, disk_path: str = ".", force: bool = False):
     with parent_module_lock(name):
-        _offload_disk_locked(module=module, name=name, disk_path=disk_path)
+        _offload_disk_locked(module=module, name=name, disk_path=disk_path, force=force)
 
 
-def _offload_disk_locked(module: nn.Module, name: str, disk_path: str = "."):
+def _offload_disk_locked(module: nn.Module, name: str, disk_path: str = ".", force: bool = False):
+    # Finalizers are threads, protected by the parent-module lock above.
+    # Checkpoint runs additionally hold a run lease and use private attempt
+    # directories; unrelated modules do not need a global offload lock.
     if is_meta_module(module):
         # print(f"[skip] '{name}' is on meta; leaving as-is")
         return
@@ -353,11 +363,27 @@ def _offload_disk_locked(module: nn.Module, name: str, disk_path: str = "."):
     for tensor in state_items:
         total_bytes += _tensor_nbytes(tensor)
 
-    if total_bytes <= _SMALL_MODULE_OFFLOAD_BYTES:
+    if not force and total_bytes <= _SMALL_MODULE_OFFLOAD_BYTES:
         return
 
-    _prepare_offload_directory(module_offload_dir)
-    _bundle_module_state_dict(module, module_offload_dir)
+    # Write the new bundle into a sibling temp dir and swap it in with two
+    # renames. The previous scheme (rmtree the live dir, then serialize into
+    # it) had a wide crash window during which the only durable copy of the
+    # module was destroyed -- fatal when that copy is a finalized quant
+    # module a resumed run needs to restore. The index.json inside the
+    # bundle must reference the final path, not the temp path (index_dir=).
+    tmp_dir = f"{module_offload_dir}.tmp"
+    old_dir = f"{module_offload_dir}.old"
+    _prepare_offload_directory(tmp_dir)
+    if os.path.isdir(old_dir):
+        shutil.rmtree(old_dir)
+    _bundle_module_state_dict(module, tmp_dir, index_dir=module_offload_dir)
+
+    if os.path.isdir(module_offload_dir):
+        os.rename(module_offload_dir, old_dir)
+    os.rename(tmp_dir, module_offload_dir)
+    if os.path.isdir(old_dir):
+        shutil.rmtree(old_dir)
 
     _ = disk_offload(
         module,
@@ -392,6 +418,7 @@ def _maybe_align(mod: nn.Module, device: torch.device):
         yield
 
 
+@torch.inference_mode(False)
 def _clone_into_parameter(t: torch.Tensor, *, device: torch.device, dtype: Optional[torch.dtype], requires_grad: bool) -> nn.Parameter:
     target = t
     if dtype is not None and target.dtype != dtype:
@@ -403,6 +430,7 @@ def _clone_into_parameter(t: torch.Tensor, *, device: torch.device, dtype: Optio
     return nn.Parameter(target, requires_grad=requires_grad)
 
 
+@torch.inference_mode(False)
 def _clone_into_buffer(t: torch.Tensor, *, device: torch.device, dtype: Optional[torch.dtype]) -> torch.Tensor:
     target = t
     if dtype is not None and target.dtype != dtype:
@@ -508,6 +536,16 @@ def undo_offload_to_disk(
     #with _lock:
     # Track candidate offload dirs if user asks to delete them later.
     offload_dirs: Set[str] = set()
+    # Accelerate's detach_hook reloads offloaded leaves from weights_map onto
+    # their original device and dtype, even after we materialize them below.
+    # Remember meta leaves so we can honor the caller's requested target after
+    # detaching without moving unrelated, already materialized model state.
+    offloaded_leaves = [
+        (sub, name, is_param, tensor.requires_grad)
+        for sub in module.modules()
+        for name, tensor, is_param in _iter_leaf_tensors(sub, include_buffers=include_buffers)
+        if tensor.is_meta
+    ]
 
     # 1) Materialize all offloaded leaves as real tensors on the target device/dtype.
     with torch.inference_mode():
@@ -544,12 +582,27 @@ def undo_offload_to_disk(
                         setattr(sub, name, new_b)
 
         # 2) Remove all Accelerate hooks so future forwards won't offload again.
-        remove_hook_from_submodules(module)      # public API
-        remove_hook_from_module(module, recurse=False)  # ensure root is also clean
+        # Detaching hooks can recreate tensors from their offload maps. Tying
+        # weights may also update leaf parameters in place.
+        with torch.inference_mode(False), torch.no_grad():
+            remove_hook_from_submodules(module)      # public API
+            remove_hook_from_module(module, recurse=False)  # ensure root is also clean
 
-        # 3) Tie embedding if module is model and enabled/tied
-        if hasattr(module, "config") and getattr(module.config, "tie_word_embeddings", False):
-            module.tie_weights()  # makes lm_head.weight point to embed_tokens.weight again after undo_offload
+            for sub, name, is_param, requires_grad in offloaded_leaves:
+                tensor = getattr(sub, name)
+                if tensor.is_meta:
+                    continue  # unrelated meta leaves have no offload hook to restore them
+                if tensor.device == device and (dtype is None or tensor.dtype == dtype) and not tensor.is_inference():
+                    continue
+                if is_param:
+                    restored = _clone_into_parameter(tensor, device=device, dtype=dtype, requires_grad=requires_grad)
+                else:
+                    restored = _clone_into_buffer(tensor, device=device, dtype=dtype)
+                setattr(sub, name, restored)
+
+            # 3) Tie embedding if module is model and enabled/tied
+            if hasattr(module, "config") and getattr(module.config, "tie_word_embeddings", False):
+                module.tie_weights()  # makes lm_head.weight point to embed_tokens.weight again after undo_offload
 
         # 4) Optionally delete offload folders.
         if delete_offload_folders:

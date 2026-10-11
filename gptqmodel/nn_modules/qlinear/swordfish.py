@@ -26,9 +26,10 @@ from ...utils.swordfish import (
     check_swordfish_supports_shape,
     query_swordfish_supported_group_sizes,
     query_swordfish_supported_quant_types,
+    swordfish_extension_available,
+    swordfish_extension_error,
     swordfish_mm,
     swordfish_prepack_B,
-    swordfish_runtime_available,
     swordfish_runtime_error,
 )
 
@@ -162,8 +163,8 @@ class SwordfishLinear(GPTQQuantLinear):
 
     @classmethod
     def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
-        if not swordfish_runtime_available():
-            return False, ImportError(swordfish_runtime_error())
+        if not swordfish_extension_available():
+            return False, ImportError(swordfish_extension_error())
         return True, None
 
     @classmethod
@@ -210,13 +211,21 @@ class SwordfishLinear(GPTQQuantLinear):
         return True, None
 
     @classmethod
-    def validate_device(cls, device: DEVICE):
+    def validate_device(cls, device: DEVICE | torch.device):
         super().validate_device(device)
-        if device == DEVICE.CUDA:
+        if (device.type if isinstance(device, torch.device) else device) in ("cuda", DEVICE.CUDA):
             if IS_ROCM:
                 raise NotImplementedError("Swordfish kernel is not supported on ROCm.")
-            if not _validate_swordfish_device_support():
-                raise NotImplementedError(swordfish_runtime_error())
+            targets = (
+                (device,)
+                if isinstance(device, torch.device)
+                else tuple(torch.device(f"cuda:{index}") for index in range(torch.cuda.device_count()))
+            )
+            if not targets:
+                raise NotImplementedError("Swordfish kernel requires CUDA.")
+            for target in targets:
+                if not _validate_swordfish_device_support(target):
+                    raise NotImplementedError(swordfish_runtime_error(target))
 
     def post_init(self):
         device = self.qweight.device
@@ -303,13 +312,11 @@ class SwordfishLinear(GPTQQuantLinear):
         return buf
 
     def forward(self, x: torch.Tensor):
-        if x.shape[0] == 0:
-            result = torch.empty(x.shape[:-1] + (self.out_features,), dtype=x.dtype, device=x.device)
-            if self.adapter is not None:
-                result = self.adapter.apply(x=x, out=result)
-            return result
+        if self.input_rows(x) == 0:
+            return self.empty_linear_output(x)
 
-        input_2d = x.reshape(-1, x.shape[-1])
+        # The native ABI requires a contiguous [M, K] activation.
+        input_2d = x.reshape(-1, x.shape[-1]).contiguous()
 
         if self.input_perm.numel() > 0:
             perm = self.input_perm
@@ -510,8 +517,8 @@ class AwqSwordfishLinear(AWQuantLinear):
 
     @classmethod
     def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
-        if not swordfish_runtime_available():
-            return False, ImportError(swordfish_runtime_error())
+        if not swordfish_extension_available():
+            return False, ImportError(swordfish_extension_error())
         return True, None
 
     @classmethod
@@ -554,13 +561,21 @@ class AwqSwordfishLinear(AWQuantLinear):
         return True, None
 
     @classmethod
-    def validate_device(cls, device: DEVICE):
+    def validate_device(cls, device: DEVICE | torch.device):
         super().validate_device(device)
-        if device == DEVICE.CUDA:
+        if (device.type if isinstance(device, torch.device) else device) in ("cuda", DEVICE.CUDA):
             if IS_ROCM:
                 raise NotImplementedError("Swordfish kernel is not supported on ROCm.")
-            if not _validate_swordfish_device_support():
-                raise NotImplementedError(swordfish_runtime_error())
+            targets = (
+                (device,)
+                if isinstance(device, torch.device)
+                else tuple(torch.device(f"cuda:{index}") for index in range(torch.cuda.device_count()))
+            )
+            if not targets:
+                raise NotImplementedError("Swordfish kernel requires CUDA.")
+            for target in targets:
+                if not _validate_swordfish_device_support(target):
+                    raise NotImplementedError(swordfish_runtime_error(target))
 
     def post_init(self):
         device = self.qweight.device
@@ -673,13 +688,11 @@ class AwqSwordfishLinear(AWQuantLinear):
         return buf
 
     def forward(self, x: torch.Tensor):
-        if x.shape[0] == 0:
-            result = torch.empty(x.shape[:-1] + (self.out_features,), dtype=x.dtype, device=x.device)
-            if self.adapter is not None:
-                result = self.adapter.apply(x=x, out=result)
-            return result
+        if self.input_rows(x) == 0:
+            return self.empty_linear_output(x)
 
-        input_2d = x.reshape(-1, x.shape[-1])
+        # Keep the native ABI independent of the caller's input strides.
+        input_2d = x.reshape(-1, x.shape[-1]).contiguous()
 
         group_scales = self.scales
         if group_scales.dtype != input_2d.dtype:
