@@ -126,6 +126,35 @@ def quantize_core_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.02
 class KimiK3EXL3Source(KimiK3Source):
     """K2/K6 source with one-tensor reads and deferred routed expert storage."""
 
+    def close(self):
+        context = getattr(self, "_reader_context", None)
+        self._reader_context = self._reader = self._reader_shard = None
+        if context is not None:
+            context.__exit__(None, None, None)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def tensor(self, name, device="cpu"):
+        """Parse one active shard once; transfer only owned tensor bytes.
+
+        Four EXL3 buffers per projection otherwise reopen the same layer shard
+        over ten thousand times. A single bounded reader also avoids retaining
+        thousands of separate mapped storages until a Python GC collection.
+        """
+        from safetensors import safe_open
+        shard = self.weight_map[name]
+        if getattr(self, "_reader_shard", None) != shard:
+            self.close()
+            context = safe_open(self.snapshot / shard, framework="pt", device="cpu")
+            reader = context.__enter__()
+            self._reader_context, self._reader, self._reader_shard = context, reader, shard
+        owned = self._reader.get_tensor(name).clone()
+        return owned.to(device=device)
+
     def _logical_shape(self, prefix):
         cfg = self.text_config
         h, intermediate = cfg["hidden_size"], cfg["moe_intermediate_size"]

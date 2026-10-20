@@ -95,8 +95,9 @@ class KimiK3Source:
 
     def tensor(self, name, device="cpu"):
         with safe_open(self.snapshot / self.weight_map[name], framework="pt", device="cpu") as file:
-            # copy=True prevents file mappings surviving tensor ownership.
-            return file.get_tensor(name).to(device=device, copy=True)
+            # Queue GPU copies from owned host memory, never a file mapping.
+            owned = file.get_tensor(name).clone()
+        return owned.to(device=device)
 
     def decoded(self, name, device="cpu"):
         if name in self.weight_map:

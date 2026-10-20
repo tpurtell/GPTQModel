@@ -189,3 +189,72 @@ def test_lazy_source_materializes_routed_weights_only_on_request(monkeypatch):
     assert names[-1]=='language_model.model.layers.1.block_sparse_moe.experts.0.weight'
     source.materialize_routed_experts(block,device='cpu')
     assert len(names)==2  # Repeated admission must not duplicate a full expert block.
+
+
+def test_source_reuses_only_one_reader_and_returns_owned_tensors(tmp_path, monkeypatch):
+    import safetensors
+    from pathlib import Path
+    original_open = safetensors.safe_open
+    opened, active = [], set()
+    class Reader:
+        def __init__(self, path, **kwargs):
+            self.path = Path(path)
+            self.inner = original_open(path, **kwargs)
+        def __enter__(self):
+            assert not active
+            self.inner.__enter__()
+            active.add(self.path.name)
+            opened.append(self.path.name)
+            return self
+        def __exit__(self, *args):
+            active.remove(self.path.name)
+            return self.inner.__exit__(*args)
+        def get_tensor(self, name):
+            return self.inner.get_tensor(name)
+    monkeypatch.setattr(safetensors, 'safe_open', Reader)
+    save_file({'a': torch.arange(16, dtype=torch.bfloat16)}, tmp_path/'one.safetensors')
+    save_file({'b': torch.arange(8, dtype=torch.bfloat16)}, tmp_path/'two.safetensors')
+    source = object.__new__(core.KimiK3EXL3Source)
+    source.snapshot = tmp_path
+    source.weight_map = {'a':'one.safetensors', 'b':'two.safetensors'}
+    fd_before = len(list(Path('/proc/self/fd').iterdir()))
+    for _ in range(1100):
+        value = source.tensor('a')
+        assert torch.equal(value, torch.arange(16, dtype=torch.bfloat16))
+        # Mutating owned memory must not alter a subsequent source read.
+        value.zero_()
+    assert opened == ['one.safetensors']
+    assert len(list(Path('/proc/self/fd').iterdir())) <= fd_before + 4
+    assert torch.equal(source.tensor('b'), torch.arange(8, dtype=torch.bfloat16))
+    assert opened == ['one.safetensors', 'two.safetensors']
+    assert active == {'two.safetensors'}
+    source.close()
+    source.close()
+    assert not active
+
+
+def test_generic_source_clones_before_closing_and_transfers_owned_buffer(monkeypatch):
+    state = {'active': False}
+    class Owned:
+        def to(self, *, device):
+            assert not state['active']
+            assert device == 'cuda:0'
+            return 'owned-device-buffer'
+    class Mapped:
+        def clone(self):
+            assert state['active']
+            return Owned()
+    class Reader:
+        def __enter__(self):
+            state['active'] = True
+            return self
+        def __exit__(self, *args):
+            state['active'] = False
+        def get_tensor(self, name):
+            assert name == 'tensor'
+            return Mapped()
+    monkeypatch.setattr(kimi_k3, 'safe_open', lambda *args, **kwargs: Reader())
+    source = object.__new__(kimi_k3.KimiK3Source)
+    from pathlib import Path
+    source.snapshot, source.weight_map = Path('/unused'), {'tensor':'shard'}
+    assert source.tensor('tensor', 'cuda:0') == 'owned-device-buffer'
