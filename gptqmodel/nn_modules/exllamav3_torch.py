@@ -307,6 +307,27 @@ class ExllamaV3TorchLinear(nn.Module):
             return torch.float32
         return torch.float16
 
+    def _stored_features(self) -> tuple[int, int]:
+        """Validate full Hadamard storage against the logical linear shape."""
+        trellis = getattr(self, "trellis", None)
+        if (trellis is None or trellis.ndim != 3 or trellis.dtype != torch.int16
+                or trellis.shape[-1] not in range(16, 129, 16)):
+            raise ValueError(f"EXL3 module `{self.name}` has invalid trellis geometry or dtype")
+        inputs, outputs = int(trellis.shape[0]) * 16, int(trellis.shape[1]) * 16
+        padded_outputs = ((self.out_features + 127) // 128) * 128
+        if (self.in_features <= 0 or self.out_features <= 0
+                or inputs != self.in_features or inputs % 128 != 0
+                or outputs != padded_outputs):
+            raise ValueError(f"EXL3 module `{self.name}` storage differs from logical dimensions or 128-channel padding")
+        for suffix, expected in (("suh", inputs), ("svh", outputs)):
+            scale = getattr(self, suffix, None)
+            if scale is None or tuple(scale.shape) != (expected,):
+                raise ValueError(f"EXL3 module `{self.name}` has invalid {suffix} geometry")
+        bias = getattr(self, "bias", None)
+        if bias is not None and tuple(bias.shape) != (self.out_features,):
+            raise ValueError(f"EXL3 module `{self.name}` has invalid logical bias geometry")
+        return inputs, outputs
+
     def _unpack_indices(self) -> torch.Tensor:
         trellis = getattr(self, "trellis", None)
         if trellis is None:
@@ -314,6 +335,7 @@ class ExllamaV3TorchLinear(nn.Module):
         if trellis.device.type == "meta":
             raise RuntimeError(f"EXL3 module `{self.name}` has not been materialized from checkpoint tensors yet.")
 
+        self._stored_features()
         bits = self._bits_per_weight()
         mask = (1 << bits) - 1
         words = (trellis.to(torch.int32) & 0xFFFF).contiguous()
@@ -397,7 +419,10 @@ class ExllamaV3TorchLinear(nn.Module):
         inner = _apply_hadamard_right(inner)
         inner *= getattr(self, "svh").to(dtype=torch.float32).unsqueeze(0)
 
-        self._weight_fp32 = inner.contiguous()
+        # The final Hadamard mixes every stored channel in a 128-wide block.
+        # Crop only after both transforms and FP32 scale multiplications;
+        # the inner tensor remains full-width for callers that use that layout.
+        self._weight_fp32 = inner[:, :self.out_features].contiguous()
         return self._weight_fp32
 
     def get_weight_tensor(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
