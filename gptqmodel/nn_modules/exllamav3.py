@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from ..exllamav3.modules.quant.exl3 import LinearEXL3
 
 
-_EXL3_BUFFER_NAMES = ("trellis", "suh", "svh", "su", "sv", "bias", "mcg", "mul1")
+_EXL3_BUFFER_NAMES = ("trellis", "suh", "svh", "su", "sv", "bias", "mcg", "mul1", "e4m3")
 
 
 def _torch_dtype(value: Any) -> torch.dtype:
@@ -164,6 +164,7 @@ class ExllamaV3Linear(nn.Module):
             trellis=trellis,
             mcg=getattr(self, "mcg", None),
             mul1=getattr(self, "mul1", None),
+            e4m3=getattr(self, "e4m3", None),
             bias=bias,
             out_dtype=self.out_dtype,
             transformers_fix=True,

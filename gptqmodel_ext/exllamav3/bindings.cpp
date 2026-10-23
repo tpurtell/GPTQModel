@@ -35,10 +35,11 @@ void quantize_tiles_wrapper(
     torch::Tensor& temp_edges,
     int64_t K,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3
 )
 {
-    quantize_tiles(input_tiles, output_tiles, output_indices, temp_costs, temp_edges, static_cast<int>(K), mcg, mul1);
+    quantize_tiles(input_tiles, output_tiles, output_indices, temp_costs, temp_edges, static_cast<int>(K), mcg, mul1, e4m3);
 }
 
 void pack_trellis_wrapper(torch::Tensor& packed, torch::Tensor unpacked, int64_t K)
@@ -56,9 +57,9 @@ void pack_signs_wrapper(torch::Tensor& packed, torch::Tensor unpacked)
     pack_signs(packed, unpacked);
 }
 
-void reconstruct_wrapper(torch::Tensor& unpacked, torch::Tensor packed, int64_t K, bool mcg, bool mul1)
+void reconstruct_wrapper(torch::Tensor& unpacked, torch::Tensor packed, int64_t K, bool mcg, bool mul1, bool e4m3)
 {
-    reconstruct(unpacked, packed, static_cast<int>(K), mcg, mul1);
+    reconstruct(unpacked, packed, static_cast<int>(K), mcg, mul1, e4m3);
 }
 
 void had_r_128_wrapper(
@@ -102,11 +103,11 @@ TORCH_LIBRARY(gptqmodel_exllamav3, m)
 {
     m.def("had_paley(Tensor(a!) h) -> ()");
     m.def("had_paley2(Tensor(a!) h) -> ()");
-    m.def("quantize_tiles(Tensor input_tiles, Tensor(a!) output_tiles, Tensor(b!) output_indices, Tensor(c!) temp_costs, Tensor(d!) temp_edges, int K, bool mcg, bool mul1) -> ()");
+    m.def("quantize_tiles(Tensor input_tiles, Tensor(a!) output_tiles, Tensor(b!) output_indices, Tensor(c!) temp_costs, Tensor(d!) temp_edges, int K, bool mcg, bool mul1, bool e4m3=False) -> ()");
     m.def("pack_trellis(Tensor(a!) packed, Tensor unpacked, int K) -> ()");
     m.def("unpack_trellis(Tensor(a!) unpacked, Tensor packed, int K) -> ()");
     m.def("pack_signs(Tensor(a!) packed, Tensor unpacked) -> ()");
-    m.def("reconstruct(Tensor(a!) unpacked, Tensor packed, int K, bool mcg, bool mul1) -> ()");
+    m.def("reconstruct(Tensor(a!) unpacked, Tensor packed, int K, bool mcg, bool mul1, bool e4m3=False) -> ()");
     m.def("had_r_128(Tensor input, Tensor(a!) output, Tensor? pre_scale, Tensor? post_scale, float scale) -> ()");
     m.def("hgemm(Tensor a, Tensor b, Tensor(a!) c) -> ()");
     m.def("bc_linear_exl3_run(Tensor trellis, Tensor suh, Tensor svh, int K, Tensor? bias, bool mcg, bool mul1, Tensor(a!) xh, Tensor x, Tensor(b!) y) -> ()");

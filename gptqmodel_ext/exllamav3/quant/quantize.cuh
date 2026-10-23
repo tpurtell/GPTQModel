@@ -11,7 +11,8 @@ void quantize_tiles
     at::Tensor temp_edges,
     int K,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3 = false
 );
 
 void decode
@@ -19,7 +20,8 @@ void decode
     at::Tensor input_indices,
     at::Tensor output_tiles,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3 = false
 );
 
 void test_distribution
@@ -30,5 +32,6 @@ void test_distribution
     float min_value,
     float max_value,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3 = false
 );

@@ -4863,8 +4863,8 @@ class EXL3Config(PreProcessorConfig):
             self.out_scales = out_scale_aliases[normalized_out_scales]
 
         self.codebook = str(self.codebook).strip().lower()
-        if self.codebook not in {"mcg", "mul1", "3inst"}:
-            raise ValueError("EXL3Config: `codebook` must be one of `mcg`, `mul1`, or `3inst`.")
+        if self.codebook not in {"mcg", "mul1", "3inst", "e4m3"}:
+            raise ValueError("EXL3Config: `codebook` must be one of `mcg`, `mul1`, `3inst`, or `e4m3`.")
 
         if self.tensor_storage is not None and not isinstance(self.tensor_storage, dict):
             raise ValueError("EXL3Config: `tensor_storage` must be a dictionary when provided.")

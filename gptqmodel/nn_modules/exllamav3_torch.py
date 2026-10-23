@@ -158,7 +158,7 @@ def _codebook_lut(
         floats = halves.view(torch.float16).to(torch.float32)
         return (floats[..., 0] + floats[..., 1]).contiguous()
 
-    if codebook == "mcg":
+    if codebook in {"mcg", "e4m3"}:
         raw = (values * _EXL3_MCG_MULT) & 0xFFFFFFFF
         raw = _EXL3_LOP3_BIAS ^ (raw & _EXL3_LOP3_MASK)
         halves = torch.stack(
@@ -169,7 +169,11 @@ def _codebook_lut(
             dim=-1,
         ).contiguous()
         floats = halves.view(torch.float16).to(torch.float32)
-        return (floats[..., 0] + floats[..., 1]).contiguous()
+        values = floats[..., 0] + floats[..., 1]
+        if codebook == "e4m3":
+            # The format rounds the native FP16 sum before E4M3 RNE.
+            return values.half().clamp(-448, 448).to(torch.float8_e4m3fn).float().contiguous()
+        return values.contiguous()
 
     if codebook == "mul1":
         raw = (values * _EXL3_MUL1_MULT) & 0xFFFFFFFF
@@ -289,6 +293,11 @@ class ExllamaV3TorchLinear(nn.Module):
         self._drop_cache()
 
     def _codebook_name(self) -> str:
+        markers = [name for name in ("mcg", "mul1", "e4m3") if getattr(self, name, None) is not None]
+        if len(markers) > 1:
+            raise ValueError("ambiguous EXL3 codebook")
+        if "e4m3" in markers:
+            return "e4m3"
         if getattr(self, "mcg", None) is not None:
             return "mcg"
         if getattr(self, "mul1", None) is not None:

@@ -2323,7 +2323,9 @@ class EXL3Processor(LoopProcessor):
             "seed": 787,
         }
 
-        if module_qcfg.codebook == "mcg":
+        if module_qcfg.codebook == "e4m3":
+            quant_args["e4m3"] = True
+        elif module_qcfg.codebook == "mcg":
             quant_args["mcg"] = True
         elif module_qcfg.codebook == "mul1":
             quant_args["mul1"] = True
@@ -2423,7 +2425,7 @@ class EXL3Processor(LoopProcessor):
             )
 
         module.stream_sync()
-        packed_names = ("trellis", "suh", "svh", "su", "sv", "mcg", "mul1")
+        packed_names = ("trellis", "suh", "svh", "su", "sv", "mcg", "mul1", "e4m3")
         packed = {
             name: module.state[name]
             for name in packed_names
@@ -3309,6 +3311,7 @@ class EXL3Processor(LoopProcessor):
                 "bias",
                 "mcg",
                 "mul1",
+                "e4m3",
             ):
                 tensor = module.state.pop(tensor_name, None)
                 if tensor is not None:
