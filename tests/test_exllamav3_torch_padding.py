@@ -47,7 +47,7 @@ def _oracle_inner(packed):
     if "mul1" in packed:
         raw = (states * 0x83DCD12D) & 0xFFFFFFFF
         summed = sum((raw >> shift) & 255 for shift in (0, 8, 16, 24)) + 0x6400
-        values = summed.to(torch.uint16).contiguous().view(torch.float16).float()
+        values = summed.to(torch.uint16).contiguous().view(torch.float16).double()
         inv = struct.unpack("<e", struct.pack("<H", 0x1EEE))[0]
         offset = struct.unpack("<e", struct.pack("<H", 0xC931))[0]
         values = values * inv + offset
@@ -56,9 +56,9 @@ def _oracle_inner(packed):
                else states * 89226354 + 64248484) & 0xFFFFFFFF
         raw = (raw & 0x8FFF8FFF) ^ 0x3B603B60
         halves = torch.stack((raw & 65535, raw >> 16), -1).to(torch.uint16).contiguous()
-        # The Torch backend intentionally sums codebook halves in FP32 and
-        # never introduces the native backend's FP16 reconstruction stages.
-        values = halves.view(torch.float16).float().sum(-1)
+        values = halves.view(torch.float16).double().sum(-1)
+    # Native codewords round once to half (__hadd/__hfma); rotations stay FP32.
+    values = values.half().float()
     tiles = torch.empty((*trellis.shape[:2], 16, 16), dtype=torch.float32)
     for lane in range(32):
         row, column = lane % 4 * 2, lane // 4

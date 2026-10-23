@@ -156,7 +156,8 @@ def _codebook_lut(
             dim=-1,
         ).contiguous()
         floats = halves.view(torch.float16).to(torch.float32)
-        return (floats[..., 0] + floats[..., 1]).contiguous()
+        # Native __hadd rounds to half before widening the decoded value.
+        return (floats[..., 0] + floats[..., 1]).half().float().contiguous()
 
     if codebook == "mcg":
         raw = (values * _EXL3_MCG_MULT) & 0xFFFFFFFF
@@ -169,7 +170,8 @@ def _codebook_lut(
             dim=-1,
         ).contiguous()
         floats = halves.view(torch.float16).to(torch.float32)
-        return (floats[..., 0] + floats[..., 1]).contiguous()
+        # Native __hadd rounds to half before widening the decoded value.
+        return (floats[..., 0] + floats[..., 1]).half().float().contiguous()
 
     if codebook == "mul1":
         raw = (values * _EXL3_MUL1_MULT) & 0xFFFFFFFF
@@ -181,7 +183,9 @@ def _codebook_lut(
         )
         accum = (byte_sum + _EXL3_MUL1_ACC).to(torch.uint16).contiguous()
         floats = accum.view(torch.float16).to(torch.float32)
-        return (floats * _EXL3_MUL1_INV + _EXL3_MUL1_BIAS).contiguous()
+        # These half operands are exact in FP32; native __hfma rounds once,
+        # after the add, not between the multiply and add.
+        return (floats * _EXL3_MUL1_INV + _EXL3_MUL1_BIAS).half().float().contiguous()
 
     raise ValueError(f"Unsupported EXL3 codebook: {codebook}")
 
