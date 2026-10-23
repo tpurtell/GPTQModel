@@ -32,9 +32,10 @@ def validate_core_tensors(packed, logical_shape):
         raise ValueError("invalid native EXL3 weight shape")
     outputs, inputs = logical_shape
     stored_outputs = math.ceil(outputs / 128) * 128
-    if inputs % 128 or set(packed) != {"trellis", "suh", "svh", "mcg"}:
+    markers = set(packed) & {"mcg", "e4m3"}
+    if inputs % 128 or len(markers) != 1 or set(packed) != {"trellis", "suh", "svh"} | markers:
         raise ValueError("expected 128-aligned input and standard EXL3 MCG tensors")
-    trellis, suh, svh, mcg = (packed[k] for k in ("trellis", "suh", "svh", "mcg"))
+    trellis, suh, svh, mcg = (packed[k] for k in ("trellis", "suh", "svh", next(iter(markers))))
     if (trellis.dtype != torch.int16 or trellis.ndim != 3
             or tuple(trellis.shape[:2]) != (inputs // 16, stored_outputs // 16)
             or trellis.shape[2] not in range(16, 129, 16)
@@ -61,13 +62,15 @@ def reconstruct_core_projection(packed, logical_shape, *, device="cuda:0", dtype
 
 
 @torch.no_grad()
-def quantize_core_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, device="cuda:0"):
+def quantize_core_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, device="cuda:0", codebook="mcg"):
     """Quantize a dense native [output,input] matrix using a fresh raw XTX copy.
 
     ``raw_hessian`` is the usual H/count/finalized mapping. The corpus count
     is required: no identity augmentation or uncalibrated fallback is accepted.
     The caller owns raw_hessian and weight; neither is mutated.
     """
+    if codebook not in {"mcg", "e4m3"}:
+        raise ValueError("Kimi core requires mcg or e4m3")
     if (isinstance(bits, bool) or not isinstance(bits, int) or bits != 6
             or isinstance(seed, bool) or not isinstance(seed, int)
             or isinstance(sigma, bool) or not isinstance(sigma, (int, float))
@@ -98,7 +101,8 @@ def quantize_core_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.02
     target = torch.device(device)
     working_hessian = dict(H=H.to(device=target, copy=True), count=raw_hessian["count"], finalized=False)
     args = dict(K=bits, seed=seed, sigma_reg=float(sigma), devices=[target],
-                mcg=True, apply_out_scales=None)
+                apply_out_scales=None)
+    args[codebook] = True
     _, _, packed = _quantizer().quantize_exl3(
         working_weight, working_hessian, args, return_weight_q=False)
     metrics = args.get("error_metrics", {})

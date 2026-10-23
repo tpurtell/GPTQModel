@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_fp8.h>
+
 // Force integer MAD on sm<=86. For some reason this performs better than letting the compiler emit IMUL
 // TODO: Keep an eye on new behavior in future versions of nvcc. While this is faster on RTX 3090, it really shouldn't be.
 template <uint32_t w>
@@ -41,6 +43,12 @@ __device__ inline half decode_3inst(uint32_t x)
         asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
+    }
+    if constexpr (cb == 3)
+    {
+        half value = decode_3inst<1>(x);
+        __nv_fp8_storage_t rounded = __nv_cvt_float_to_fp8(__half2float(value), __NV_SATFINITE, __NV_E4M3);
+        return __nv_cvt_fp8_to_halfraw(rounded, __NV_E4M3);
     }
     if constexpr (cb == 2)
     {
@@ -86,6 +94,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         half2 d1 = __highs2half2(xu0.as_half2, xu1.as_half2);
         return __hadd2(d0, d1);
     }
+    if constexpr (cb == 3)
+        return __halves2half2(decode_3inst<3>(x0), decode_3inst<3>(x1));
     if constexpr (cb == 2)
     {
         x0 *= 0x83DCD12Du;

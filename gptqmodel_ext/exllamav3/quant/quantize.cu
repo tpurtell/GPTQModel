@@ -235,7 +235,8 @@ constexpr auto quantize_tiles_kernel_instances = std::array
 {
     __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
-    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
+    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+    __(1, 3), __(2, 3), __(3, 3), __(4, 3), __(5, 3), __(6, 3), __(7, 3), __(8, 3)
 };
 #undef __
 
@@ -259,7 +260,8 @@ void quantize_tiles
     at::Tensor temp_edges,
     int K,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(input_tiles.device());
@@ -296,6 +298,8 @@ void quantize_tiles
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
+    if (e4m3) cb = 3;
+    TORCH_CHECK(int(mcg) + int(mul1) + int(e4m3) <= 1, "ambiguous EXL3 codebook");
 
     int batch_i = 0;
     do
@@ -343,7 +347,8 @@ void decode_kernel
     T* __restrict__ output_tiles_ptr,
     int cols,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3
 )
 {
     int col = threadIdx.x + blockIdx.x * 64;
@@ -353,7 +358,9 @@ void decode_kernel
 
     uint32_t enc = (uint32_t) input_tiles_ptr[idx];
     half w;
-    if (mcg)
+    if (e4m3)
+        w = decode_3inst<3>(enc);
+    else if (mcg)
         w = decode_3inst<1>(enc);
     else if (mul1)
         w = decode_3inst<2>(enc);
@@ -380,7 +387,8 @@ void decode
     at::Tensor input_indices,
     at::Tensor output_tiles,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(input_indices.device());
@@ -403,7 +411,8 @@ void decode
             (float*) output_tiles.data_ptr(),
             cols,
             mcg,
-            mul1
+            mul1,
+            e4m3
         );
     else if (output_tiles.dtype() == at::kHalf)
         decode_kernel<<<gridDim, blockDim, 0, stream>>>
@@ -412,7 +421,8 @@ void decode
             (half*) output_tiles.data_ptr(),
             cols,
             mcg,
-            mul1
+            mul1,
+            e4m3
         );
 }
 
@@ -431,7 +441,8 @@ void test_distribution_kernel
     float min_value,
     float max_value,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3
 )
 {
     __shared__ int histogram[MAX_BINS];
@@ -466,7 +477,9 @@ void test_distribution_kernel
         reset_histogram();
         for (uint64_t i = threadIdx.x; i < 65536; i += NUM_THREADS_TD)
         {
-            if (mcg)
+            if (e4m3)
+                count(decode_3inst_f<3>((uint16_t) (i & 0xffff)));
+            else if (mcg)
                 count(decode_3inst_f<1>((uint16_t) (i & 0xffff)));
             else if (mul1)
                 count(decode_3inst_f<2>((uint16_t) (i & 0xffff)));
@@ -500,7 +513,8 @@ void test_distribution
     float min_value,
     float max_value,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
@@ -525,6 +539,7 @@ void test_distribution
         min_value,
         max_value,
         mcg,
-        mul1
+        mul1,
+        e4m3
     );
 }

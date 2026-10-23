@@ -277,6 +277,7 @@ class _ExllamaV3TorchOpsFacade:
         K: int,
         mcg: bool,
         mul1: bool,
+        e4m3: bool = False,
     ) -> None:
         _runtime_op("quantize_tiles")(
             input_tiles,
@@ -287,6 +288,7 @@ class _ExllamaV3TorchOpsFacade:
             int(K),
             bool(mcg),
             bool(mul1),
+            bool(e4m3),
         )
 
     def pack_trellis(self, packed: torch.Tensor, unpacked: torch.Tensor, K: int) -> None:
@@ -298,8 +300,8 @@ class _ExllamaV3TorchOpsFacade:
     def pack_signs(self, packed: torch.Tensor, unpacked: torch.Tensor) -> None:
         _runtime_op("pack_signs")(packed, unpacked)
 
-    def reconstruct(self, unpacked: torch.Tensor, packed: torch.Tensor, K: int, mcg: bool, mul1: bool) -> None:
-        _runtime_op("reconstruct")(unpacked, packed, int(K), bool(mcg), bool(mul1))
+    def reconstruct(self, unpacked: torch.Tensor, packed: torch.Tensor, K: int, mcg: bool, mul1: bool, e4m3: bool = False) -> None:
+        _runtime_op("reconstruct")(unpacked, packed, int(K), bool(mcg), bool(mul1), bool(e4m3))
 
     def had_r_128(
         self,

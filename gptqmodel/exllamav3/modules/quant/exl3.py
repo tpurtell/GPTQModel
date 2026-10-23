@@ -31,6 +31,7 @@ class LinearEXL3:
         trellis: torch.Tensor | None = None,
         mcg: torch.Tensor | None = None,
         mul1: torch.Tensor | None = None,
+        e4m3: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
         transformers_fix: bool = False,
@@ -65,6 +66,10 @@ class LinearEXL3:
         self.swap_device = None
         self.out_dtype = out_dtype
 
+        if sum(marker is not None for marker in (mcg, mul1, e4m3)) > 1:
+            raise ValueError("ambiguous EXL3 codebook")
+        self.e4m3_tensor = e4m3
+        self.e4m3 = e4m3 is not None
         self.mcg_tensor = mcg
         self.mul1_tensor = mul1
         self.mcg = self.mcg_tensor is not None
@@ -99,6 +104,7 @@ class LinearEXL3:
                 ("bias", self.bias),
                 ("mcg", self.mcg_tensor),
                 ("mul1", self.mul1_tensor),
+                ("e4m3", self.e4m3_tensor),
             ] if tensor is not None
         }
 
@@ -116,7 +122,7 @@ class LinearEXL3:
                 return ovr[self.key].forward(x, params, out_dtype)
 
         bsz = x.numel() // x.shape[-1]
-        torch_mode = params.get("reconstruct", bsz > 32)
+        torch_mode = self.e4m3 or params.get("reconstruct", bsz > 32)
 
         out_shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, self.in_features)
@@ -169,7 +175,7 @@ class LinearEXL3:
 
     def get_inner_weight_tensor(self):
         w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-        ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+        ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1, self.e4m3)
         return w
 
 
@@ -213,6 +219,7 @@ class LinearEXL3:
             "bias": producer.send(self.bias),
             "mcg": producer.send(self.mcg_tensor),
             "mul1": producer.send(self.mul1_tensor),
+            "e4m3": producer.send(self.e4m3_tensor),
             "out_dtype": self.out_dtype,
         }
 
@@ -226,6 +233,7 @@ class LinearEXL3:
         id_bias = exported["bias"]
         mcg = consumer.recv(exported["mcg"], cuda = True)
         mul1 = consumer.recv(exported["mul1"], cuda = True)
+        e4m3 = consumer.recv(exported["e4m3"], cuda = True)
 
         if split is not None:
             split_out, first, last = split
@@ -259,6 +267,7 @@ class LinearEXL3:
             trellis = trellis,
             mcg = mcg,
             mul1 = mul1,
+            e4m3 = e4m3,
             bias = bias,
             out_dtype = exported["out_dtype"],
         )

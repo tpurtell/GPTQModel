@@ -8,5 +8,6 @@ void reconstruct
     at::Tensor packed,
     int K,
     bool mcg,
-    bool mul1
+    bool mul1,
+    bool e4m3 = false
 );

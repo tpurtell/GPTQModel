@@ -66,7 +66,7 @@ _workspace_registry_lock = threading.Lock()
 _workspace_gates = {}
 
 
-def _quantize_tiles_with_workspace(tiles, output, indices, K, mcg, mul1):
+def _quantize_tiles_with_workspace(tiles, output, indices, K, mcg, mul1, e4m3=False):
     # The cached scratch tensors are writable. Order their use across streams,
     # not just Python calls: releasing a mutex does not finish CUDA kernels.
     key = (tiles.device, K)
@@ -78,7 +78,7 @@ def _quantize_tiles_with_workspace(tiles, output, indices, K, mcg, mul1):
             stream.wait_event(gate["event"])
         temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
         try:
-            ext.quantize_tiles(tiles, output, indices, temp_costs, temp_edges, K, mcg, mul1)
+            ext.quantize_tiles(tiles, output, indices, temp_costs, temp_edges, K, mcg, mul1, e4m3)
         finally:
             event = torch.cuda.Event()
             event.record(stream)
@@ -93,9 +93,10 @@ def quantize_tiles(tiles, quant_args: dict):
     K = quant_args["K"]
     mcg = "mcg" in quant_args
     mul1 = "mul1" in quant_args
+    e4m3 = "e4m3" in quant_args
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
-    _quantize_tiles_with_workspace(tiles, quantized_tiles, quantized_idx, K, mcg, mul1)
+    _quantize_tiles_with_workspace(tiles, quantized_tiles, quantized_idx, K, mcg, mul1, e4m3)
     return quantized_tiles, quantized_idx
 
 
@@ -176,7 +177,8 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
                 K = quant_args["K"]
                 mcg = "mcg" in quant_args
                 mul1 = "mul1" in quant_args
-                _quantize_tiles_with_workspace(dev_tiles, dev_q_tiles, dev_q_idx, K, mcg, mul1)
+                e4m3 = "e4m3" in quant_args
+                _quantize_tiles_with_workspace(dev_tiles, dev_q_tiles, dev_q_idx, K, mcg, mul1, e4m3)
 
                 # Async copy back to pinned memory
                 pin_split_q_tiles[i].copy_(dev_q_tiles, non_blocking = True)
@@ -796,6 +798,7 @@ def reconstruct_exl3_tensors(
         K,
         "mcg" in tensors,
         "mul1" in tensors,
+        "e4m3" in tensors,
     )
     reconstructed = preapply_had_l(reconstructed, had_k)
     reconstructed *= suh.to(device=target, dtype=torch.float16).unsqueeze(1)
@@ -1393,6 +1396,8 @@ def quantize_exl3(
         # Safetensors doesn't know what to do with a torch.uint32 tensor. Anyway, since the multipliers are now
         # locked, the values in these tensors are never read, but they need to be present in the model files to
         # indicate which codebook to use during inference, per individual tensor.
+        if quant_args.get("e4m3"):
+            out_tensors["e4m3"] = torch.tensor(codebook_mcg_mult, dtype=torch.uint32).view(torch.int)
         if quant_args.get("mcg"):
             out_tensors.update({
                 "mcg": torch.tensor(codebook_mcg_mult, dtype = torch.uint32).view(torch.int)
