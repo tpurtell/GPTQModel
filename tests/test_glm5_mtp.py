@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
+from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaRMSNorm
 
 from gptqmodel.utils.glm5_mtp import GlmMTP, MTP_CONTRACT, aligned_inputs, load_mtp
 
@@ -19,16 +20,11 @@ def _norm(x, weight, eps):
     return unit * weight
 
 
-class Norm(nn.Module):
+class Norm(GlmMoeDsaRMSNorm):
     def __init__(self, weight, eps=1e-5):
-        super().__init__()
+        super().__init__(weight.numel(), eps=eps)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.eps = eps
-
-    def forward(self, x):
-        # The test module implements the native path; the separate oracle
-        # spells out the multiplication/reduction itself in _norm.
-        return F.rms_norm(x.float(), (x.shape[-1],), eps=self.eps).to(x.dtype) * self.weight
 
 
 @pytest.mark.cpu
