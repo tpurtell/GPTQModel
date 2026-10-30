@@ -1,0 +1,202 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Ownership, packed-QKV observation, native boundaries and MTP alignment."""
+from contextlib import contextmanager
+import importlib.util
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+from safetensors.torch import save_file
+
+from gptqmodel.utils import step5_core as core
+
+
+def source_slice(tmp_path):
+    values = torch.arange(3*4*8).reshape(3,4,8).bfloat16()
+    name = "model.layers.3.moe.gate_proj.weight"
+    save_file({name:values},tmp_path/"weights.safetensors")
+    source = core.Step5BF16Source.__new__(core.Step5BF16Source)
+    source.snapshot = tmp_path
+    source.config = dict(moe_layer_list=[3],moe_num_experts=3)
+    source.weight_map={name:"weights.safetensors"}
+    source._reader=source._reader_context=source._reader_shard=None
+    return source,values
+
+
+def test_fused_expert_slice_owns_only_one_matrix_and_survives_mapping_close(tmp_path):
+    source,values=source_slice(tmp_path)
+    tensor=source.expert_tensor(3,1,"gate_proj")
+    source.close()
+    assert tensor.shape==(4,8) and torch.equal(tensor,values[1])
+    tensor.zero_()
+    assert torch.equal(source.expert_tensor(3,1,"gate_proj"),values[1])
+    assert tensor.untyped_storage().nbytes()==tensor.numel()*tensor.element_size()
+    source.close()
+
+
+@pytest.mark.parametrize("args",[(True,1,"gate_proj"),(3,True,"gate_proj"),(3,3,"gate_proj"),
+                                 (4,1,"gate_proj"),(3,1,"invalid")])
+def test_expert_slice_rejects_outside_reviewed_geometry(tmp_path,args):
+    source,_=source_slice(tmp_path)
+    with pytest.raises(ValueError):
+        source.expert_tensor(*args)
+    source.close()
+
+
+class PackedAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj=nn.Linear(8,8,bias=False)
+        self.k_proj=nn.Linear(8,4,bias=False)
+        self.v_proj=nn.Linear(8,4,bias=False)
+        self.o_proj=nn.Linear(8,8,bias=False)
+        self.register_buffer("_qkv_weight",torch.empty(0),persistent=False)
+        self.calls=0
+
+    def _project_packed_qkv(self,x):
+        self.calls+=1
+        if not self._qkv_weight.numel():
+            self._qkv_weight=torch.cat([self.q_proj.weight,self.k_proj.weight,self.v_proj.weight])
+        return torch.nn.functional.linear(x,self._qkv_weight)
+
+
+def block():
+    b=nn.Module()
+    b.layer_idx=4
+    b.self_attn=PackedAttention()
+    return b
+
+
+def test_capture_packed_qkv_observes_same_operand_without_extra_gemm():
+    b=block();x=torch.randn(5,8)
+    observed={}
+    names=["model.layers.4.self_attn."+part+"_proj" for part in "qkv"]
+    with core.capture_inputs(b,names,lambda name,value:observed.setdefault(name,value)):
+        actual=b.self_attn._project_packed_qkv(x)
+    assert b.self_attn.calls==1
+    assert all(observed[name] is x for name in names)
+    assert torch.equal(actual,torch.nn.functional.linear(x,b.self_attn._qkv_weight))
+    assert not b.self_attn.q_proj._forward_pre_hooks
+
+
+def test_capture_restores_method_and_hooks_on_failure():
+    b=block();original=b.self_attn._project_packed_qkv
+    with pytest.raises(RuntimeError):
+        with core.capture_inputs(b,["self_attn.q_proj","self_attn.o_proj"],lambda *_:None):
+            raise RuntimeError("abort")
+    assert b.self_attn._project_packed_qkv==original
+    assert not b.self_attn.o_proj._forward_pre_hooks
+
+
+def test_replacing_projection_retires_stale_packed_storage():
+    b=block();x=torch.randn(5,8)
+    old=b.self_attn._project_packed_qkv(x)
+    replacement=torch.zeros_like(b.self_attn.q_proj.weight)
+    core.replace_projection(b,"self_attn.q_proj",replacement)
+    assert b.self_attn._qkv_weight.numel()==0
+    actual=b.self_attn._project_packed_qkv(x)
+    assert torch.count_nonzero(actual[:,:8])==0
+    assert torch.equal(actual[:,8:],old[:,8:])
+
+
+class Norm(nn.Module):
+    def __init__(self,width):
+        super().__init__()
+        self.weight=nn.Parameter(torch.linspace(-.1,.2,width))
+    def forward(self,x):
+        value=x.float()
+        return (value*torch.rsqrt(value.square().mean(-1,keepdim=True)+1e-5)
+                *(1+self.weight)).to(x.dtype)
+
+
+def test_three_mtp_teacher_shifts_preserve_raw_residual_and_positions():
+    embedding=torch.randn(16,8).bfloat16()
+    previous=torch.randn(7,8)
+    ids=torch.arange(7)
+    positions=torch.arange(7)
+    for stage in range(3):
+        aligned=core.aligned_inputs(previous,ids,embedding,position_ids=positions)
+        assert torch.equal(aligned["target_hidden"],previous[:-1])
+        assert torch.equal(aligned["inputs_embeds"],embedding[ids[1:]])
+        assert torch.equal(aligned["position_ids"],torch.arange(stage+1,7))
+        previous=aligned["target_hidden"]+10.0
+        ids=aligned["input_ids"]
+        positions=aligned["position_ids"]
+
+
+def test_mtp_envelope_narrows_before_each_zero_centered_norm():
+    b=SimpleNamespace(enorm=Norm(8),hnorm=Norm(8))
+    embedding=torch.randn(5,8).bfloat16()
+    residual=torch.randn(5,8)*100.1
+    actual=core.mtp_envelope(b,embedding,residual)
+    def oracle(x,w):
+        x=x.bfloat16().float()
+        return (x*torch.rsqrt(x.square().mean(-1,keepdim=True)+1e-5)*(1+w)).bfloat16()
+    expected=torch.cat((oracle(embedding,b.enorm.weight),oracle(residual,b.hnorm.weight)),-1)
+    assert torch.equal(actual,expected)
+
+
+def test_rope_growth_retires_old_tables_before_native_builder():
+    class Attention:
+        def __init__(self):
+            self.rope_cos=torch.ones(4,2)
+            self.rope_sin=torch.ones(4,2)
+        def build_rope(self,*,max_position,device,shared_cache):
+            assert self.rope_cos.numel()==0 and self.rope_sin.numel()==0
+            self.rope_cos=torch.ones(max_position,2)
+            self.rope_sin=torch.ones(max_position,2)
+    b=SimpleNamespace(self_attn=Attention(),_gptqmodel_step5_source=SimpleNamespace(_rope={}),
+                      _gptqmodel_step5_extent=4)
+    context=core.prepare_context(torch.ones(130,8),position_ids=torch.arange(130))
+    core._prepare_rope(b,context)
+    assert b.self_attn.rope_cos.shape[0]==256
+
+
+@pytest.mark.parametrize("positions",[torch.tensor([0,2,3]),torch.tensor([-1,0,1]),torch.tensor([0.,1.,2.])])
+def test_context_rejects_gaps_negative_or_float_positions(positions):
+    with pytest.raises(ValueError):
+        core.prepare_context(torch.ones(3,8),position_ids=positions)
+
+
+def test_router_preserves_native_topk_and_recovers_only_unselected_experts():
+    class Router:
+        top_k=2
+        gate=nn.Linear(4,6,bias=False)
+        router_bias=torch.zeros(6)
+        def route(self,x):
+            ids=torch.tensor([[5,3],[2,0]])
+            return torch.tensor([[.8,.2],[.6,.4]]),ids
+    router=Router()
+    with torch.no_grad():router.gate.weight.zero_()
+    selected,weights,recovery=core.router_choices(router,torch.ones(2,4),rank_max=4)
+    assert torch.equal(selected,router.route(None)[1])
+    assert torch.equal(weights,router.route(None)[0])
+    assert torch.equal(recovery,torch.tensor([[0,1],[1,3]]))
+
+
+@pytest.mark.parametrize("bits",[4,5,6])
+def test_all_pilot_bits_use_calibrated_contract_without_mutating_raw_hessian(monkeypatch,bits):
+    original=torch.eye(128,dtype=torch.float32)
+    hessian=dict(H=original,count=17,finalized=False)
+    class Quantizer:
+        def quantize_exl3(self,weight,raw,args,return_weight_q):
+            assert raw["H"].data_ptr()!=original.data_ptr()
+            assert args["K"]==bits and args["mcg"] is True and return_weight_q is False
+            raw["H"].zero_()
+            args["error_metrics"]={
+                "quantizer_path":"hessian_ldlq","hessian_metric_status":"ok",
+                "hessian_numerical_contract":"signed-block-hadamard-congruence-fp64-v1",
+                "hessian_transform_compute_dtype":"torch.float64","hessian_storage_dtype":"torch.float32",
+                "hessian_sample_count":17,"reported_metric_value":.001,
+                "hessian_weighted_error_numerator":1.,"hessian_weighted_reference_denominator":1000.,
+                "hessian_weighted_relative_error":.001}
+            return None,None,dict(trellis=torch.zeros(8,8,16*bits,dtype=torch.int16),
+                suh=torch.ones(128,dtype=torch.float16),svh=torch.ones(128,dtype=torch.float16),
+                mcg=torch.tensor(-877912083,dtype=torch.int32))
+    monkeypatch.setattr(core.base,"_quantizer",lambda:Quantizer())
+    packed,metric,evidence=core.quantize_projection(torch.ones(128,128).bfloat16(),hessian,bits=bits,device="cpu")
+    assert torch.equal(original,torch.eye(128))
+    assert evidence["bits"]==bits and evidence["hessian_rows"]==17 and evidence["identity_rows"]==0
