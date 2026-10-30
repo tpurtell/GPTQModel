@@ -270,3 +270,74 @@ def test_functional_indexer_observer_restores_method_on_callback_failure():
         with core.capture_inputs(b,["self_attn.sparse_indexer_w"],abort):
             b.self_attn.indexer.project(torch.ones(2,8),torch.arange(2))
     assert b.self_attn.indexer.project==original
+
+
+def test_hessian_products_bound_k_and_preserve_all_actual_rows_without_padding(monkeypatch):
+    generator=torch.Generator().manual_seed(51)
+    inputs=torch.randn(301,8,generator=generator).bfloat16()
+    H=torch.zeros(8,8,dtype=torch.float32)
+    actual=[];addmm=torch.Tensor.addmm_
+    def observed(self,left,right,*args,**kwargs):
+        if self is H:
+            actual.append(right.clone())
+            assert right.shape[0]<=128
+            assert left.dtype==right.dtype==self.dtype==torch.float32
+            assert torch.equal(left,right.T)
+        return addmm(self,left,right,*args,**kwargs)
+    monkeypatch.setattr(torch.Tensor,'addmm_',observed)
+    assert core.accumulate_hessian_fp32(H,inputs)==301
+    assert [len(value) for value in actual]==[128,128,45]
+    assert torch.equal(torch.cat(actual),inputs.float())
+    expected=(inputs.double().T@inputs.double()).float()
+    torch.testing.assert_close(H,expected,rtol=2e-6,atol=1e-5)
+    assert float(torch.linalg.norm(H-expected)/torch.linalg.norm(expected))<2e-6
+    assert H.dtype==torch.float32
+
+
+def test_dense_hessian_add_and_update_keep_exact_actual_count_no_identity_rows(monkeypatch):
+    inputs=torch.linspace(-2,2,317*8).reshape(317,8).bfloat16()
+    capture=core.DenseRawHessian(8,device='cpu')
+    lengths=[];addmm=torch.Tensor.addmm_
+    def observed(self,left,right,*args,**kwargs):
+        if self is capture.H:lengths.append(len(right))
+        return addmm(self,left,right,*args,**kwargs)
+    monkeypatch.setattr(torch.Tensor,'addmm_',observed)
+    capture.add(inputs[:200].reshape(2,100,8))
+    capture.update(inputs[200:].T.contiguous().T)
+    raw=capture.raw_dict(minimum_rows=317)
+    assert capture.count==raw['count']==317 and raw['finalized'] is False
+    assert raw.get('identity_rows',0)==0
+    assert lengths==[128,72,117]
+    assert raw['H'].dtype==torch.float32
+    torch.testing.assert_close(raw['H'],(inputs.double().T@inputs.double()).float(),rtol=1e-6,atol=1e-4)
+
+
+def test_bounded_hessian_accumulation_is_deterministic_and_honors_smaller_chunks():
+    inputs=torch.randn(519,7,generator=torch.Generator().manual_seed(9))
+    first=torch.zeros(7,7);second=torch.zeros(7,7)
+    core.accumulate_hessian_fp32(first,inputs,max_rows=64)
+    core.accumulate_hessian_fp32(second,inputs,max_rows=64)
+    assert torch.equal(first,second)
+    capture=core.DenseRawHessian(7,device='cpu',chunk_rows=64)
+    capture.add(inputs)
+    assert torch.equal(capture.H,first)
+
+
+@pytest.mark.parametrize('max_rows',[0,-1,129,2048,True,1.5])
+def test_hessian_rejects_unsafe_or_noninteger_product_bounds(max_rows):
+    H=torch.zeros(4,4)
+    with pytest.raises(ValueError):core.accumulate_hessian_fp32(H,torch.ones(2,4),max_rows=max_rows)
+    assert torch.count_nonzero(H)==0
+
+
+@pytest.mark.parametrize('inputs',[torch.empty(0,4),torch.full((2,4),float('nan')),
+                                  torch.ones(2,3),torch.ones(2,4,dtype=torch.int64)])
+def test_invalid_hessian_observations_do_not_increment_dense_count(inputs):
+    capture=core.DenseRawHessian(4,device='cpu')
+    with pytest.raises(ValueError):capture.add(inputs)
+    assert capture.count==0 and torch.count_nonzero(capture.H)==0
+
+
+def test_hessian_requires_fp32_storage():
+    with pytest.raises(ValueError):
+        core.accumulate_hessian_fp32(torch.zeros(4,4,dtype=torch.float64),torch.ones(2,4))

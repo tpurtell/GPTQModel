@@ -23,10 +23,48 @@ from . import glm5_core as base
 
 PREFIX = "model."
 REVISION = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1"
-DenseRawHessian = base.DenseRawHessian
 capture_linear_input = base.capture_linear_input
 reconstruct_projection = base.reconstruct_projection
 validate_projection = base.validate_projection
+HESSIAN_ACCUMULATION_CONTRACT = "step5-native-fp32-XTX-k128-v1"
+
+
+@torch.inference_mode()
+def accumulate_hessian_fp32(H, inputs, *, max_rows=128):
+    """Add every actual activation row with a bounded FP32 reduction length.
+
+    A long transposed-input CUDA SGEMM can accumulate thousands of products
+    sequentially, destroying the covariance's positive margin. Bound each
+    product's K dimension to 128 while retaining FP32 storage and corpus order.
+    No padding, synthetic rows, damping or precision fallback is introduced.
+    Return the number of actual rows accumulated.
+    """
+    if (not isinstance(H, torch.Tensor) or H.ndim != 2 or H.shape[0] != H.shape[1]
+            or H.shape[0] <= 0 or H.dtype != torch.float32):
+        raise ValueError("Step-5 Hessian accumulation requires square FP32 storage")
+    if (isinstance(max_rows, bool) or not isinstance(max_rows, int) or not 1 <= max_rows <= 128):
+        raise ValueError("Step-5 Hessian products require 1..128 actual rows")
+    if (not isinstance(inputs, torch.Tensor) or inputs.ndim < 2
+            or inputs.shape[-1] != H.shape[0] or not inputs.is_floating_point()):
+        raise ValueError("invalid Step-5 Hessian activation geometry or dtype")
+    rows = inputs.reshape(-1, H.shape[0])
+    if not len(rows) or not bool(torch.isfinite(rows).all()):
+        raise ValueError("Step-5 Hessian observations must be nonempty and finite")
+    for start in range(0, len(rows), max_rows):
+        value = rows[start:start + max_rows].to(device=H.device, dtype=torch.float32)
+        H.addmm_(value.T, value)
+    if not bool(torch.isfinite(H).all()):
+        raise ValueError("nonfinite Step-5 Hessian accumulation")
+    return len(rows)
+
+
+class DenseRawHessian(base.DenseRawHessian):
+    """Actual dense observations with Step-5's bounded FP32 XTX products."""
+    @torch.inference_mode()
+    def add(self, inputs):
+        self.count += accumulate_hessian_fp32(self.H, inputs, max_rows=min(self.chunk_rows, 128))
+
+    update = add
 
 
 
