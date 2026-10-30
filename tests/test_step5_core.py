@@ -223,3 +223,50 @@ def test_native_config_constructor_cannot_mutate_reviewed_source_document(tmp_pa
     assert source.document==document
     assert source.config==document["text_config"]
     assert json.loads((tmp_path/"config.json").read_text())==document
+
+
+def test_functional_indexer_weight_capture_observes_native_operand_without_extra_gemm():
+    b=block()
+    b.self_attn.sparse_indexer_q=nn.Linear(8,4,bias=False,dtype=torch.bfloat16)
+    b.self_attn.sparse_indexer_w=nn.Linear(8,2,bias=False,dtype=torch.float32)
+    class Indexer:
+        def __init__(self,owner):
+            self.owner=owner;self.calls=0
+        def project(self,hidden,positions):
+            self.calls+=1
+            query=self.owner.sparse_indexer_q(hidden)
+            # Deliberately bypass the W module, exactly as the pinned release.
+            weight=torch.nn.functional.linear(hidden,self.owner.sparse_indexer_w.weight.to(hidden.dtype)).float()
+            return query,weight
+    b.self_attn.indexer=Indexer(b.self_attn)
+    indexer=b.self_attn.indexer
+    original=indexer.project
+    x=torch.randn(5,8).bfloat16()
+    positions=torch.arange(5)
+    expected=indexer.project(x,positions)
+    before=indexer.calls
+    observations=[]
+    names=["self_attn.sparse_indexer_q","self_attn.sparse_indexer_w"]
+    with core.capture_inputs(b,names,lambda name,value:observations.append((name,value))):
+        actual=indexer.project(x,positions)
+    assert indexer.calls==before+1
+    assert all(torch.equal(a,e) for a,e in zip(actual,expected))
+    assert sorted(name for name,_ in observations)==["model.layers.4."+name for name in names]
+    assert all(value is x for _,value in observations)
+    assert indexer.project==original
+    assert not b.self_attn.sparse_indexer_q._forward_pre_hooks
+    assert not b.self_attn.sparse_indexer_w._forward_pre_hooks
+
+
+def test_functional_indexer_observer_restores_method_on_callback_failure():
+    b=block()
+    class Indexer:
+        def project(self,hidden,positions):
+            raise AssertionError("callback must abort before the native project")
+    b.self_attn.indexer=Indexer()
+    original=b.self_attn.indexer.project
+    def abort(*_):raise RuntimeError("capture failed")
+    with pytest.raises(RuntimeError,match="capture failed"):
+        with core.capture_inputs(b,["self_attn.sparse_indexer_w"],abort):
+            b.self_attn.indexer.project(torch.ones(2,8),torch.arange(2))
+    assert b.self_attn.indexer.project==original

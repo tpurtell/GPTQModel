@@ -343,17 +343,20 @@ def capture_inputs(block, names, callback):
     """Observe full checkpoint module names, including packed functional QKV.
 
     ``callback(full_name, input_tensor)`` receives the actual GEMM operands.
-    Packed QKV bypasses its child Linear forwards, so observing it requires
-    wrapping the packed call without invoking additional matrix products.
+    Packed QKV and sparse-indexer W bypass their child Linear forwards.
+    Observe their enclosing native calls without additional matrix products;
+    no operator, GEMM dtype, output or reduction order is replaced.
     """
     prefix = f"model.layers.{block.layer_idx}."
     relative = {name.removeprefix(prefix).removesuffix(".weight") for name in names}
     hooks = []
     qkv = {f"self_attn.{part}_proj" for part in "qkv"}
     observed_qkv = relative & qkv
-    original = None
+    functional_indexer = "self_attn.sparse_indexer_w"
+    observed_indexer = functional_indexer in relative
+    original = original_indexer = None
     try:
-        for name in sorted(relative - qkv):
+        for name in sorted(relative - qkv - {functional_indexer}):
             def observe(target, args, name=name):
                 callback(prefix + name, args[0])
             hooks.append(module(block, name).register_forward_pre_hook(observe))
@@ -364,12 +367,25 @@ def capture_inputs(block, names, callback):
                     callback(prefix + name, hidden)
                 return original(hidden)
             block.self_attn._project_packed_qkv = types.MethodType(packed, block.self_attn)
+        if observed_indexer:
+            indexer = block.self_attn.indexer
+            if indexer is None:
+                raise ValueError("Step-5 functional indexer observation requires a sparse layer")
+            original_indexer = indexer.project
+            def project(self, hidden, positions):
+                # The native function rounds its F32 W weight to hidden.dtype
+                # and uses this exact hidden operand in functional.linear.
+                callback(prefix + functional_indexer, hidden)
+                return original_indexer(hidden, positions)
+            indexer.project = types.MethodType(project, indexer)
         yield
     finally:
         for hook in hooks:
             hook.remove()
         if original is not None:
             block.self_attn._project_packed_qkv = original
+        if original_indexer is not None:
+            block.self_attn.indexer.project = original_indexer
 
 
 def router_choices(moe, hidden, *, rank_max=16):
