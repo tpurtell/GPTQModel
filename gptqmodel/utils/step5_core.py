@@ -8,6 +8,7 @@ This adapter adds loading, observation and stage boundaries, never attention mat
 from __future__ import annotations
 
 from contextlib import contextmanager
+import copy
 import importlib.util
 import json
 import math
@@ -128,7 +129,7 @@ class Step5BF16Source(base.GlmBF16Source):
         install()  # Exactly the fixed-M128 reference GEMM geometry.
         self.source_identity = self.reference.verify_source(self.snapshot)
         self.release, self.kernel = self.reference.load_release(self.snapshot)
-        self._config = self.release.Step5Config(**self.reference.decoder_config(self.document))
+        self._config = self.release.Step5Config(**copy.deepcopy(self.reference.decoder_config(self.document)))
         self.reference.validate_config(self._config)
         self._rope = {}
 

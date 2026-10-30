@@ -200,3 +200,26 @@ def test_all_pilot_bits_use_calibrated_contract_without_mutating_raw_hessian(mon
     packed,metric,evidence=core.quantize_projection(torch.ones(128,128).bfloat16(),hessian,bits=bits,device="cpu")
     assert torch.equal(original,torch.eye(128))
     assert evidence["bits"]==bits and evidence["hessian_rows"]==17 and evidence["identity_rows"]==0
+
+
+def test_native_config_constructor_cannot_mutate_reviewed_source_document(tmp_path,monkeypatch):
+    document=dict(model_type="step5_vl",text_config=dict(model_type="step5",
+        num_hidden_layers=92,num_nextn_predict_layers=3,norm_dtype="float32",
+        fp32_residual_connection=True,rope_scaling=dict(factor=16.0,nested=dict(values=[1,2]))))
+    (tmp_path/"config.json").write_text(json.dumps(document))
+    (tmp_path/"model.safetensors.index.json").write_text(json.dumps(dict(weight_map={})))
+    class MutatingConfig:
+        def __init__(self,**config):
+            config["rope_scaling"]["rope_theta"]=[10000.0]*95
+            config["rope_scaling"]["nested"]["values"].append(3)
+    release=SimpleNamespace(Step5Config=MutatingConfig)
+    reference=SimpleNamespace(verify_source=lambda _:dict(revision=core.REVISION),
+        load_release=lambda _:(release,None),decoder_config=lambda value:dict(value["text_config"]),
+        validate_config=lambda _:None)
+    monkeypatch.setattr(core,"_load_reference",lambda _:reference)
+    import sys
+    monkeypatch.setitem(sys.modules,"shape_invariant",SimpleNamespace(install=lambda:None))
+    source=core.Step5BF16Source(tmp_path,reference_root=tmp_path)
+    assert source.document==document
+    assert source.config==document["text_config"]
+    assert json.loads((tmp_path/"config.json").read_text())==document
