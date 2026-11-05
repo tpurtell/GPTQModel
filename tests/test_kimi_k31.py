@@ -133,6 +133,12 @@ def test_source_deferred_experts_one_active_reader_and_f32_indexer(tmp_path, mon
     source.materialize_routed_experts(block, "cpu")
     expected = torch.tensor([1., 1.5]).repeat(16).repeat(2, 1).to(torch.bfloat16)
     assert torch.equal(block.block_sparse_moe.experts[0].w1.weight, expected)
+    # The core replay phase asks to materialize experts again. Already-installed
+    # serialized K2 reconstructions must survive that call unchanged.
+    with torch.no_grad():
+        block.block_sparse_moe.experts[0].w1.weight.fill_(9)
+    source.materialize_routed_experts(block, "cpu")
+    assert torch.equal(block.block_sparse_moe.experts[0].w1.weight, torch.full_like(expected, 9))
     assert opens == ["a.safetensors"]
     cloned = source.tensor(name)
     cloned.zero_()
