@@ -62,7 +62,14 @@ class KimiK31Source(KimiK3EXL3Source):
     def decoded(self, name, device="cpu"):
         # The inherited EXL3 reader's decoder expects already-quantized source
         # parts. This source instead uses the original exact MXFP4 dequantizer.
-        return KimiK3Source.decoded(self, name, device)
+        value = KimiK3Source.decoded(self, name, device)
+        if name.endswith(".self_attn.A_log"):
+            heads = self.text_config["linear_attn_config"]["num_heads"]
+            if value.ndim != 1 or value.numel() != heads:
+                if (heads != 96 or value.dtype != torch.float32 or value.shape != (128,)
+                        or bool(torch.count_nonzero(value[96:].contiguous().view(torch.uint8)))):
+                    raise ValueError("unsupported or nonzero KDA A_log padding")
+        return value
 
     @torch.no_grad()
     def load_block(self, layer, device="cuda:0", *, include_experts=False):

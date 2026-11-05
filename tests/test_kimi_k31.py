@@ -142,3 +142,20 @@ def test_source_deferred_experts_one_active_reader_and_f32_indexer(tmp_path, mon
     source.close()
     assert source._reader is None
     assert not block.training
+
+
+@pytest.mark.parametrize("bad", ["nonzero", "negative-zero", "wrong-dtype", "wrong-length"])
+def test_padded_a_log_requires_exact_zero_f32_tail(bad):
+    source = object.__new__(k31.KimiK31Source)
+    source.text_config = dict(linear_attn_config=dict(num_heads=96))
+    name = "language_model.model.layers.0.self_attn.A_log"
+    source.weight_map = {name: "unused"}
+    value = torch.cat((torch.linspace(-2, 2, 96), torch.zeros(32)))
+    source.tensor = lambda *a: value
+    assert torch.equal(source.decoded(name), value)
+    if bad == "nonzero": value[127] = 1
+    elif bad == "negative-zero": value[127] = -0.
+    elif bad == "wrong-dtype": value = value.to(torch.bfloat16)
+    elif bad == "wrong-length": value = value[:127]
+    with pytest.raises(ValueError, match="A_log padding"):
+        source.decoded(name)
