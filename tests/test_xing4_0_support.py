@@ -97,4 +97,3 @@ def test_xing4_0_lm_head_hook_reduces_hyperconnection_streams():
     torch.testing.assert_close(result[0][0], norm(stream_4d.mean(dim=2)))
     torch.testing.assert_close(result[0][1], norm(stream_3d))
     assert not torch.allclose(result[0][0], norm(stream_4d).mean(dim=2))
-

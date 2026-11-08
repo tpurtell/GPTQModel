@@ -58,6 +58,7 @@ def build_startup_banner(
 def _get_git_commit():
     """Read the package checkout's commit independently of the caller's directory."""
     import subprocess
+
     try:
         repo_root = Path(__file__).resolve().parent.parent
         if not (repo_root / ".git").exists():
@@ -65,8 +66,7 @@ def _get_git_commit():
         commit = subprocess.check_output(
             ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
             stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
+        ).decode().strip()
         return f"+{commit}"
     except Exception:
         return ""
