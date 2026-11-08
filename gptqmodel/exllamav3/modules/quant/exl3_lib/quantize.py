@@ -13,10 +13,11 @@ from functools import lru_cache
 import torch
 
 from ....ext import exllamav3_ext as ext
-from ....util.progress import ProgressBar
-from ....util.memory import free_mem
 from ....util.hadamard import get_hadamard_dt
+from ....util.memory import free_mem
+from ....util.progress import ProgressBar
 from ....util.tensor import save_tensor_image
+
 
 # Constant
 had_k, had_n = 128, 128
@@ -54,35 +55,109 @@ def tensor_core_perm_i(device):
     return torch.argsort(tensor_core_perm(device))
 
 
-@lru_cache
-def get_temp_buffers(device, K: int):
-    max_batch_size = 256
-    temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.half, device = device)
-    temp_edges = torch.zeros((max_batch_size, 256, 65536 >> K), dtype = torch.short, device = device)
+def tile_core_permute(rows: torch.Tensor, tiles_n: int) -> torch.Tensor:
+    """Move a (16, tiles_n * 16) row block into the tensor core tile layout.
+
+    ``tensor_core_perm`` reorders each 16x16 tile so that the source element
+    ``r = 8*n + 2*a + m``, ``c = 8*q + b`` lands at ``p = 32*b + 8*a + 4*q + 2*n + m``.
+    That mapping is a pure dimension permutation of the block, so it is expressed
+    as a view plus a transpose rather than an index gather. The copy kernel this
+    produces is coalesced and vectorized, where the gather reads one scattered
+    element per thread. Both forms move the same values and are bit-identical.
+    """
+
+    return rows.reshape(2, 4, 2, tiles_n, 2, 8).permute(3, 5, 1, 4, 0, 2).reshape(tiles_n, 256)
+
+
+def tile_core_permute_i(tiles: torch.Tensor, tiles_n: int, size_n: int) -> torch.Tensor:
+    """Undo :func:`tile_core_permute`, back to a (16, size_n) row block."""
+
+    return tiles.reshape(tiles_n, 8, 4, 2, 2, 2).permute(4, 2, 5, 0, 3, 1).reshape(16, size_n)
+
+
+_DEFAULT_TILE_BATCH = 256
+
+
+def _tile_batch_size() -> int:
+    """Tile slots per quantization launch.
+
+    The scratch buffer below is ``batch x 256 x (65536 >> K)`` int16, i.e. 2 GiB
+    at the default batch of 256. That is allocated once per CUDA stream, and the
+    quantization pool runs one stream per worker thread, so a wide run can hold
+    several GiB of pure scratch per device. ``GPTQMODEL_EXL3_TILE_BATCH`` lowers
+    the slot count for memory-constrained hosts; tiles are quantized
+    independently, so a smaller batch only means more launches.
+    """
+
+    import os
+
+    try:
+        batch = int(os.environ.get("GPTQMODEL_EXL3_TILE_BATCH", _DEFAULT_TILE_BATCH))
+    except ValueError:
+        batch = _DEFAULT_TILE_BATCH
+    return max(1, min(_DEFAULT_TILE_BATCH, batch))
+
+
+def _allocate_temp_buffers(device, K: int, batch: int):
+    """Allocate one stream's worth of writable tile scratch.
+
+    Both buffers are pure scratch that ``quantize_tiles_kernel`` fills before it
+    reads anything back. Each launch covers every trellis position of every
+    ``edges`` state of every tile slot it is given, so no element can be
+    observed before it is written; zero-filling only costs a 537 MB memset per
+    stream (measured 43.1 ms against 0.3 ms for the uninitialized allocation).
+    """
+
+    max_batch_size = batch
+    temp_costs = torch.empty((max_batch_size, 2, 65536 >> K), dtype = torch.half, device = device)
+    temp_edges = torch.empty((max_batch_size, 256, 65536 >> K), dtype = torch.short, device = device)
     return temp_costs, temp_edges
 
 
 _workspace_registry_lock = threading.Lock()
-_workspace_gates = {}
+_workspace_buffers = {}
+
+
+def _stream_temp_buffers(device, K: int, stream):
+    """Return the writable tile scratch owned by *stream*.
+
+    A launch indexes the scratch by tile slot, so launches that may run at the
+    same time must never share it. The lifecycle quantizes several modules
+    concurrently (one per device-pool worker thread) and each thread drives its
+    own serial chain of tile launches; keying the scratch by stream keeps those
+    chains independent so they can overlap on the device. Launches on a single
+    stream stay ordered by the stream itself, so no event handshake is needed.
+    """
+
+    batch = _tile_batch_size()
+    key = (torch.device(device), int(K), stream, batch)
+    with _workspace_registry_lock:
+        buffers = _workspace_buffers.get(key)
+        if buffers is None:
+            buffers = _allocate_temp_buffers(key[0], K, batch)
+            _workspace_buffers[key] = buffers
+        return buffers
 
 
 def _quantize_tiles_with_workspace(tiles, output, indices, K, mcg, mul1):
-    # The cached scratch tensors are writable. Order their use across streams,
-    # not just Python calls: releasing a mutex does not finish CUDA kernels.
-    key = (tiles.device, K)
-    with _workspace_registry_lock:
-        gate = _workspace_gates.setdefault(key, {"lock": threading.Lock(), "event": None})
+    """Quantize every tile, splitting the launch to fit the scratch buffer.
+
+    Tiles are independent (each carries its own trellis and writes all 256 of
+    its entries), so processing them in batches is exactly equivalent to one
+    launch over the whole set.
+    """
+
     stream = torch.cuda.current_stream(tiles.device)
-    with gate["lock"]:
-        if gate["event"] is not None:
-            stream.wait_event(gate["event"])
-        temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
-        try:
-            ext.quantize_tiles(tiles, output, indices, temp_costs, temp_edges, K, mcg, mul1)
-        finally:
-            event = torch.cuda.Event()
-            event.record(stream)
-            gate["event"] = event
+    temp_costs, temp_edges = _stream_temp_buffers(tiles.device, K, stream)
+    batch = _tile_batch_size()
+    rows = tiles.shape[0]
+    if rows <= batch:
+        ext.quantize_tiles(tiles, output, indices, temp_costs, temp_edges, K, mcg, mul1)
+        return
+    for start in range(0, rows, batch):
+        stop = min(start + batch, rows)
+        ext.quantize_tiles(tiles[start:stop], output[start:stop], indices[start:stop],
+                           temp_costs, temp_edges, K, mcg, mul1)
 
 
 def quantize_tiles(tiles, quant_args: dict):
@@ -93,15 +168,38 @@ def quantize_tiles(tiles, quant_args: dict):
     K = quant_args["K"]
     mcg = "mcg" in quant_args
     mul1 = "mul1" in quant_args
-    quantized_tiles = torch.zeros_like(tiles)
-    quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
+    # ``quantize_tiles_kernel`` writes every one of the 256 entries of each
+    # output tile (the final backward pass walks all 256 positions with
+    # ``write = true``), so zero-filling the buffers first only costs a
+    # separate memset launch per tile set -- one per 16-row block, i.e. up to
+    # a few hundred extra launches per weight matrix.
+    quantized_tiles = torch.empty_like(tiles)
+    quantized_idx = torch.empty_like(tiles, dtype = torch.short)
     _quantize_tiles_with_workspace(tiles, quantized_tiles, quantized_idx, K, mcg, mul1)
     return quantized_tiles, quantized_idx
 
 
-@lru_cache
+_quant_stream_tls = threading.local()
+
+
 def get_quant_stream(device):
-    return torch.cuda.Stream(device = device)
+    """Return this thread's quantization stream for *device*.
+
+    Modules are quantized by a pool of worker threads, and every module runs its
+    own serial chain of small tile launches (a 56-tile grid fills less than a
+    quarter of the machine). One stream per thread lets independent chains
+    co-schedule on the device; a single shared stream serializes them instead.
+    """
+
+    device = torch.device(device)
+    streams = getattr(_quant_stream_tls, "streams", None)
+    if streams is None:
+        streams = _quant_stream_tls.streams = {}
+    stream = streams.get(device)
+    if stream is None:
+        stream = torch.cuda.Stream(device = device)
+        streams[device] = stream
+    return stream
 
 
 pinned_tiles: torch.Tensor | None = None
@@ -366,9 +464,12 @@ def ldlq(
     """
 
     devices = quant_args["devices"]
-    for device in devices:
-        torch.cuda.synchronize(device)
     main_stream = get_quant_stream(devices[0])
+    # Hand the caller's stream ordering over to the per-thread quant stream
+    # instead of draining the whole device: other modules are quantized
+    # concurrently on their own streams and a device sync would convoy them.
+    outer_stream = torch.cuda.current_stream(devices[0])
+    main_stream.wait_stream(outer_stream)
     with torch.cuda.stream(main_stream):
 
         devices = quant_args["devices"]
@@ -388,10 +489,16 @@ def ldlq(
 
         p_row = 0
 
-        # Work buffers
+        # Work buffers. ``prod_cache`` is accumulated into with ``beta = 1.0``
+        # from a zero starting point, so it has to be zero-filled. ``weight_q``
+        # and ``encoded`` are write-only scratch: the span loop covers every row
+        # exactly once and the inner loop covers every row block of the span, so
+        # every element is written before the only reads (``b_weight_q[bj:]``,
+        # which looks at rows already quantized in this span) or before the
+        # values leave the function.
         prod_cache = torch.zeros((size_k, size_n), dtype = torch.float, device = device)
-        weight_q = torch.zeros((size_k, size_n), dtype = torch.float, device = buffer_device)
-        encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = buffer_device)
+        weight_q = torch.empty((size_k, size_n), dtype = torch.float, device = buffer_device)
+        encoded = torch.empty((tiles_k, tiles_n, 256), dtype = torch.short, device = buffer_device)
 
         for j in range(size_k, 0, -buf_size_k):
             i = j - buf_size_k
@@ -399,9 +506,9 @@ def ldlq(
             # Current span is rows i:j
             b_weight = weight[i:j].to(device)
             b_weight_q = weight_q[i:j] if device == buffer_device else \
-                torch.zeros_like(weight_q[i:j], device = device)
+                torch.empty_like(weight_q[i:j], device = device)
             b_encoded = encoded[i // 16 : j // 16] if device == buffer_device else \
-                torch.zeros_like(encoded[i // 16 : j // 16], device = device)
+                torch.empty_like(encoded[i // 16 : j // 16], device = device)
             b_prod_cache = prod_cache[i:j]
             b_L = L[i:j]
 
@@ -420,19 +527,16 @@ def ldlq(
                 compensation_term.addmm_(bb_L.T, bb_err,  alpha = 1.0, beta = 1.0)
                 rows = b_weight[bi:bj] + compensation_term
 
-                tiles = rows.reshape(16, tiles_n, 16).permute(1, 0, 2).reshape(tiles_n, 256)
-
                 # Pre-permute to tensor core layout
-                tiles = tiles[:, tensor_core_perm(device)]
+                tiles = tile_core_permute(rows, tiles_n)
 
                 # Quantize
                 quant_w, quant_i = quantize_tiles_multigpu(tiles, quant_args)
 
                 # Undo permutation on reconstructed tiles, but keep indices in tensor core layout
-                quant_w = quant_w[:, tensor_core_perm_i(device)]
+                quant_w = tile_core_permute_i(quant_w, tiles_n, size_n)
 
                 # Store result
-                quant_w = quant_w.reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, size_n)
                 b_weight_q[bi:bj] = quant_w
                 b_encoded[bi // 16 : bj // 16] = quant_i.unsqueeze(0)
 
@@ -450,9 +554,7 @@ def ldlq(
             b_err = b_weight - b_weight_q
             prod_cache.addmm_(b_L.T, b_err, alpha = 1.0, beta = 1.0)
 
-        for device in devices:
-            torch.cuda.synchronize(device)
-
+    outer_stream.wait_stream(main_stream)
     return weight_q, encoded
 
 
@@ -487,9 +589,9 @@ def fallback_quant(
     """
 
     devices = quant_args["devices"]
-    for device in devices:
-        torch.cuda.synchronize(device)
     main_stream = get_quant_stream(devices[0])
+    outer_stream = torch.cuda.current_stream(devices[0])
+    main_stream.wait_stream(outer_stream)
     with torch.cuda.stream(main_stream):
 
         devices = quant_args["devices"]
@@ -529,19 +631,17 @@ def fallback_quant(
 
                 # Input tiles for quantization
                 rows = b_weight[bi:bj]
-                tiles = rows.reshape(16, tiles_n, 16).permute(1, 0, 2).reshape(tiles_n, 256)
 
                 # Pre-permute to tensor core layout
-                tiles = tiles[:, tensor_core_perm(device)]
+                tiles = tile_core_permute(rows, tiles_n)
 
                 # Quantize
                 quant_w, quant_i = quantize_tiles_multigpu(tiles, quant_args)
 
                 # Undo permutation on reconstructed tiles, but keep indices in tensor core layout
-                quant_w = quant_w[:, tensor_core_perm_i(device)]
+                quant_w = tile_core_permute_i(quant_w, tiles_n, size_n)
 
                 # Store result
-                quant_w = quant_w.reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, size_n)
                 b_weight_q[bi:bj] = quant_w
                 b_encoded[bi // 16 : bj // 16] = quant_i.unsqueeze(0)
 
@@ -555,9 +655,7 @@ def fallback_quant(
                 weight_q[i:j] = b_weight_q.to(buffer_device)
                 encoded[i // 16 : j // 16] = b_encoded.to(buffer_device)
 
-        for device in devices:
-            torch.cuda.synchronize(device)
-
+    outer_stream.wait_stream(main_stream)
     return weight_q, encoded
 
 
@@ -693,9 +791,8 @@ def finalize_capture_H(
         # Preserve the original-channel diagonal used by the weight
         # regularizer. The same sigma term is applied to the Hessian in FP64
         # immediately before the signed-Hadamard congruence below.
-        idx = torch.arange(H.shape[0])
         regularization = quant_args.get("sigma_reg", 0.025) * diag_mean
-        diag = H[idx, idx].clone() + regularization
+        diag = H.diagonal().clone() + regularization
 
         if verbose:
             print(f"     - H min/max: {H.min().item():.6f}   {H.max().item():.6f}")
@@ -727,14 +824,13 @@ def finalize_capture_H(
             L = None
         else:
             L, H = block_ldl(H, 16, verbose)
-            dr = torch.arange(k)
-            L[dr, dr] = 0
+            L.diagonal().zero_()
 
         H_data["L"] = L
 
         # H is no longer needed except to compute proxy error so move to CPU
         H = H.cpu()
-        H_data["H"] = H.cpu()
+        H_data["H"] = H
 
         H_data["finalized"] = True
         H_data["diag"] = diag
@@ -748,7 +844,10 @@ def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
     assert len(shape) == 3 and shape[2] == 256
     assert encoded.dtype == torch.int16
     packed_shape = (shape[0], shape[1], 256 * K // 16)
-    packed = torch.zeros(packed_shape, dtype = torch.int16, device = encoded.device)
+    # ``pack_trellis_kernel`` writes the whole tile: thread ``t < packed_size / 2``
+    # stores one ``uint32`` each, which covers all ``packed_size`` entries, so the
+    # zero fill only costs a memset of the packed tensor.
+    packed = torch.empty(packed_shape, dtype = torch.int16, device = encoded.device)
     ext.pack_trellis(packed, encoded.contiguous(), K)
     # unpacked = torch.zeros_like(encoded)
     # ext.unpack_trellis(unpacked, packed, K)
@@ -812,6 +911,37 @@ def pack_signs(signs: torch.Tensor, quant_args: dict) -> torch.Tensor:
     return packed
 
 
+def _sample_gss_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
+    """Gather the wrapped-diagonal 16x16 tile sample used by the global scale search.
+
+    This mirrors the original per-tile ``clone().view(256)[perm]`` loop exactly
+    (bit-identical ordering and values) but builds the tile set with a handful of
+    vectorized gathers instead of a Python double loop launching one small kernel
+    per tile. On large projection shapes this removes hundreds of tiny launches
+    per layer, which dominates the global-scale search on otherwise fast devices.
+    """
+    rows = weight_r.shape[0]
+    cols = weight_r.shape[1]
+    tiles_k = rows // 16
+    tiles_n = cols // 16
+    count = max(tiles_k, tiles_n)
+
+    index = torch.arange(count, device = weight_r.device)
+    k_base = (index % tiles_k) * 16
+    w_offsets = torch.arange(width, device = weight_r.device).unsqueeze(0) + index.unsqueeze(1)
+    n_base = (w_offsets % tiles_n) * 16
+
+    row_offsets = torch.arange(16, device = weight_r.device)
+    col_offsets = torch.arange(16, device = weight_r.device)
+    flat = (
+        (k_base[:, None, None, None] + row_offsets[None, None, :, None]) * cols
+        + (n_base[:, :, None, None] + col_offsets[None, None, None, :])
+    )
+    flat = flat.reshape(count, width, 256)
+    flat = flat[..., tensor_core_perm(weight_r.device)]
+    return weight_r.reshape(-1)[flat].reshape(count * width, 256)
+
+
 def g_scale_gss(
     weight_r: torch.Tensor,
     verbose: bool,
@@ -822,24 +952,12 @@ def g_scale_gss(
     # Select a sample of tiles along a wrapped diagonal (sampling from every row and column of tiles, hopefully
     # representative) and search for the global scale within given range that minimizes the direct quantization
     # error
-    tiles = []
-    tiles_k = weight_r.shape[0] // 16
-    tiles_n = weight_r.shape[1] // 16
-    for i in range(max(tiles_k, tiles_n)):
-        for w in range(width):
-            k = (i % tiles_k) * 16
-            n = ((i + w) % tiles_n) * 16
-            tile = weight_r[k : k + 16, n : n + 16].clone()
-            tile = tile.view(256)
-            tile = tile[tensor_core_perm(weight_r.device)]
-            tiles.append(tile)
-    tiles = torch.stack(tiles)
+    tiles = _sample_gss_tiles(weight_r, width)
 
     devices = quant_args["devices"]
-    for device in devices:
-        torch.cuda.synchronize(device)
-
     main_stream = get_quant_stream(devices[0])
+    outer_stream = torch.cuda.current_stream(devices[0])
+    main_stream.wait_stream(outer_stream)
     # TODO: Figure out why Torch always initializes cuda:0 when exiting this CM, even when it's not used
     with torch.cuda.stream(main_stream):
 
@@ -883,10 +1001,7 @@ def g_scale_gss(
         if verbose:
             print(f"     - gss: min = {best_scale:.6f}, mse: {(f1 + f2) / 2:.6f}")
 
-    devices = quant_args["devices"]
-    for device in devices:
-        torch.cuda.synchronize(device)
-
+    outer_stream.wait_stream(main_stream)
     return best_scale, (f1 + f2) / 2
 
 
@@ -1027,6 +1142,26 @@ def reconstruction_error_metrics(
     }
 
 
+def block_trace(A: torch.Tensor, B: torch.Tensor, block_size: int = 1024):
+    # Compute trace(A @ B) by streaming 1024-column blocks of B.
+    #
+    # The partials used to be read back one at a time and accumulated in a
+    # Python float, synchronizing the device after every block. Widening each
+    # float32 partial to float64 and accumulating on the device performs the
+    # exact same ordered IEEE-754 double additions, so the result is unchanged
+    # while only one device-to-host read is needed by the caller.
+    total = None
+    for j_start in range(0, B.shape[1], block_size):
+        j_end = min(j_start + block_size, B.shape[1])
+        B_block = B[:, j_start:j_end]
+        A_j_block = A[j_start:j_end, :]
+        partial = torch.einsum("ik,ij,jk->", A, B_block, A_j_block).double()
+        total = partial if total is None else total + partial
+    if total is None:
+        return torch.zeros((), dtype=torch.float64, device=A.device)
+    return total
+
+
 def regularize(
     weight: torch.Tensor,
     su: torch.Tensor,
@@ -1138,7 +1273,21 @@ def quantize_exl3(
     swap_to_device: torch.device | None = None,
     save_reg: str = None
 ):
-    """
+    """Quantize one weight matrix against a captured Hessian.
+
+    The whole body runs on this worker thread's quantization stream instead of
+    the ambient (device-shared) stream. ``ldlq``, ``fallback_quant`` and
+    ``g_scale_gss`` each bracket their work with
+    ``stream.wait_stream(current)`` / ``current.wait_stream(stream)`` pairs, and
+    when ``current`` is the shared default stream those brackets chain every
+    worker's tile launches behind every other worker's through the wait events
+    they leave on it. That serialized the tile chains (one launch in flight at a
+    time, measured 1.19x overlap across four workers) even though the kernel is
+    latency-bound and a single 56-block launch fills under a quarter of the
+    device. Hoisting the bracket to this boundary keeps the same ordering
+    guarantees against the caller, while the nested pairs become waits on their
+    own stream, i.e. no-ops.
+
     :param weight:
         Input tensor, row major shape (in_features, out_features)
 
@@ -1173,6 +1322,38 @@ def quantize_exl3(
           - proxy error: trace(err @ H @ err.T) / (W @ H @ W.T)
           - quantized and packed tensors
     """
+
+    device = torch.device(quant_args["devices"][0])
+    quant_stream = get_quant_stream(device)
+    outer_stream = torch.cuda.current_stream(device)
+    quant_stream.wait_stream(outer_stream)
+    with torch.cuda.stream(quant_stream):
+        try:
+            return _quantize_exl3_body(
+                weight,
+                H_data,
+                quant_args,
+                return_weight_q,
+                progress_str=progress_str,
+                verbose=verbose,
+                swap_to_device=swap_to_device,
+                save_reg=save_reg,
+            )
+        finally:
+            outer_stream.wait_stream(quant_stream)
+
+
+def _quantize_exl3_body(
+    weight: torch.Tensor,
+    H_data: dict,
+    quant_args: dict,
+    return_weight_q: bool,
+    progress_str: str | None = None,
+    verbose: bool = False,
+    swap_to_device: torch.device | None = None,
+    save_reg: str | None = None
+):
+    """Runs the EXL3 quantization body; see :func:`quantize_exl3`."""
 
     progress_text = None if not progress_str else progress_str.replace("<step>", "Preparing")
     with (ProgressBar(progress_text, 100) as pb):
@@ -1223,9 +1404,14 @@ def quantize_exl3(
             .unsqueeze(0)
         )
 
-        # Move stored L to CPU (if not already), move working L to device
+        # ``finalize_capture_H`` returns the very tensor it cached in ``H_data``, so the
+        # working copy below aliases the caller's stored reference. Replacing the cached
+        # entry (rather than only rebinding the local) is what lets ``del L`` further
+        # down release the device buffer. A single-use dict never reads the cache again,
+        # so drop the reference instead of duplicating ``L`` onto the host; reusable
+        # dicts keep a host copy so they stay cheap to re-quantize.
         if H_data["L"] is not None:
-            H_data["L"] = H_data["L"].cpu()
+            H_data["L"] = None if H_data.get("single_use") else H_data["L"].cpu()
         if L is not None:
             L = L.to(device)
 
@@ -1290,23 +1476,17 @@ def quantize_exl3(
             W = weight_r
             Hd = None
             try:
-                def block_trace(A, B, block_size = 1024):
-                    total = 0.0
-                    for j_start in range(0, B.shape[1], block_size):
-                        j_end = min(j_start + block_size, B.shape[1])
-                        B_block = B[:, j_start:j_end]
-                        A_j_block = A[j_start:j_end, :]
-                        partial = torch.einsum("ik,ij,jk->", A, B_block, A_j_block)
-                        total += partial.item()
-                    return total
                 Hd = H.to(device)
                 E_device = E.to(device)
-                hessian_num = block_trace(E_device, Hd)
+                num = block_trace(E_device, Hd)
+                E_device = None
                 W_device = W.to(device)
-                hessian_den = block_trace(W_device, Hd)
+                den = block_trace(W_device, Hd)
+                W_device = None
+                hessian_num = num.item()
+                hessian_den = den.item()
                 hessian_ratio = hessian_num / max(hessian_den, 1e-8)
                 proxy_err = hessian_ratio
-                del E_device, W_device
             except torch.OutOfMemoryError:
                 hessian_status = "out_of_memory"
                 proxy_err = -1.0

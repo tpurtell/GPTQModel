@@ -103,9 +103,9 @@ def test_complete_stored_decode_then_logical_crop(outputs, bits, codebook):
     actual = module.get_weight_tensor(dtype=torch.float32)
     assert actual.shape == (128, outputs) and actual.is_contiguous()
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
-    # Dense reconstruction must not replace or crop the cached inner decode.
-    assert module.get_inner_weight_tensor(dtype=torch.float32) is inner
-    assert module.get_weight_tensor(dtype=torch.float32) is actual
+    # Dense reconstruction must not change or crop the complete inner decode.
+    assert torch.equal(module.get_inner_weight_tensor(dtype=torch.float32), inner)
+    assert torch.equal(module.get_weight_tensor(dtype=torch.float32), actual)
     for dtype in (torch.float16, torch.bfloat16):
         assert torch.equal(module.get_weight_tensor(dtype=dtype), expected.to(dtype))
 

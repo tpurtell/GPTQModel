@@ -47,6 +47,7 @@ from .input_cache import TensorLifetimeDiagnostic
 from .extension import LoopStep
 from .stage_subset import SubsetPlan, build_layer_subset_plans, run_subset_stage
 
+
 if TYPE_CHECKING:  # pragma: no cover - type hints only
     from .module_looper import ModuleLooper
 
@@ -796,8 +797,8 @@ def run_layer_stage(
 
         for p_index, processor in enumerate(looper.processors):
             if looper.gptq_model.quantize_config.activation_mode in {"w4afp8", "w4a_nvfp4"}:
-                from .native_processor import NativeProcessor
                 from ..nn_modules.qlinear.w4a_llama_replay import set_w4a_replay_enabled
+                from .native_processor import NativeProcessor
 
                 set_w4a_replay_enabled(module, not isinstance(processor, NativeProcessor))
             # Each processor contributes a quantization phase; walk them in
@@ -853,7 +854,7 @@ def run_layer_stage(
             # iterate plans instead of repeatedly re-deriving replay, batching,
             # and device-routing state inside the execution loop.
             if embed_quant_mode is not None and embed_only is not False and not is_embeddings_module:
-                # Embedding-only operations replay loaded decoder blocks only
+                # Module-replacement operations replay loaded decoder blocks only
                 # to propagate calibration activations to the output endpoint.
                 subset_plans = []
             else:

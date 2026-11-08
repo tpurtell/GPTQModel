@@ -10,7 +10,7 @@ from gptqmodel.nn_modules.qlinear.w4a_triton import _token_fp8_quant
 from gptqmodel.quantization.activation_floatx import fp8_token_qdq
 from gptqmodel.quantization.config import QuantizeConfig
 from gptqmodel.utils.backend import BACKEND, backend_for_activation
-from tests.w4a_hardware_marks import FP8_HARDWARE
+from tests.w4a_hardware_marks import FP8_HARDWARE, GLUON_FP8
 
 
 def _assert_native_gemm_close(actual, expected, magnitude):
@@ -83,15 +83,22 @@ def test_activation_policy_round_trip(tmp_path):
         )
 
 
-def test_exact_fp8_weight_cache_and_native_checkpoint():
+@GLUON_FP8
+@FP8_HARDWARE
+def test_exact_fp8_weight_operand_and_native_checkpoint():
     module = _packed_linear()
     expected = (torch.arange(128, dtype=torch.float32).remainder(16) - 8)
-    torch.testing.assert_close(module._weight_e4m3.float()[:, 0], expected, rtol=0, atol=0)
+    # No full-layer E4M3 plane is retained: the operand is built per forward.
+    assert not hasattr(module, "_weight_e4m3")
+    operand = module.fp8_weight_operand()
+    torch.testing.assert_close(operand.float()[:, 0], expected, rtol=0, atol=0)
     assert set(module.state_dict()) == {"qweight", "qzeros", "scales", "g_idx"}
     assert module.qweight.dtype == torch.int32
-    original = module._weight_e4m3.clone()
+    # Re-staging is deterministic and leaves no cache behind.
     module.post_init()
-    torch.testing.assert_close(module._weight_e4m3.float(), original.float(), rtol=0, atol=0)
+    restaged = module.fp8_weight_operand()
+    assert torch.equal(restaged.view(torch.uint8), operand.view(torch.uint8))
+    assert not hasattr(module, "_weight_e4m3")
 
 
 def test_replay_quantizes_only_selected_linear_input():
@@ -102,6 +109,7 @@ def test_replay_quantizes_only_selected_linear_input():
     torch.testing.assert_close(linear(x), expected)
 
 
+@GLUON_FP8
 @FP8_HARDWARE
 def test_token_fp8_codes_match_independent_torch_oracle():
     x = torch.randn((3, 128), device="cuda", dtype=torch.bfloat16)
@@ -119,6 +127,7 @@ def test_token_fp8_codes_match_independent_torch_oracle():
     assert torch.equal(codes.view(torch.uint8), reference_codes.view(torch.uint8))
 
 
+@GLUON_FP8
 @FP8_HARDWARE
 @pytest.mark.parametrize("rows", [1, 16, 33])
 def test_gb10_native_fp8_group_gemm(rows):
@@ -144,6 +153,7 @@ def test_gb10_native_fp8_group_gemm(rows):
     _assert_native_gemm_close(y, reference, magnitude)
 
 
+@GLUON_FP8
 @FP8_HARDWARE
 def test_gb10_fp8_random_columns_and_partial_tile():
     generator = torch.Generator(device="cuda").manual_seed(2029)
@@ -178,6 +188,7 @@ def _round_toward_zero_to_fp16(value: torch.Tensor) -> torch.Tensor:
     return (value.view(torch.int32) & ~0x1FFF).view(torch.float32)
 
 
+@GLUON_FP8
 @FP8_HARDWARE
 def test_token_fp8_rounding_holds_at_e4m3_midpoint_neighbours():
     """Values just above an E4M3 midpoint must round like the Torch oracle.

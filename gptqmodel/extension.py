@@ -51,6 +51,15 @@ _EXTENSION_SPECS = (
         resolve=lambda: _resolve_extension_factory("gptqmodel.utils.cpp", "_floatx_cpu_extension"),
     ),
     _ExtensionSpec(
+        name="int4_qzero_group_scaled_cpu",
+        aliases=(),
+        resolve=lambda: _resolve_extension_factory(
+            "gptqmodel.utils.cpp", "_int4_qzero_group_scaled_cpu_extension"
+        ),
+        supported=lambda: _resolve_attr("gptqmodel.utils.cpu_features", "has_avx512_bf16")(),
+        unsupported_error=lambda: _resolve_attr("gptqmodel.utils.cpu_features", "avx512_bf16_error")(),
+    ),
+    _ExtensionSpec(
         name="awq",
         aliases=(),
         resolve=lambda: _resolve_extension_attr("gptqmodel.utils.awq", "_AWQ_TORCH_OPS_EXTENSION"),
@@ -61,14 +70,25 @@ _EXTENSION_SPECS = (
         resolve=lambda: _resolve_extension_attr("gptqmodel.utils.qqq", "_QQQ_TORCH_OPS_EXTENSION"),
     ),
     _ExtensionSpec(
+        name="vptq",
+        aliases=("vptq_cuda",),
+        resolve=lambda: _resolve_extension_attr("gptqmodel.utils.vptq_cuda", "_VPTQ_TORCH_OPS_EXTENSION"),
+        supported=lambda: _resolve_attr("gptqmodel.utils.vptq_cuda", "_validate_vptq_build_support")(),
+        unsupported_error=lambda: _resolve_attr("gptqmodel.utils.vptq_cuda", "vptq_cuda_build_error")(),
+    ),
+    _ExtensionSpec(
         name="exllamav2",
         aliases=("exllama2", "exllama_v2", "exllamav2_gptq"),
         resolve=lambda: _resolve_extension_attr("gptqmodel.utils.exllamav2", "_EXLLAMAV2_GPTQ_TORCH_OPS_EXTENSION"),
+        supported=lambda: _resolve_attr("gptqmodel.utils.exllamav2", "exllamav2_gptq_supported")(),
+        unsupported_error=lambda: _resolve_attr("gptqmodel.utils.exllamav2", "exllamav2_gptq_runtime_error")(),
     ),
     _ExtensionSpec(
         name="exllamav2_awq",
         aliases=("exllama2_awq", "exllama_v2_awq"),
         resolve=lambda: _resolve_extension_attr("gptqmodel.utils.exllamav2", "_EXLLAMAV2_AWQ_TORCH_OPS_EXTENSION"),
+        supported=lambda: _resolve_attr("gptqmodel.utils.exllamav2", "exllamav2_awq_supported")(),
+        unsupported_error=lambda: _resolve_attr("gptqmodel.utils.exllamav2", "exllamav2_awq_runtime_error")(),
     ),
     _ExtensionSpec(
         name="exllamav3",

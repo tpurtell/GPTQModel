@@ -24,13 +24,14 @@ from ..models.writer import (
     QUANT_LOG_LOSS,
     QUANT_LOG_NSAMPLES,
 )
-from ..nn_modules.qlinear.qqq import QQQLinear, QQQTorchLinear
-from ..quantization.config import METHOD, QuantizeConfig, resolve_quant_format
+from ..nn_modules.qlinear.qqq import QQQ_ROCM_UNSUPPORTED, QQQLinear, QQQTorchLinear
+from ..quantization.config import METHOD, QuantizeConfig, _normalize_mse, resolve_quant_format
 from ..quantization.qqq import QQQ
 from ..utils.backend import BACKEND
 from ..utils.fallback import normalize_fallback
 from ..utils.logger import log_time_block, setup_logger
 from ..utils.model import create_quant_module, move_to, pack_module
+from ..utils.rocm import IS_ROCM
 from ..utils.torch import CPU
 
 
@@ -51,6 +52,7 @@ class QQQProcessor(LoopProcessor):
         require_fwd: bool = True,
         calculate_w_wq_diff: bool = False,
         calibration_concat_separator: Optional[str] = None,
+        backend: Optional[BACKEND] = BACKEND.AUTO,
     ):
         """Initializes QQQ processing and optional weight-delta tracking."""
 
@@ -68,16 +70,33 @@ class QQQProcessor(LoopProcessor):
 
         self.calculate_w_wq_diff = calculate_w_wq_diff
         self.avg_losses = []
+        from ..utils.backend import normalize_backend
+
+        self.requested_backend = normalize_backend(backend, quant_method=self.qcfg.method)
+        if self.requested_backend not in (None, BACKEND.AUTO, BACKEND.QQQ, BACKEND.QQQ_TORCH):
+            raise ValueError("QQQ quantization requires QQQ or QQQ_TORCH backend")
 
     def _quant_linear_kernel(self):
-        if sys.platform == "darwin":
+        if self.requested_backend == BACKEND.QQQ_TORCH or sys.platform == "darwin":
+            return QQQTorchLinear, BACKEND.QQQ_TORCH
+        # QQQ's Marlin-derived W4A8 kernel is CUDA-only in practice; its JIT
+        # extension uses CUDA inline PTX that hipcc cannot compile for gfx120*.
+        # An explicit BACKEND.QQQ request on ROCm is a user error, so report it
+        # here rather than failing later inside the pack/forward path.
+        if IS_ROCM:
+            if self.requested_backend == BACKEND.QQQ:
+                raise NotImplementedError(QQQ_ROCM_UNSUPPORTED)
             return QQQTorchLinear, BACKEND.QQQ_TORCH
         device = self.qcfg.device
         if isinstance(device, DEVICE):
-            return (QQQTorchLinear, BACKEND.QQQ_TORCH) if device == DEVICE.NPU else (QQQLinear, BACKEND.QQQ)
+            if device in (DEVICE.CPU, DEVICE.NPU):
+                return QQQTorchLinear, BACKEND.QQQ_TORCH
+            return QQQLinear, BACKEND.QQQ
         if isinstance(device, torch.device):
-            return (QQQTorchLinear, BACKEND.QQQ_TORCH) if device.type == "npu" else (QQQLinear, BACKEND.QQQ)
-        if isinstance(device, str) and device.split(":")[0].lower() == "npu":
+            if device.type in ("cpu", "npu"):
+                return QQQTorchLinear, BACKEND.QQQ_TORCH
+            return QQQLinear, BACKEND.QQQ
+        if isinstance(device, str) and device.split(":")[0].lower() in ("cpu", "npu"):
             return QQQTorchLinear, BACKEND.QQQ_TORCH
         return QQQLinear, BACKEND.QQQ
 
@@ -89,8 +108,11 @@ class QQQProcessor(LoopProcessor):
     def preprocess(self, module: NamedModule, fallback=None, **kwargs):
         """Builds the per-module QQQ task after applying dynamic overrides."""
 
-        # entire module is skipped
-        if self.qcfg.dynamic_get(layer_name=module.full_name) == False:
+        # Skip only modules explicitly excluded by a `dynamic` rule. `dynamic_get`
+        # returns None when no rule matches (the common case, including
+        # `dynamic=None`), so a truthiness test here silently skipped every
+        # module and quantized nothing.
+        if self.qcfg.dynamic_get(layer_name=module.full_name) is False:
             return
 
         qcfg_clone = copy.deepcopy(self.qcfg)
@@ -99,7 +121,9 @@ class QQQProcessor(LoopProcessor):
         if self.qcfg.dynamic is not None:
             qcfg_clone.bits = self.qcfg.dynamic_get(module.full_name, "bits", qcfg_clone.bits)
             qcfg_clone.sym = self.qcfg.dynamic_get(module.full_name, "sym", qcfg_clone.sym)
-            qcfg_clone.mse = self.qcfg.dynamic_get(module.full_name, "mse", qcfg_clone.mse)
+            qcfg_clone.mse = _normalize_mse(
+                self.qcfg.dynamic_get(module.full_name, "mse", None), base=qcfg_clone.mse,
+            )
 
             qcfg_clone.group_size = self.qcfg.dynamic_get(module.full_name, "group_size", qcfg_clone.group_size)
             desc_act_override = self.qcfg.dynamic_get(module.full_name, "desc_act", None)
@@ -118,9 +142,9 @@ class QQQProcessor(LoopProcessor):
         tmp.fallback = normalize_fallback(fallback, qcfg_clone.fallback)
         tmp.expected_nsamples = getattr(self, "total_calibration_tokens", None)
 
-        if self.qcfg.mse > 0.0:
+        if self.qcfg.mse.norm > 0.0:
             mse = True
-            norm = self.qcfg.mse
+            norm = self.qcfg.mse.norm
         else:
             mse = False
             norm = 100
@@ -140,7 +164,7 @@ class QQQProcessor(LoopProcessor):
 
         # gptq has no dynamic method of full override (removal)
         t = self.tasks.get(module.name, False)
-        if t == False:
+        if not t:
             return True
         else:
             return False
@@ -176,6 +200,8 @@ class QQQProcessor(LoopProcessor):
         q = qqq[module.name]
         try:
             wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp_percent, q_scales_extra, nsamples = q.quantize()
+            if getattr(q, "gsq_diagnostics", None) is not None:
+                module.state["gsq_diagnostics"] = q.gsq_diagnostics
         finally:
             q.free()
 
@@ -333,6 +359,7 @@ class QQQProcessor(LoopProcessor):
                 lock=self.lock,
                 q_scales_extra=q_scales_extra,
                 quantize_config=self.qcfg,
+                device=module.state.get("quant_device"),
             )
 
         # TODO: store module quant results in module, not global processor result

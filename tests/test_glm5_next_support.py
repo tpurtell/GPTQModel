@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from defuser.model_registry import MODEL_CONFIG
 from torch import nn
 
 from gptqmodel.models.definitions.glm5_next import (
@@ -13,6 +14,11 @@ from gptqmodel.models.definitions.glm5_next import (
     Glm5NextQModel,
     _prune_glm5_next_replay_frontier,
 )
+from gptqmodel.models import auto
+from gptqmodel.models.loader import _convert_model_with_defuser
+from gptqmodel.models.moe_lifecycle import GateUpDownMoELifecycleHooks
+from gptqmodel.utils.model import find_modules
+from gptqmodel.utils.structure import LazyTurtle
 
 
 def test_routed_expert_pattern_includes_target_and_checkpoint_mtp_only():

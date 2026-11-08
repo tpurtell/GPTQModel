@@ -13,8 +13,8 @@ import gptqmodel.nn_modules.qlinear.marlin as marlin_qlinear_module
 import gptqmodel.nn_modules.qlinear.marlin_awq as marlin_awq_qlinear_module
 import gptqmodel.utils.marlin as marlin_utils
 from gptqmodel import extension as extension_api
-from gptqmodel.utils.backend import BACKEND
 from gptqmodel.utils import cpp as cpp_module
+from gptqmodel.utils.backend import BACKEND
 from gptqmodel.utils.marlin_scalar_type import scalar_types
 
 
@@ -341,11 +341,11 @@ def test_marlin_auto_selection_keeps_tile_padding_opt_in(monkeypatch):
         "dtype": torch.float16,
     }
 
-    with pytest.raises(NotImplementedError, match="request GPTQ_MARLIN explicitly"):
+    with pytest.raises(NotImplementedError, match="request BACKEND.MARLIN explicitly"):
         marlin_qlinear_module.MarlinLinear(**kwargs, backend=BACKEND.AUTO)
 
     explicit = marlin_qlinear_module.MarlinLinear(
-        **kwargs, backend=BACKEND.GPTQ_MARLIN
+        **kwargs, backend=BACKEND.MARLIN
     )
     assert explicit.in_features == 288
     assert explicit.out_features == 200
@@ -450,13 +450,13 @@ def test_awq_marlin_auto_selection_keeps_tile_padding_opt_in(monkeypatch):
         "dtype": torch.float16,
     }
 
-    with pytest.raises(NotImplementedError, match="request AWQ_MARLIN explicitly"):
+    with pytest.raises(NotImplementedError, match="request BACKEND.MARLIN explicitly"):
         marlin_awq_qlinear_module.AwqMarlinLinear(
             **kwargs, backend=BACKEND.AUTO
         )
 
     explicit = marlin_awq_qlinear_module.AwqMarlinLinear(
-        **kwargs, backend=BACKEND.AWQ_MARLIN
+        **kwargs, backend=BACKEND.MARLIN
     )
     assert explicit.in_features == 288
     assert explicit.out_features == 200
@@ -1361,6 +1361,7 @@ def test_marlin_include_paths_use_wheel_headers_when_local_cuda_is_incomplete(mo
     for header_name in marlin_utils._MARLIN_REQUIRED_CUDA_HEADERS:
         (wheel_cuda_include / header_name).write_text("// stub", encoding="utf-8")
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     monkeypatch.setattr(marlin_utils, "_marlin_root", lambda: root)
     monkeypatch.setattr(cpp_module, "detected_local_cuda_include_paths", lambda: [str(local_cuda_include)])
     monkeypatch.setattr(cpp_module, "detected_cuda_wheel_include_paths", lambda: [str(wheel_cuda_include)])

@@ -160,6 +160,31 @@ DEFAULT_FLOOR_PCT = 0.05
 DEFAULT_CEIL_PCT = 0.10
 DEFAULT_TASK_NAMES = ("arc_challenge",)
 
+# Non-metric metadata keys that may appear alongside metric baselines in an
+# eval-task config. They are consumed by `get_eval_tasks()` for the evalution
+# harness and must never be treated as numeric metric baselines.
+EVAL_TASK_METADATA_KEYS = frozenset(
+    {
+        "chat_template",
+        "evalution_suite_kwargs",
+        "evalution_model_args",
+        "evalution_use_model_path",
+        "evalution_batch_size",
+    }
+)
+
+
+def is_eval_task_metadata_key(metric_name) -> bool:
+    """Return True when `metric_name` is eval-task metadata, not a metric baseline.
+
+    `get_eval_tasks()` pops these keys before normalizing baselines, so any code
+    that walks raw task configs (for example `derive_fast_eval_tasks`) must skip
+    them too. The `evalution_` prefix check keeps future metadata keys, which are
+    frequently non-numeric sentinels such as `"auto"`, from being coerced with
+    `float()`.
+    """
+    return metric_name in EVAL_TASK_METADATA_KEYS or str(metric_name).startswith("evalution_")
+
 
 class ModelTest(unittest.TestCase):
     DEBUG = True # enable extra debug output
@@ -277,7 +302,7 @@ class ModelTest(unittest.TestCase):
             if not isinstance(metrics, dict):
                 continue
             for metric_name, spec in list(metrics.items()):
-                if metric_name == "chat_template":
+                if is_eval_task_metadata_key(metric_name):
                     continue
                 if isinstance(spec, dict):
                     current_ceil = spec.get("ceil_pct", spec.get("max_delta_ceil_percent", DEFAULT_CEIL_PCT))
@@ -1352,30 +1377,45 @@ class ModelTest(unittest.TestCase):
             if hf_load_dataset is not None:
                 dataset = hf_load_dataset("parquet", data_files=calibration_file, split="train")
             else:
-                dataset = cls._load_calibration_parquet()
+                dataset = cls._load_calibration_parquet(rows=rows)
             return dataset.select(range(min(rows, len(dataset)))) if rows > 0 else dataset
+
+        # Small local calibration slices should not build the entire HF dataset.
+        if rows > 0 and Path("/monster/data/model/dataset/nm-calibration/llm.parquet").exists():
+            return cls._load_calibration_parquet(rows=rows)
         if hf_load_dataset is None:
             log.warning("datasets.load_dataset unavailable; falling back to local parquet: %s", DATASETS_IMPORT_ERROR)
-            dataset = cls._load_calibration_parquet()
+            dataset = cls._load_calibration_parquet(rows=rows)
         else:
             try:
                 dataset = hf_load_dataset(path="/monster/data/model/dataset/nm-calibration", name="LLM", split="train")
             except Exception as exc:  # pragma: no cover - exercised in fallbacks
                 log.warning("load_dataset failed; falling back to local parquet: %s", exc)
-                dataset = cls._load_calibration_parquet()
+                dataset = cls._load_calibration_parquet(rows=rows)
 
         if rows > 0:
             return dataset.select(range(min(rows, len(dataset))))
         return dataset
 
     @staticmethod
-    def _load_calibration_parquet():
+    def _load_calibration_parquet(rows: int = 0):
         parquet_path = Path(os.environ.get(
             "GPTQMODEL_CALIBRATION_PARQUET",
             "/monster/data/model/dataset/nm-calibration/llm.parquet",
         )).expanduser()
         if not parquet_path.exists():
             raise FileNotFoundError(f"Calibration parquet not found at {parquet_path}")
+
+        if rows > 0:
+            try:
+                import pyarrow.parquet as pq
+            except ImportError:
+                pass
+            else:
+                parquet = pq.ParquetFile(parquet_path)
+                first_batch = next(parquet.iter_batches(batch_size=rows), None)
+                records = [] if first_batch is None else first_batch.to_pylist()
+                return ModelTest._LocalCalibrationDataset(records)
 
         try:
             import pandas as pd

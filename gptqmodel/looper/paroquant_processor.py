@@ -56,6 +56,8 @@ from ..quantization.mlx_paroquant_optimize import (
 )
 from ..quantization.paroquant.optimization import (
     _activate_stage_params,
+    _backward_scalar_loss,
+    _fold_epoch_loss,
     _normalize_group_size,
     _normalize_opt_impl,
     _normalize_opt_optimizer,
@@ -549,6 +551,7 @@ class ParoQuantProcessor(LoopProcessor):
                 fused_rotation=self.qcfg.opt_fused_rotation,
                 gradient_checkpointing=bool(getattr(self.qcfg, "opt_gradient_checkpointing", False)),
                 stage_cudagraph=self._module_scope_stage_cudagraph_enabled(),
+                use_amp=getattr(self.qcfg, "opt_amp", None),
                 best_state_dtype=getattr(self.qcfg, "opt_best_state_dtype", "fp32"),
                 stage_impl=self.qcfg.opt_stage_impl,
                 pair_impl=self.qcfg.opt_pair_impl,
@@ -556,6 +559,28 @@ class ParoQuantProcessor(LoopProcessor):
                 scale_clamp_min=self.qcfg.opt_channel_scale_clamp_min,
                 scale_clamp_max=self.qcfg.opt_channel_scale_clamp_max,
             )
+
+        from ..quantization.gsq_scalar import gsq_enabled_for
+
+        if gsq_enabled_for(self.qcfg.gsq, module.full_name):
+            from dataclasses import replace
+
+            from ..quantization.gsq_paro import refine_paro_export
+
+            if inputs.numel() == 0:
+                raise ValueError("Paro GSQ requires nonempty calibration inputs")
+            features = inputs.reshape(-1, weight.shape[1]).to(weight.device)
+            fitted = refine_paro_export(
+                result, teacher=original_weight, inputs=features,
+                group_size=group_size, config=self.qcfg.gsq,
+                storage_dtype=weight.dtype if weight.dtype in (torch.float16, torch.bfloat16) else torch.float16)
+            result = replace(result, pack_weight=fitted["pack_weight"],
+                             pseudo_weight=fitted["pseudo_weight"],
+                             q_scales=fitted["q_scales"], q_zeros=fitted["q_zeros"])
+            module.state["gsq_diagnostics"] = {
+                "before": fitted["before"], "after": fitted["after"],
+                "history": fitted["history"], "objective": "transformed_input_mse",
+            }
 
         self._apply_optimization_result(module, result, original_weight)
         return result.train_loss, result.val_loss
@@ -1652,11 +1677,17 @@ class ParoQuantProcessor(LoopProcessor):
         attention_masks: list[Optional[torch.Tensor]],
         use_amp: bool,
     ) -> float:
-        """Measure full-layer reconstruction error for one grouped optimization stage."""
+        """Measure full-layer reconstruction error for one grouped optimization stage.
+
+        The per-batch losses are folded on the device into one fp64 scalar and read
+        back once, so a validation pass costs a single device sync instead of one
+        per batch. The fold order and fp64 accumulation match the per-batch host
+        sum bit for bit.
+        """
         if not input_batches:
             return 0.0
 
-        total_loss = 0.0
+        total_loss: Optional[torch.Tensor] = None
         with torch.inference_mode():
             for batch_index, (input_batch, input_kwargs, target_batch, pos_ids, attn_mask) in enumerate(
                 zip(input_batches, input_kwargs_batches, target_batches, position_ids, attention_masks)
@@ -1672,8 +1703,10 @@ class ParoQuantProcessor(LoopProcessor):
                         position_ids=pos_ids,
                     )
                     target = self._prepare_group_target(target_batch, device=preds.device, dtype=preds.dtype)
-                    total_loss += float(F.smooth_l1_loss(preds, target).item())
-        return total_loss / max(1, len(input_batches))
+                    total_loss = _fold_epoch_loss(total_loss, F.smooth_l1_loss(preds, target))
+        if total_loss is None:
+            return 0.0
+        return float(total_loss.item()) / max(1, len(input_batches))
 
     def _forward_group_batch_train(
         self,
@@ -1931,7 +1964,7 @@ class ParoQuantProcessor(LoopProcessor):
             base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
             scaler = torch.amp.GradScaler(enabled=use_amp)
             active_prefixes = tuple(optim_modules.keys())
-            needs_angle_reset = any(optim_module.theta.requires_grad for optim_module in optim_modules.values())
+            any(optim_module.theta.requires_grad for optim_module in optim_modules.values())
             best_state_dtype = _resolve_best_state_snapshot_dtype(
                 best_state_dtype=getattr(self.qcfg, "opt_best_state_dtype", "fp32"),
                 device=opt_device,
@@ -1942,7 +1975,7 @@ class ParoQuantProcessor(LoopProcessor):
             global_step = 0
 
             for _epoch in range(epochs):
-                epoch_loss = 0.0
+                epoch_loss: Optional[torch.Tensor] = None
                 batch_count = 0
                 optimizer.zero_grad(set_to_none=True)
 
@@ -1968,7 +2001,7 @@ class ParoQuantProcessor(LoopProcessor):
                         target = self._prepare_group_target(target_batch, device=preds.device, dtype=preds.dtype)
                         loss = F.smooth_l1_loss(preds, target)
 
-                    scaler.scale(loss).backward()
+                    _backward_scalar_loss(scaler.scale(loss))
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
@@ -1979,10 +2012,10 @@ class ParoQuantProcessor(LoopProcessor):
                         group["lr"] = (base_lr / 20.0) + ((base_lr - (base_lr / 20.0)) * cosine_ratio)
 
                     self._reset_group_angles(optim_modules)
-                    epoch_loss += float(loss.item())
+                    epoch_loss = _fold_epoch_loss(epoch_loss, loss)
                     batch_count += 1
 
-                last_train_loss = epoch_loss / max(1, batch_count)
+                last_train_loss = 0.0 if epoch_loss is None else float(epoch_loss.item()) / max(1, batch_count)
                 val_loss = self._evaluate_group_layer(
                     layer,
                     input_batches=input_batches_val,
@@ -2014,11 +2047,17 @@ class ParoQuantProcessor(LoopProcessor):
         target_device: torch.device,
         metadata_cache: Optional[dict[tuple[int, str], torch.Tensor]] = None,
     ) -> float:
-        """Measure full-layer reconstruction error while streaming one validation batch at a time."""
+        """Measure full-layer reconstruction error while streaming one validation batch at a time.
+
+        Each streamed batch contributes one device-side fold into an fp64 scalar
+        that is read back once, so the pass costs a single device sync instead of
+        one per batch. The fold order and fp64 accumulation match the per-batch
+        host sum bit for bit.
+        """
         if not replay_batches:
             return 0.0
 
-        total_loss = 0.0
+        total_loss: Optional[torch.Tensor] = None
         loader = _LayerShardLoader(
             replay_batches,
             target_device=target_device,
@@ -2040,8 +2079,10 @@ class ParoQuantProcessor(LoopProcessor):
                     dtype=preds.dtype,
                     cache=False,
                 )
-                total_loss += float(F.smooth_l1_loss(preds, target).item())
-        return total_loss / max(1, len(replay_batches))
+                total_loss = _fold_epoch_loss(total_loss, F.smooth_l1_loss(preds, target))
+        if total_loss is None:
+            return 0.0
+        return float(total_loss.item()) / max(1, len(replay_batches))
 
     def _run_group_stage_streamed(
         self,
@@ -2104,7 +2145,7 @@ class ParoQuantProcessor(LoopProcessor):
             )
 
             for _epoch in range(epochs):
-                epoch_loss = 0.0
+                epoch_loss: Optional[torch.Tensor] = None
                 batch_count = 0
                 optimizer.zero_grad(set_to_none=True)
                 train_loader = _LayerShardLoader(
@@ -2131,7 +2172,7 @@ class ParoQuantProcessor(LoopProcessor):
                             )
                             loss = F.smooth_l1_loss(preds, target)
 
-                            scaler.scale(loss).backward()
+                            _backward_scalar_loss(scaler.scale(loss))
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad(set_to_none=True)
@@ -2143,10 +2184,10 @@ class ParoQuantProcessor(LoopProcessor):
 
                             if needs_angle_reset:
                                 self._reset_group_angles(optim_modules)
-                            epoch_loss += float(loss.item())
+                            epoch_loss = _fold_epoch_loss(epoch_loss, loss)
                             batch_count += 1
 
-                last_train_loss = epoch_loss / max(1, batch_count)
+                last_train_loss = 0.0 if epoch_loss is None else float(epoch_loss.item()) / max(1, batch_count)
                 val_loss = self._evaluate_group_layer_streamed(
                     layer,
                     replay_batches=replay_batches_val,
@@ -2678,18 +2719,22 @@ class ParoQuantProcessor(LoopProcessor):
             logger=log,
             module_name=module_label,
         ):
-            with parent_module_lock(module.full_name):
-                pack_module(
-                    name=module.full_name,
-                    qModules=qmodules,
-                    q_scales=q_scales,
-                    q_zeros=q_zeros,
-                    q_g_idx=None,
-                    layers=layers,
-                    quant_linear_cls=quant_linear_cls,
-                    lock=self.lock,
-                    quantize_config=self.qcfg,
-                )
+            # `pack_module` only reads the already-resolved float layer and
+            # mutates the freshly created quant module; it never touches the
+            # parent's module tree. Holding the parent lock here would block
+            # every sibling module's proxy attribute access (which takes the
+            # same lock) for the whole packing window.
+            pack_module(
+                name=module.full_name,
+                qModules=qmodules,
+                q_scales=q_scales,
+                q_zeros=q_zeros,
+                q_g_idx=None,
+                layers=layers,
+                quant_linear_cls=quant_linear_cls,
+                lock=self.lock,
+                quantize_config=self.qcfg,
+            )
 
         qmodule = qmodules[module.full_name]
         if not isinstance(qmodule, ParoLinear):

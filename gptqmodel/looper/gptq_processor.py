@@ -1,9 +1,10 @@
-# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
-# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2026 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2026 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import copy
+import math
 import threading
 import time
 from types import MethodType
@@ -39,7 +40,16 @@ from ..quantization.activation_floatx import (
     nvfp4_global_scale,
     nvfp4_uses_headroom,
 )
-from ..quantization.config import METHOD, FOEMConfig, GPTAQConfig, HessianConfig, QuantizeConfig, resolve_quant_format
+from ..quantization.config import (
+    METHOD,
+    FOEMConfig,
+    GPTAQConfig,
+    HessianConfig,
+    QuantizeConfig,
+    _normalize_mse,
+    normalize_gsq_config,
+    resolve_quant_format,
+)
 from ..quantization.gptq import SharedHessianFactorCache
 from ..utils.device import get_device
 from ..utils.fallback import normalize_fallback
@@ -125,7 +135,9 @@ def clone_gptq_config_for_module(
     if qcfg.dynamic is not None:
         qcfg_clone.bits = qcfg.dynamic_get(module_full_name, "bits", qcfg_clone.bits)
         qcfg_clone.sym = qcfg.dynamic_get(module_full_name, "sym", qcfg_clone.sym)
-        qcfg_clone.mse = qcfg.dynamic_get(module_full_name, "mse", qcfg_clone.mse)
+        qcfg_clone.mse = _normalize_mse(
+            qcfg.dynamic_get(module_full_name, "mse", None), base=qcfg_clone.mse,
+        )
 
         qcfg_clone.group_size = qcfg.dynamic_get(module_full_name, "group_size", qcfg_clone.group_size)
         desc_act_override = qcfg.dynamic_get(module_full_name, "desc_act", None)
@@ -149,6 +161,7 @@ def clone_gptq_config_for_module(
                 raise ValueError("QuantizeConfig: dynamic `hessian` must be a HessianConfig or dict.")
         gptaq_override = qcfg.dynamic_get(module_full_name, "gptaq", None)
         foem_override = qcfg.dynamic_get(module_full_name, "foem", None)
+        qcfg_clone.gsq = normalize_gsq_config(qcfg.dynamic_get(module_full_name, "gsq", qcfg_clone.gsq))
         if gptaq_override is not None:
             if isinstance(gptaq_override, dict):
                 qcfg_clone.gptaq = GPTAQConfig(**gptaq_override)
@@ -165,6 +178,7 @@ def clone_gptq_config_for_module(
                 raise ValueError("QuantizeConfig: dynamic `foem` must be a FOEMConfig or dict.")
 
         qcfg_clone._resolve_activation_ordering(desc_act_override, act_group_aware_override)
+        qcfg_clone.validate_gsq()
 
     qcfg_clone.fallback = normalize_fallback(fallback, qcfg_clone.fallback)
     return qcfg_clone
@@ -220,7 +234,7 @@ class GPTQProcessor(LoopProcessor):
         self._shared_input_capture_generation = 0
         self.shared_input_dedup_count = 0
         self.shared_input_dedup_telemetry: Dict[str, Any] = {}
-        self._activation_amax: Dict[str, float] = {}
+        self._activation_amax: Dict[str, torch.Tensor] = {}
         self._activation_headroom: Dict[str, NVFP4ActivationHeadroom] = {}
         self._activation_global_scales: Dict[str, float] = {}
         self._activation_headroom_probe = False
@@ -286,11 +300,18 @@ class GPTQProcessor(LoopProcessor):
                     raise RuntimeError(f"Missing NVFP4 headroom collector for `{key}`.")
                 collector.collect(inp)
             return
-        current = float(inp.detach().abs().amax().item())
-        if not torch.isfinite(torch.tensor(current)):
-            raise ValueError(f"NVFP4 calibration input for `{name}` contains NaN or infinity.")
+        # Keep the running maximum on the device. Reading it back per batch
+        # synchronized the calibration stream for every module and batch; the
+        # finiteness check moves to the single consumer read at quantization.
+        current = inp.detach().abs().amax()
         with self.lock:
-            self._activation_amax[key] = max(current, self._activation_amax.get(key, 0.0))
+            previous = self._activation_amax.get(key)
+            if previous is None:
+                self._activation_amax[key] = current
+            else:
+                if previous.device != current.device or previous.dtype != current.dtype:
+                    current = current.to(device=previous.device, dtype=previous.dtype)
+                torch.maximum(previous, current, out=previous)
 
     def begin_activation_scale_probe(self, subset, layer=None) -> bool:
         """Start the calibration-only pass required by NVIDIA headroom scales."""
@@ -581,10 +602,15 @@ class GPTQProcessor(LoopProcessor):
                 out_tensor = out if torch.is_tensor(out) else None
                 # Keep per-sample boundaries here so batched calibration
                 # accumulates GPTQ stats with the same semantics as batch_size=1.
-                for sample_index, sample_keep in enumerate(keep_mask):
-                    if not bool(sample_keep.any().item()):
+                mask_tls = getattr(self, "_mask_tls", None)
+                sample_has_tokens = getattr(mask_tls, "sample_has_tokens", None)
+                if sample_has_tokens is None:
+                    sample_has_tokens = keep_mask.any(dim=1).tolist()
+                for sample_index, has_tokens in enumerate(sample_has_tokens):
+                    if not has_tokens:
                         continue
 
+                    sample_keep = keep_mask[sample_index]
                     input_keep = sample_keep.to(device=inp_tensor.device)
                     sample_inp = inp_tensor[
                         sample_index : sample_index + 1, input_keep, :
@@ -675,6 +701,9 @@ class GPTQProcessor(LoopProcessor):
                 )
 
         wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp_percent, nsamples = g.quantize()
+        gsq_diagnostics = getattr(g, "gsq_diagnostics", None)
+        if gsq_diagnostics is not None:
+            module.state["gsq_diagnostics"] = gsq_diagnostics
 
         workspace_summary = getattr(g, "_borrow_workspace_last_summary", None)
         workspace_totals = getattr(g, "_borrow_workspace_totals", None)
@@ -802,8 +831,17 @@ class GPTQProcessor(LoopProcessor):
                     ) from exc
             else:
                 observed = self._activation_amax.get(
-                    module.full_name, self._activation_amax.get(module.name, 0.0)
+                    module.full_name, self._activation_amax.get(module.name)
                 )
+                if observed is None:
+                    observed = 0.0
+                elif torch.is_tensor(observed):
+                    observed = float(observed.item())
+                    if not math.isfinite(observed):
+                        raise ValueError(
+                            f"NVFP4 calibration input for `{module.full_name}` "
+                            "contains NaN or infinity."
+                        )
                 scale = float(nvfp4_global_scale(
                     observed, recipe=recipe or self.qcfg.activation_recipe or "least_squares"
                 ))
@@ -901,6 +939,7 @@ class GPTQProcessor(LoopProcessor):
                     quant_linear_cls=model.qlinear_kernel,
                     lock=self.lock,
                     quantize_config=self.qcfg,
+                    device=module.state.get("quant_device"),
                 )
         if timer is not None and pack_start is not None:
             timer.record(

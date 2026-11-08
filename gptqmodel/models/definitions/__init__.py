@@ -21,6 +21,9 @@ from .decilm import DeciLMQModel
 from .deepseek_v2 import DeepSeekV2QModel
 from .deepseek_v3 import DeepSeekV3QModel
 from .deepseek_v32 import DeepSeekV32QModel
+from .raon1_mini import Raon1MiniQModel
+from .flint import FlintQModel
+from .ricursive import RicursiveQModel
 from .deepseek_v4 import DeepSeekV4QModel
 from .deepseek_ocr2 import DeepSeekOCR2QModel
 from .deepseek_vl import DeepSeekVLQModel
@@ -67,6 +70,9 @@ from .internvl_chat import InternVLChatQModel
 from .k2_horizon import K2HorizonGPTQ, K2HorizonQModel
 from .kimi_k3 import KimiK3QModel, KimiLinearQModel
 from .lfm2_vl import LFM2VLQModel
+from .lfm3 import LFM3QModel
+from .lfm3_omni import LFM3OmniQModel
+from .lfm3_vl import LFM3VLQModel
 from .mage_vl import MageVLQModel
 from .llama4 import Llama4QModel, Llama4TextQModel
 from .mimo import MimoQModel
@@ -89,6 +95,7 @@ from .nemotron_labs_diffusion import NemotronLabsDiffusionQModel
 from .nemotron_h_puzzle import NemotronHPuzzleQModel
 from .olmo3 import Olmo3QModel
 from .olmoe import OlmoeQModel
+from .openvla import OpenVLAQModel
 from .opt import OptQModel
 from .ouro import OuroQModel
 from .ovis import OvisQModel
@@ -100,6 +107,7 @@ from .phi3 import Phi3QModel
 from .qwen import QwenQModel
 from .qwen2 import Qwen2QModel
 from .qwen2_5_vl import Qwen2_5_VLQModel
+from .qwen2_audio import Qwen2AudioGPTQ
 from .qwen2_moe import Qwen2MoeQModel
 from .qwen2_vl import Qwen2VLQModel
 from .qwen3 import Qwen3QModel
@@ -130,6 +138,7 @@ from .apertus import Apertus1p5QModel, Apertus1p5TextQModel, ApertusQModel
 from .axk2 import AXK2QModel
 from .klear import KlearQModel
 from .laguna import LagunaQModel
+from .llava import LlavaQModel
 from .llava_qwen2 import LlavaQwen2QModel
 from .nemotron_h import NemotronHQModel
 from .qwen3_omni_moe import Qwen3OmniMoeGPTQ

@@ -84,10 +84,10 @@ def test_glm5_next_module_tree_preserves_fork_quantization_boundary():
         for block in Glm5NextQModel.full_layer_modules(model_config=config)
         for name in block
     }
-    # This fork allows these projections; the EXL3 recipe restricts actual
-    # work to routed experts. MTP is instantiated and calibrated, not copied.
-    assert {"self_attn.q_a_proj", "self_attn.kv_a_proj_with_mqa",
-            "mlp.shared_experts.gate_proj"} <= flat
+    # Keep upstream's dense low-rank attention inputs while retaining the
+    # fork's shared-expert and integrated MTP support.
+    assert {"self_attn.q_a_proj", "self_attn.kv_a_proj_with_mqa"}.isdisjoint(flat)
+    assert "mlp.shared_experts.gate_proj" in flat
     assert not Glm5NextQModel.out_of_model_tensors
 
 

@@ -36,6 +36,7 @@ from torch.utils.cpp_extension import CUDA_HOME, _get_build_directory, _get_cuda
 from .env import env_flag
 from .jit_compile_baselines import get_jit_compile_baseline_seconds
 from .logger import setup_logger
+from .rocm import IS_ROCM
 
 
 log = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ _PACK_BLOCK_EXTENSION_INITIALISED = False
 
 _PACK_BLOCK_TORCH_OPS_EXTENSION = None
 _FLOATX_CPU_TORCH_OPS_EXTENSION = None
+_INT4_QZERO_GROUP_SCALED_CPU_TORCH_OPS_EXTENSION = None
 
 _cpp_ext_lock = _TORCH_OPS_JIT_LOCK
 
@@ -535,7 +537,17 @@ def _is_system_or_dependency_header(include_name: str) -> bool:
 
 
 def detected_cuda_wheel_include_paths() -> list[str]:
-    """Discover CUDA developer headers shipped via NVIDIA Python wheels."""
+    """Discover CUDA developer headers shipped via NVIDIA Python wheels.
+
+    NVIDIA wheel headers are for `nvcc` only. A ROCm host can still have the
+    `nvidia` namespace packages installed (for example through a
+    `torchao`/`vllm` dependency), but adding those `vector_types.h` and
+    `cuda_runtime.h` copies to a hipcc command line makes HIP and CUDA type
+    aliases (``uint1``, ``int2``, ...) collide. Never offer them on ROCm.
+    """
+
+    if IS_ROCM:
+        return []
 
     try:
         import nvidia  # type: ignore
@@ -593,6 +605,69 @@ def detected_local_cuda_include_paths() -> list[str]:
     return _dedupe_path_strings(include_paths)
 
 
+_ROCM_TOOLKIT_ROOT_ENV_VARS = ("ROCM_PATH", "HIP_PATH", "ROCM_HOME")
+
+
+def _rocm_sdk_devel_include_paths() -> list[str]:
+    """Return the TheRock pip ROCm SDK devel include tree when it is expanded.
+
+    The pip ROCm SDK layout keeps ``_rocm_sdk_core`` (what PyTorch reports as
+    ``ROCM_HOME``) and ``_rocm_sdk_devel`` side by side in site-packages. The
+    devel wheel stores its headers in an archive that ``rocm-sdk init`` expands
+    in place; until that happens the tree has no ``include`` directory.
+    """
+
+    try:
+        from torch.utils import cpp_extension as _cpp_extension
+    except Exception:  # pragma: no cover - torch is always importable here
+        return []
+
+    rocm_home = getattr(_cpp_extension, "ROCM_HOME", None)
+    if not rocm_home:
+        return []
+
+    rocm_home_path = Path(rocm_home).expanduser()
+    candidate_includes = (
+        rocm_home_path.parent / "_rocm_sdk_devel" / "include",
+        rocm_home_path.parent / "rocm_sdk_devel" / "include",
+    )
+    return [
+        str(candidate)
+        for candidate in candidate_includes
+        if (candidate / "thrust" / "complex.h").is_file()
+    ]
+
+
+def detected_rocm_include_paths() -> list[str]:
+    """Discover ROCm template-library headers (thrust/rocprim) for HIP builds.
+
+    The pip-packaged ROCm SDK that PyTorch reports as ``ROCM_HOME`` ships the
+    HIP runtime headers but not the thrust/rocprim template libraries that some
+    kernel sources pull in through torch headers (``thrust/complex.h``). Prefer
+    the SDK's own expanded devel tree, which is version-matched with the active
+    runtime; only then probe the standard environment variables and install
+    roots for an include directory that provides the required headers.
+    """
+
+    sdk_include_paths = _rocm_sdk_devel_include_paths()
+    if sdk_include_paths:
+        return _dedupe_path_strings(sdk_include_paths)
+
+    candidate_roots: list[Path] = []
+    for env_name in _ROCM_TOOLKIT_ROOT_ENV_VARS:
+        value = os.getenv(env_name)
+        if value:
+            candidate_roots.append(Path(value).expanduser())
+    candidate_roots.extend((Path("/opt/rocm"), Path("/usr")))
+
+    include_paths: list[str] = []
+    for root in candidate_roots:
+        candidate = root / "include"
+        if (candidate / "thrust" / "complex.h").is_file():
+            include_paths.append(str(candidate))
+    return _dedupe_path_strings(include_paths)
+
+
 def _detected_local_cuda_has_required_headers(required_header_names: Sequence[str]) -> bool:
     """Return whether the detected local CUDA toolkit exposes every required header."""
 
@@ -610,12 +685,80 @@ def cuda_include_paths_with_fallback(
     *,
     required_header_names: Sequence[str] = (),
 ) -> list[str]:
-    """Append NVIDIA wheel headers when the local CUDA toolkit is absent or incomplete."""
+    """Append NVIDIA wheel headers when the local CUDA toolkit is absent or incomplete.
+
+    The fallback exists for `nvcc` builds that have no local CUDA toolkit. On
+    ROCm the only valid headers are the HIP/torch ones, so NVIDIA wheel headers
+    are never appended; mixing them breaks hipcc with conflicting CUDA/HIP
+    vector types.
+    """
 
     resolved_include_paths = _dedupe_path_strings(include_paths)
-    if not _detected_local_cuda_has_required_headers(required_header_names):
+    if not IS_ROCM and not _detected_local_cuda_has_required_headers(required_header_names):
         resolved_include_paths.extend(detected_cuda_wheel_include_paths())
     return _dedupe_path_strings(resolved_include_paths)
+
+
+def rocm_supplemental_include_cflags() -> list[str]:
+    """Return ``-I`` flags for ROCm headers that torch's default include set misses.
+
+    Torch reports the pip ROCm SDK as ``ROCM_HOME``; that layout ships the HIP
+    runtime headers but not the thrust/rocprim template libraries that some
+    kernel sources pull in through torch headers (``thrust/complex.h``). These
+    directories must be passed as compiler flags rather than through
+    ``extra_include_paths``: torch hipifies every file below an extra include
+    path outside ``ROCM_HOME``, which would copy and rewrite the whole ROCm
+    header tree on every JIT build.
+    """
+
+    if not IS_ROCM:
+        return []
+    return [f"-I{include_path}" for include_path in detected_rocm_include_paths()]
+
+
+def _rocm_sdk_devel_lib_paths() -> list[str]:
+    """Return the TheRock pip ROCm SDK devel library tree when it is expanded.
+
+    The pip ROCm SDK layout keeps ``_rocm_sdk_core`` (what PyTorch reports as
+    ``ROCM_HOME``) and ``_rocm_sdk_devel`` side by side in site-packages. The
+    core tree is the runtime package and ships versioned sonames only
+    (``libamdhip64.so.7``), while the devel tree carries the unversioned
+    development symlinks that ``-lamdhip64`` needs.
+    """
+
+    try:
+        from torch.utils import cpp_extension as _cpp_extension
+    except Exception:  # pragma: no cover - torch is always importable here
+        return []
+
+    rocm_home = getattr(_cpp_extension, "ROCM_HOME", None)
+    if not rocm_home:
+        return []
+
+    rocm_home_path = Path(rocm_home).expanduser()
+    candidate_libs = (
+        rocm_home_path.parent / "_rocm_sdk_devel" / "lib",
+        rocm_home_path.parent / "rocm_sdk_devel" / "lib",
+    )
+    return [
+        str(candidate)
+        for candidate in candidate_libs
+        if (candidate / "libamdhip64.so").is_file()
+    ]
+
+
+def rocm_supplemental_ldflags() -> list[str]:
+    """Return ``-L`` flags for ROCm development libraries missing from ``ROCM_HOME``.
+
+    Torch adds ``-lamdhip64`` to every HIP JIT extension, but the pip ROCm
+    runtime package behind ``ROCM_HOME`` only ships ``libamdhip64.so.7``, so the
+    link fails with ``cannot find -lamdhip64`` unless the version-matched devel
+    tree's ``lib`` directory is on the search path.
+    """
+
+    if not IS_ROCM:
+        return []
+    return [f"-L{lib_path}" for lib_path in _rocm_sdk_devel_lib_paths()]
 
 
 _CUDA_ARCH_TOKEN_RE = pcre.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)(?:\+PTX)?$")
@@ -800,7 +943,7 @@ def default_jit_cuda_cflags(
     include_diag_suppress: bool = False,
     nvcc_threads: str | int | None = None,
 ) -> list[str]:
-    """Return the common NVCC flags for torch.ops JIT CUDA extensions."""
+    """Return the common device-compiler flags for torch.ops JIT CUDA/ROCm extensions."""
 
     resolved_opt_level = resolved_jit_opt_level(opt_level)
     flags = default_jit_cflags(
@@ -808,6 +951,11 @@ def default_jit_cuda_cflags(
         enable_bf16=enable_bf16,
         include_abi=include_abi,
     )
+
+    if IS_ROCM:
+        if include_lineinfo:
+            flags.append("-gline-tables-only")
+        return flags
 
     if include_nvcc_threads:
         resolved_nvcc_threads = str(nvcc_threads) if nvcc_threads is not None else os.getenv("NVCC_THREADS", _DEFAULT_NVCC_THREADS)
@@ -830,6 +978,18 @@ def default_jit_cuda_cflags(
     if include_diag_suppress:
         flags.append("-diag-suppress=179,39,177")
     return flags
+
+
+def jit_disable_fma_contraction_flag() -> str:
+    """Return the toolchain flag that disables FMA contraction for JIT kernels.
+
+    ``--fmad=false`` is an NVCC-only spelling; hipcc/clang uses the generic
+    ``-ffp-contract=off``. Kernels that request this flag depend on the
+    contraction being disabled to match the Torch reference numerics, so the
+    request must translate rather than disappear on ROCm.
+    """
+
+    return "-ffp-contract=off" if IS_ROCM else "--fmad=false"
 
 
 class TorchOpsJitExtension:
@@ -925,10 +1085,21 @@ class TorchOpsJitExtension:
         return resolved
 
     def _resolved_extra_cflags(self) -> list[str]:
-        return self._with_stable_abi_target(self._resolve_sequence(self.extra_cflags))
+        flags = self._with_stable_abi_target(self._resolve_sequence(self.extra_cflags))
+        if self.requires_cuda:
+            flags.extend(rocm_supplemental_include_cflags())
+        return flags
 
     def _resolved_extra_cuda_cflags(self) -> list[str]:
         return self._with_stable_abi_target(self._resolve_sequence(self.extra_cuda_cflags))
+
+    def _resolved_extra_ldflags(self) -> list[str]:
+        flags = list(self._resolve_sequence(self.extra_ldflags))
+        if self.requires_cuda:
+            for flag in rocm_supplemental_ldflags():
+                if flag not in flags:
+                    flags.append(flag)
+        return flags
 
     def base_build_root(self) -> Path:
         """Return the user-visible cache root before applying the loader fingerprint."""
@@ -1186,7 +1357,7 @@ class TorchOpsJitExtension:
         payload.extend(extra_cflags)
         payload.extend(_cuda_cache_relevant_flags(extra_cuda_cflags))
         payload.extend(_fingerprint_path_key(Path(include_path)) for include_path in include_paths)
-        payload.extend(self._resolve_sequence(self.extra_ldflags))
+        payload.extend(self._resolved_extra_ldflags())
         digest = hashlib.sha256("\0".join(payload).encode("utf-8")).hexdigest()
         return digest[:16]
 
@@ -1258,6 +1429,53 @@ class TorchOpsJitExtension:
         self._namespace_cache = namespace
         self._op_cache = {op_name: getattr(namespace, op_name) for op_name in self.required_ops}
         return True
+
+    def _toolchain_diagnostic_lines(self) -> list[str]:
+        """Report the build tools torch will actually find.
+
+        torch's JIT build shells out to `ninja` and `cmake` through PATH. The
+        common failure is a conda env whose `ninja` lives in
+        `$CONDA_PREFIX/bin` while PATH omits it: the build dies in under a
+        second with `Ninja is required to load C++ extensions`, which does not
+        name the real cause. Surface what was found, where, and the versions.
+        """
+
+        lines: list[str] = []
+        for tool in ("ninja", "cmake"):
+            path = shutil.which(tool)
+            if path is None:
+                lines.append(f"{tool}=<not on PATH>")
+                continue
+            try:
+                proc = subprocess.run(
+                    [path, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                version = (proc.stdout or proc.stderr or "").strip().splitlines()
+                first_line = version[0].strip() if version else f"exit={proc.returncode}"
+            except Exception as exc:  # pragma: no cover - host toolchain dependent
+                first_line = f"<version probe failed: {exc}>"
+            lines.append(f"{tool}={path} ({first_line})")
+
+        conda_prefix = os.getenv("CONDA_PREFIX")
+        if conda_prefix:
+            env_bin = Path(conda_prefix) / ("Scripts" if os.name == "nt" else "bin")
+            lines.append(f"CONDA_PREFIX={conda_prefix}")
+            if env_bin.is_dir() and str(env_bin) not in os.getenv("PATH", "").split(os.pathsep):
+                hint = f"{env_bin} is not on PATH"
+                if (env_bin / "ninja").exists():
+                    hint += f"; `ninja` exists at {env_bin / 'ninja'}"
+                lines.append(f"PATH_hint={hint}")
+
+        if shutil.which("ninja") is None:
+            lines.append(
+                "hint=torch JIT needs `ninja` on PATH; install it or add the "
+                "environment's bin directory (see PATH_hint) to PATH"
+            )
+        return lines
 
     def _candidate_binary_paths(self, build_root: Path) -> list[Path]:
         seen: set[Path] = set()
@@ -1530,7 +1748,7 @@ class TorchOpsJitExtension:
                         kwargs["extra_cuda_cflags"] = extra_cuda_cflags
                     if extra_include_paths:
                         kwargs["extra_include_paths"] = extra_include_paths
-                    extra_ldflags = self._resolve_sequence(self.extra_ldflags)
+                    extra_ldflags = self._resolved_extra_ldflags()
                     if extra_ldflags:
                         kwargs["extra_ldflags"] = extra_ldflags
                     with _temporary_merged_cuda_arch_override(
@@ -1551,6 +1769,7 @@ class TorchOpsJitExtension:
                         f"TORCH_EXTENSIONS_DIR={os.getenv('TORCH_EXTENSIONS_DIR', '')}",
                         f"GPTQMODEL_TORCH_EXTENSIONS_DIR={os.getenv('GPTQMODEL_TORCH_EXTENSIONS_DIR', '')}",
                     ]
+                    diagnostic_lines.extend(self._toolchain_diagnostic_lines())
                     candidate_paths = self._candidate_binary_paths(build_root)
                     if candidate_paths:
                         diagnostic_lines.append(
@@ -1684,6 +1903,28 @@ def _floatx_cpu_source_path() -> Path:
     return project_root / "gptqmodel_ext" / "floatx_cpu.cpp"
 
 
+def _int4_qzero_group_scaled_cpu_source_dir() -> Path:
+    """Resolve the shared INT4 qzero/group-scaled CPU kernel source directory."""
+
+    project_root = Path(__file__).resolve().parents[2]
+    source_dir = project_root / "gptqmodel_ext" / "int4_qzero_group_scaled_cpu"
+    if source_dir.is_dir():
+        return source_dir
+    return project_root / "int4_qzero_group_scaled_cpu"
+
+
+def _int4_qzero_group_scaled_cpu_sources() -> list[str]:
+    source_dir = _int4_qzero_group_scaled_cpu_source_dir()
+    return [
+        str(source_dir / "binding.cpp"),
+        str(source_dir / "int4_qzero_group_scaled_torch.cpp"),
+        str(source_dir / "int4_qzero_group_scaled.cpp"),
+        str(source_dir / "int4_qzero_group_scaled_avx512.cpp"),
+        str(source_dir / "int4_qzero_group_scaled_pack.cpp"),
+        str(source_dir / "qqq_cpu.cpp"),
+    ]
+
+
 def _pack_block_extension() -> TorchOpsJitExtension:
     """Build the shared pack_block torch.ops loader on first use."""
 
@@ -1726,6 +1967,47 @@ def _floatx_cpu_extension() -> TorchOpsJitExtension:
             python_abi_dependent=False,
         )
     return _FLOATX_CPU_TORCH_OPS_EXTENSION
+
+
+def _int4_qzero_group_scaled_cpu_extension() -> TorchOpsJitExtension:
+    """Build the shared INT4 qzero/group-scaled CPU torch.ops loader."""
+
+    global _INT4_QZERO_GROUP_SCALED_CPU_TORCH_OPS_EXTENSION
+    if _INT4_QZERO_GROUP_SCALED_CPU_TORCH_OPS_EXTENSION is None:
+        source_dir = _int4_qzero_group_scaled_cpu_source_dir()
+        _INT4_QZERO_GROUP_SCALED_CPU_TORCH_OPS_EXTENSION = TorchOpsJitExtension(
+            name="gptqmodel_int4_qzero_group_scaled_cpu",
+            namespace="gptqmodel_int4_qzero_group_scaled_cpu",
+            required_ops=(
+                "gemm_int4_qzero_group_scaled_cpu_forward",
+                "pack_gptq_int4",
+                "pack_awq_int4",
+                "qqq_int4",
+            ),
+            sources=_int4_qzero_group_scaled_cpu_sources,
+            build_root_env="GPTQMODEL_EXT_BUILD",
+            default_build_root=lambda: default_torch_ops_build_root("int4_qzero_group_scaled_cpu"),
+            display_name="int4_qzero_group_scaled_cpu",
+            extra_cflags=[
+                "-O3",
+                f"-std={_jit_cxx_standard()}",
+                "-fopenmp",
+                "-mfma",
+                "-mf16c",
+                "-mavx512f",
+                "-mavx512bf16",
+                "-mavx512vl",
+                "-mavx512dq",
+                "-mavx512bw",
+                "-mavx512vbmi",
+            ],
+            extra_include_paths=[str(source_dir)],
+            extra_ldflags=["-fopenmp"],
+            verbose_env="GPTQMODEL_EXT_VERBOSE",
+            requires_cuda=False,
+            python_abi_dependent=False,
+        )
+    return _INT4_QZERO_GROUP_SCALED_CPU_TORCH_OPS_EXTENSION
 
 
 def load_pack_block_extension(*, verbose: bool = False) -> Optional[object]:

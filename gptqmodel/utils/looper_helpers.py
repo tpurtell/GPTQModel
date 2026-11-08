@@ -23,6 +23,7 @@ from ..utils.env import env_flag
 from ..utils.inspect import get_supported_kwargs
 from ..utils.logger import setup_logger
 from ..utils.model import get_layer_name, move_to, nested_move_to
+from ..utils.p2p import enable_for_devices, safe_module_to, safe_move_to
 from ..utils.safe import ThreadSafe
 from ..utils.torch import ALL_DEVICES, CPU, HAS_NPU, torch_sync
 
@@ -36,6 +37,10 @@ USE_TORCH_REPLICATE = env_flag("GPTQMODEL_USE_TORCH_REPLICATE", False)
 
 _THREAD_SAFE_PARALLEL = ThreadSafe(torch_parallel)
 _DEEPCOPY_LOCK = threading.Lock()
+# Set once the torch/NCCL replication path fails. Repeating the attempt for
+# every layer only re-raises the same NCCL error; the deepcopy fallback below is
+# the correct path for the rest of the process.
+_REPLICATE_DISABLED = False
 
 
 def _rebind_copied_instance_methods(
@@ -82,11 +87,17 @@ def torch_replicate(
             if dev.type in {"cuda", "xpu", "mps", "npu"}:
                 try:
                     torch_sync(dev)
-                except BaseException:
-                    pass
+                except Exception:
+                    log.debug("torch_sync(%s) before replicate failed", dev, exc_info=True)
         return _THREAD_SAFE_PARALLEL.replicate(module, normalized_devices, detach=detach)
 
+
 log = setup_logger()
+
+# Tensors whose device-move failure has already been reported with a traceback.
+# See `rehome_module_to_device`: without this, per-batch callers repeat the same
+# failure for every batch of every layer.
+_REPORTED_MOVE_FAILURES: set = set()
 
 
 if TYPE_CHECKING:
@@ -254,6 +265,30 @@ def rehome_module_to_device(
     Omit ``root_module`` when ancestry is unknown to preserve hook ownership.
     A standalone module may supply itself as the root.
     """
+    # Log amplification guard. This runs under `_rehome_lock`, once per module,
+    # and batch workers call it again for every batch, so a model whose tensors
+    # cannot reach the target device would otherwise emit one full traceback
+    # per tensor *per batch*. The failure traceback is emitted once per
+    # ``(device, exception type)`` for the life of the process; every call then
+    # reports only a count. Keying on the exception type (not the tensor) is
+    # what keeps a 30-tensor model from emitting 30 identical tracebacks.
+    failure_count = [0]
+
+    def _record_failure(kind: str, name: str, sub: torch.nn.Module, exc: BaseException) -> None:
+        failure_count[0] += 1
+        key = (str(device), type(exc).__name__)
+        if key in _REPORTED_MOVE_FAILURES:
+            return
+        _REPORTED_MOVE_FAILURES.add(key)
+        log.warning(
+            "failed to move %s %r of %s to %s",
+            kind,
+            name,
+            type(sub).__name__,
+            device,
+            exc_info=True,
+        )
+
     with _rehome_lock:
         for sub in module.modules():
             if move_buffers:
@@ -266,12 +301,14 @@ def rehome_module_to_device(
                     if only_mismatched and buf.device == device:
                         continue
                     try:
-                        sub._buffers[name] = buf.to(device, non_blocking=True)
+                        sub._buffers[name] = safe_move_to(buf, device, non_blocking=True)
                     except Exception:
                         try:
-                            sub._buffers[name] = buf.to(device)
-                        except Exception:
-                            pass
+                            sub._buffers[name] = safe_move_to(buf, device)
+                        except Exception as exc:
+                            # The buffer stays on its original device; that is a
+                            # correctness problem, not a benign fallback.
+                            _record_failure("buffer", name, sub, exc)
 
             if move_parameters:
                 for pname, p in list(getattr(sub, "_parameters", {}).items()):
@@ -282,7 +319,7 @@ def rehome_module_to_device(
                     try:
                         with torch.no_grad():
                             new_p = torch.nn.Parameter(
-                                p.data.to(device, non_blocking=True),
+                                safe_move_to(p.data, device, non_blocking=True),
                                 requires_grad=p.requires_grad,
                             )
                         sub._parameters[pname] = new_p
@@ -290,12 +327,20 @@ def rehome_module_to_device(
                         try:
                             with torch.no_grad():
                                 new_p = torch.nn.Parameter(
-                                    p.data.to(device),
+                                    safe_move_to(p.data, device),
                                     requires_grad=p.requires_grad,
                                 )
                             sub._parameters[pname] = new_p
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _record_failure("parameter", pname, sub, exc)
+
+        if failure_count[0]:
+            log.warning(
+                "%d tensor(s) could not be moved to %s; only the first failure per "
+                "exception type is shown with its traceback.",
+                failure_count[0],
+                device,
+            )
 
         if move_parameters:
             _realign_materialized_hooks(module, device, root_module)
@@ -415,6 +460,13 @@ def clone_module_for_devices(
     device_type = base_device.type
     homogeneous_type = all(dev.type == device_type for dev in devices)
 
+    peer_status = None
+    if device_type == "cuda" and len(devices) > 1:
+        # Best-effort peer enablement before any cross-device staging. The
+        # helper caches its result and never raises in best-effort mode, so a
+        # failed probe never blocks quantization.
+        peer_status = enable_for_devices(devices)
+
     def backend_available(dev_type: str) -> bool:
         if dev_type == "cuda":
             return torch.cuda.is_available()
@@ -426,7 +478,11 @@ def clone_module_for_devices(
 
     def _prepare_module(target_device: torch.device, step_name: str) -> None:
         start_ts = time.perf_counter()
-        module.to(target_device)
+        # ``nn.Module.to`` issues a direct peer copy for every tensor already on
+        # another accelerator. On an asymmetric ROCm link that call segfaults
+        # inside ``hipMemcpyPeerAsync`` instead of raising, so use the helper
+        # that stages unsupported directions through host memory.
+        safe_module_to(module, target_device, status=peer_status)
         module.eval()
         rehome_module_to_device(
             module,
@@ -439,8 +495,19 @@ def clone_module_for_devices(
         setattr(module, "_gptqmodule_device_hint", target_device)
         _record(step_name, start_ts)
 
+    global _REPLICATE_DISABLED
+
+    asymmetric_topology = bool(peer_status is not None and peer_status.asymmetric_pairs())
+    if asymmetric_topology and USE_TORCH_REPLICATE and not _REPLICATE_DISABLED:
+        log.info(
+            "Clone: skipping NCCL/torch replicate because the P2P topology is "
+            "asymmetric; using deepcopy plus host-staged moves instead."
+        )
+
     use_replicate = (
         USE_TORCH_REPLICATE
+        and not _REPLICATE_DISABLED
+        and not asymmetric_topology
         and homogeneous_type
         and backend_available(device_type)
         and device_type != "cpu"
@@ -470,6 +537,11 @@ def clone_module_for_devices(
             return clones
         except Exception as e:
             log.info(f"Clone: fast clone failed {e}")
+            # Do not keep the failed fast path armed: the fallback below must
+            # stage every replica deliberately instead of silently retrying a
+            # direct cross-device deep copy that can crash on ROCm.
+            _REPLICATE_DISABLED = True
+            use_replicate = False
             clone_timings.append(("replicate_failed", 0.0))
             if stage_device != base_device:
                 _prepare_module(stage_device, f"stage_{stage_device}")

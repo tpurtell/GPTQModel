@@ -36,9 +36,45 @@ def _pack_contiguous(values: torch.Tensor, bits: int) -> torch.Tensor:
 def pack_awq(iweights: torch.Tensor, izeros: torch.Tensor, bits: int):
     """Pack natural AWQ codes while retaining the established INT4 layout."""
     if bits == 4:
-        iweights = iweights.view(*iweights.shape[:-1], -1, 8)[..., AWQ_ORDER].flatten(-2)
-        izeros = izeros.view(*izeros.shape[:-1], -1, 8)[..., AWQ_ORDER].flatten(-2)
+        # The classic layout is one int32 per eight codes. Pack it directly
+        # instead of materializing the padded int64 bit-stream used by the
+        # generic 2..8-bit path.
+        if iweights.shape[-1] % 8 != 0 or izeros.shape[-1] % 8 != 0:
+            raise ValueError("INT4 AWQ packing requires the packed dimension to be divisible by 8.")
+        mask = (1 << bits) - 1
+        iweights = torch.bitwise_and(iweights, mask).to(torch.int32)
+        izeros = torch.bitwise_and(izeros, mask).to(torch.int32)
+        return (
+            pack_awq_columns(iweights, bits, order=AWQ_ORDER),
+            pack_awq_columns(izeros, bits, order=AWQ_ORDER),
+        )
     return _pack_contiguous(iweights, bits), _pack_contiguous(izeros, bits)
+
+
+def pack_awq_columns(codes: torch.Tensor, bits: int, order=None) -> torch.Tensor:
+    """Pack code columns into 32-bit words with the classic shift/OR order.
+
+    ``codes`` is ``[rows, columns]``; every ``32 // bits`` consecutive columns
+    collapse into one output word.  ``order`` optionally permutes the codes
+    inside each group (the AWQ ``[0, 2, 4, 6, 1, 3, 5, 7]`` interleave).
+    Codes are widened and masked before shifting so no field spills into its
+    neighbors. Any trailing columns that do not fill a whole group are
+    ignored, mirroring the loop that iterates ``range(columns // pack_num)``.
+    """
+
+    if codes.dim() < 2:
+        raise ValueError(f"codes must have at least two dimensions, got shape={tuple(codes.shape)}")
+    pack_num = 32 // bits
+    leading_shape = codes.shape[:-1]
+    columns = codes.shape[-1] // pack_num
+    grouped = codes[..., : columns * pack_num].to(torch.int32) & ((1 << bits) - 1)
+    grouped = grouped.reshape(*leading_shape, columns, pack_num)
+    if order is not None:
+        grouped = grouped[..., order]
+    packed = torch.zeros((*leading_shape, columns), dtype=torch.int32, device=codes.device)
+    for index in range(pack_num):
+        packed |= grouped[..., index] << (index * bits)
+    return packed
 
 
 def _unpack_columnwise(qtensor: torch.Tensor, bits: int, count: int = None) -> torch.Tensor:

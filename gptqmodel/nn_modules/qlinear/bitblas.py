@@ -9,6 +9,7 @@ import ctypes
 import os
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -23,6 +24,7 @@ from ...quantization import FORMAT, METHOD
 from ...utils import BACKEND
 from ...utils.env import env_flag
 from ...utils.logger import setup_logger
+from ...utils.rocm import IS_ROCM
 
 
 log = setup_logger()
@@ -32,11 +34,13 @@ BITBLAS_OPTIMIZE_FEATURES: List[int] = [1, 16, 32, 64, 128, 256, 512, 1024]
 BITBLAS_SUPPORTED_GROUP_SIZES: List[int] = [-1, 32, 64, 128]
 BITBLAS_SUPPORTED_BITS: List[int] = [2, 4, 8]
 BITBLAS_SUPPORTED_SYM: List[bool] = [False, True]
-# Keep bf16 exposed overall: upstream BitBLAS can successfully compile bf16 for some dtype/shape
-# combinations (for example unsigned low-bit paths used by AWQ). The specific incompatibility we
-# reproduced is the signed low-bit GPTQ dequant path, which can emit CUDA that tries to construct
-# `cutlass::bfloat16_t(int)` and fails during BitBLAS runtime compilation.
-BITBLAS_BF16_UNSUPPORTED_SIGNED_BITS = frozenset({2, 4, 8})
+# bf16 stays an interface dtype, but BitBLAS 0.1.0.post1 cannot compile bf16 low-bit dequant
+# kernels: nvcc rejects the generated `bfloat16_t` cast in the bundled cutlass 3.2.2, and
+# `Matmul()` then returns with `lib = None` and `torch_func` unset without raising. This is a
+# host-side build failure, independent of the GPU and unrelated to runtime crashes (handled by
+# `_invoke_bitblas_matmul`). bf16 modules therefore run the operator in fp16 and cast at the
+# module boundary; accumulation stays fp32.
+BITBLAS_BF16_COMPUTE_DTYPE = torch.float16
 BITBLAS_DEFAULT_ZEROS_MODE = "quantized"
 BITBLAS_PROPAGATE_WEIGHTS = False
 BITBLAS_MAX_SUPPORTED_SM = 90
@@ -126,19 +130,109 @@ def _is_bitblas_available() -> bool:
         except Exception as retry_exc:
             log.debug("BitBLAS import retry failed: %s", retry_exc)
             return False
-    parsed_version = version.parse(bitblas.__version__)
-    minimum_version = version.parse(MINIMUM_BITBLAS_VERSION)
+    # Capture the attribute once. Reading ``bitblas.__version__`` inside the
+    # handler below would raise again for a module that has no ``__version__``
+    # at all, escaping ``validate_once``'s ``(bool, exception)`` contract.
+    raw_version = getattr(bitblas, "__version__", None)
+    try:
+        parsed_version = version.parse(raw_version)
+        minimum_version = version.parse(MINIMUM_BITBLAS_VERSION)
+    except Exception as exc:
+        # An unparsable or missing ``__version__`` means the build is unusable.
+        log.debug("BitBLAS version %r could not be parsed: %s", raw_version, exc)
+        return False
     if parsed_version < minimum_version:
         log.debug(
             "BitBLAS version %s below minimum required %s",
-            bitblas.__version__,
+            raw_version,
             MINIMUM_BITBLAS_VERSION,
         )
         return False
     return True
 
 
-BITBLAS_AVAILABLE = _is_bitblas_available()
+@lru_cache(maxsize=1)
+def _probe_bitblas_available() -> bool:
+    """Probe BitBLAS once, on first real use.
+
+    Importing BitBLAS is expensive and must not happen while the kernel
+    registry is merely being discovered. The probe is cached so repeated
+    ``validate_once`` calls stay cheap.
+    """
+
+    return _is_bitblas_available()
+
+
+_probe_cache_clear = _probe_bitblas_available.cache_clear
+
+
+def bitblas_available() -> bool:
+    """Return whether a supported BitBLAS is usable.
+
+    The legacy ``BITBLAS_AVAILABLE`` name is materialized from the probe on first
+    attribute access, so this accessor reads the same attribute when present
+    and otherwise probes.
+    """
+
+    namespace = sys.modules[__name__].__dict__
+    if "BITBLAS_AVAILABLE" in namespace:
+        return bool(namespace["BITBLAS_AVAILABLE"])
+    return _probe_bitblas_available()
+
+
+def _clear_availability_state() -> None:
+    """Drop the materialized value, the probe result and validation caches.
+
+    This is the escape hatch for tests and for long-lived processes where the
+    environment changes after the first probe (a package installed later, a
+    toolchain that becomes available). It also removes a value restored by
+    ``monkeypatch.undo()``, which is indistinguishable from an explicit
+    override once materialized.
+
+    The kernel's ``cached_validate_once()`` result is invalidated as well, or a
+    kernel that failed before the backend appeared stays unselectable until the
+    process ends.
+    """
+
+    sys.modules[__name__].__dict__.pop("BITBLAS_AVAILABLE", None)
+    _probe_cache_clear()
+    cls = globals().get("BitblasLinear")
+    if cls is not None:
+        cls.cached_validate_once.cache_clear()
+    # ``validate_quant_linear()`` keeps its own bounded cache of
+    # ``(bool, error)`` results. Clearing only the kernel-level cache leaves a
+    # stale "unavailable" answer there, and that cache short-circuits before
+    # ``validate()`` is ever called again. Import lazily: ``importer`` imports
+    # the kernel package, so a module-level import here would be circular.
+    from ...utils.importer import clear_validation_cache
+
+    clear_validation_cache()
+
+
+# ``cache_clear`` is the documented knob; keep it on the probe, extended with
+# the materialized attribute so clearing really re-arms everything.
+_probe_bitblas_available.cache_clear = _clear_availability_state
+
+
+def __getattr__(name: str):
+    if name == "BITBLAS_AVAILABLE":
+        # Materialize the probe as a normal module attribute. A plain attribute
+        # keeps ``del`` and ``monkeypatch`` semantics working: pytest reads the
+        # old value from ``__dict__`` and restores it on ``undo()``, so two
+        # consecutive patch contexts behave like they did before the lazy
+        # change.
+        value = _probe_bitblas_available()
+        sys.modules[__name__].__dict__[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    # ``__getattr__`` names are invisible to ``dir()``/star-import unless
+    # advertised. Keep the pre-lazy surface.
+    return sorted(set(globals()) | {"BITBLAS_AVAILABLE"})
+
+
 _BITBLAS_TARGET_ARCH_RE = pcre.compile(r"\bsm_(\d+)[a-z]*\b")
 _BITBLAS_TARGET_SM_RE = pcre.compile(r"sm_(\d+)")
 
@@ -148,14 +242,26 @@ BITBLAS_INSTALL_HINT = (
     f"Please install via `pip install bitblas>={MINIMUM_BITBLAS_VERSION}`."
 )
 
+BITBLAS_ROCM_UNSUPPORTED = (
+    "BitBLAS (BACKEND.GPTQ_BITBLAS / AWQ_BITBLAS) is CUDA-only: it emits "
+    "NVIDIA TensorCore code and has no ROCm backend. Use BACKEND.GPTQ_TORCH / "
+    "AWQ_GEMM_TRITON (or AUTO) on ROCm."
+)
+
 
 def import_bitblas():
     global BITBLAS_DATABASE_PATH, BITBLAS_TARGET
 
     import bitblas
 
-    parsed_version = version.parse(bitblas.__version__)
-    minimum_version = version.parse(MINIMUM_BITBLAS_VERSION)
+    # ``getattr`` + ``try`` keep a build with a missing or unparsable
+    # ``__version__`` on the documented ``ImportError`` path instead of letting
+    # ``AttributeError`` escape the kernel constructor.
+    try:
+        parsed_version = version.parse(getattr(bitblas, "__version__", ""))
+        minimum_version = version.parse(MINIMUM_BITBLAS_VERSION)
+    except Exception as exc:
+        raise ImportError(BITBLAS_INSTALL_HINT) from exc
     if parsed_version < minimum_version:
         raise ImportError(BITBLAS_INSTALL_HINT)
 
@@ -258,16 +364,25 @@ def _normalize_bitblas_target(target):
 def unpack_gptq_qzeros(qzeros: torch.Tensor, bits: int, is_gptq_v2: bool = False) -> torch.Tensor:
     qzeros = qzeros.view(torch.int32)
     elems_per_int32 = 32 // bits
+    # int8 holds 0..15 with room to spare but cannot represent an 8-bit zero
+    # point above 127: 200 wraps to -56, and the caller then subtracts one and
+    # hands it to BitBLAS as a negative offset.
+    unpacked_dtype = torch.int16 if bits > 7 else torch.int8
     unpacked_zeros = torch.zeros(
         (qzeros.shape[0], qzeros.shape[1] * elems_per_int32),
-        dtype=torch.int8,
+        dtype=unpacked_dtype,
         device=qzeros.device,
         requires_grad=False,
     )
 
+    # Mask with the full field width. A hardcoded 0xF is only correct at
+    # bits == 4: at 8 bits it drops the high nibble (127 unpacks as 15), and at
+    # 2 bits it keeps two bits of the neighbouring field (0,1,2,3 unpacks as
+    # 4,9,14,3). Both are silent - the result is still a small integer.
+    mask = (1 << bits) - 1
     for col in range(unpacked_zeros.shape[1]):
         i = col % elems_per_int32
-        unpacked_zeros[:, col] = (qzeros[:, col // elems_per_int32] >> (bits * i)) & 0xF
+        unpacked_zeros[:, col] = (qzeros[:, col // elems_per_int32] >> (bits * i)) & mask
 
     if not is_gptq_v2:
         return unpacked_zeros + 1
@@ -367,6 +482,19 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
     OPT_FEATURES = BITBLAS_OPTIMIZE_FEATURES
     TORCH_DTYPE = torch.float16
 
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        """Dtype the BitBLAS operator is built with (see `_resolve_compute_dtype`)."""
+        return getattr(self, "_compute_dtype", self.TORCH_DTYPE)
+
+    @classmethod
+    def _resolve_compute_dtype(cls, dtype: torch.dtype) -> torch.dtype:
+        # The installed BitBLAS build cannot compile bf16 low-bit dequant kernels, so bf16
+        # modules run the operator in fp16 and cast at the module boundary. See the module header.
+        if dtype == torch.bfloat16:
+            return BITBLAS_BF16_COMPUTE_DTYPE
+        return dtype
+
     def _build_quant_config(
         self,
         *,
@@ -440,16 +568,23 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
 
         del fast_decoding  # unused, kept for signature compatibility
 
-        if not BITBLAS_AVAILABLE:
+        if not bitblas_available():
             raise ImportError(BITBLAS_INSTALL_HINT)
 
         self.TORCH_DTYPE = dtype
+        self._compute_dtype = self._resolve_compute_dtype(dtype)
+        if self._compute_dtype != dtype:
+            log.warn.once(
+                f"BitBLAS: the installed BitBLAS build cannot compile `{dtype}` low-bit dequant "
+                f"kernels; running `{self.__class__.__name__}` in `{self._compute_dtype}` and "
+                "casting activations/outputs back to the requested dtype."
+            )
         self.quant_config = self._build_quant_config(
             bits=bits,
             group_size=group_size,
             desc_act=desc_act,
             sym=sym,
-            dtype=dtype,
+            dtype=self._compute_dtype,
         )
         self.enable_tuning = enable_tuning
         self.layout = layout
@@ -462,7 +597,7 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
         self._configure_bitblas_matmul(
             in_features,
             out_features,
-            self.TORCH_DTYPE,
+            self.compute_dtype,
             enable_tuning,
             False,
             layout,
@@ -472,7 +607,11 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
 
     @classmethod
     def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
-        if not BITBLAS_AVAILABLE:
+        # BitBLAS compiles TensorCore IR for NVIDIA targets; there is no ROCm
+        # backend, so report that instead of a misleading "not installed" hint.
+        if IS_ROCM:
+            return False, NotImplementedError(BITBLAS_ROCM_UNSUPPORTED)
+        if not bitblas_available():
             return False, ValueError(BITBLAS_INSTALL_HINT)
 
         try:
@@ -545,6 +684,7 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
     def _initialize_buffers(self, in_features: int, out_features: int, bias: bool) -> None:
         num_groups = _num_groups(self.group_size, in_features)
         storage_dtype = self.quant_config.torch_storage_dtype
+        compute_dtype = self.compute_dtype
 
         weight_shape = self.bitblas_matmul.retrieve_weight_shape()
         self.register_buffer(
@@ -553,7 +693,7 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
         )
         self.register_buffer(
             "scales",
-            torch.empty((out_features, num_groups), dtype=self.TORCH_DTYPE),
+            torch.empty((out_features, num_groups), dtype=compute_dtype),
         )
 
         if self.quant_config.with_zeros:
@@ -569,7 +709,7 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
             self.register_buffer("qzeros", torch.empty(0, dtype=storage_dtype))
 
         if bias:
-            self.register_buffer("bias", torch.zeros((out_features,), dtype=self.TORCH_DTYPE))
+            self.register_buffer("bias", torch.zeros((out_features,), dtype=compute_dtype))
         else:
             self.bias = None
 
@@ -708,11 +848,11 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
         device = self._buffer_device()
 
         self._buffers["qweight"] = self._transform_bitblas_weight(intweight_out_in, device)
-        self._buffers["scales"] = scales_out_group.to(device=device, dtype=self.TORCH_DTYPE).contiguous()
+        self._buffers["scales"] = scales_out_group.to(device=device, dtype=self.compute_dtype).contiguous()
         self._buffers["qzeros"] = self._compress_bitblas_zeros(intzeros_group_out, device)
 
         if self.bias is not None and bias is not None:
-            self._buffers["bias"] = bias.detach().to(device=device, dtype=self.TORCH_DTYPE)
+            self._buffers["bias"] = bias.detach().to(device=device, dtype=self.compute_dtype)
 
         self.zeros = self.qzeros
 
@@ -723,11 +863,15 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
 
         orig_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
+        if x_2d.dtype != self.compute_dtype:
+            # The operator runs in fp16 when bf16 compute is unavailable (see module header);
+            # keep `x` itself in the module dtype for adapters.
+            x_2d = x_2d.to(self.compute_dtype)
 
         args = [x_2d, self.qweight, self.scales]
         if self.quant_config.with_zeros:
             args.append(self.qzeros)
-        out_2d = self.bitblas_matmul(*args)
+        out_2d = self._invoke_bitblas_matmul(args)
 
         if self.bias is not None:
             out_2d = out_2d + self.bias
@@ -741,6 +885,18 @@ class BitblasBaseQuantLinear(GroupedQuantLinear):
             out = out.to(dtype=input_dtype)
 
         return out
+
+    def _invoke_bitblas_matmul(self, args: List[torch.Tensor]) -> torch.Tensor:
+        # BitBLAS launches its prebuilt CUDA library through ctypes, so the kernel executes in the
+        # CUDA context that is current for this thread. GPT-QModel's default layer-wise device map
+        # spreads the model over every visible GPU; without entering the module's device context,
+        # layers on `cuda:1+` would launch in GPU 0's context while holding pointers to another
+        # GPU's buffers and raise `CUDA error: an illegal memory access was encountered`.
+        device = self.scales.device
+        if device.type == "cuda" and torch.cuda.current_device() != device.index:
+            with torch.cuda.device(device):
+                return self.bitblas_matmul(*args)
+        return self.bitblas_matmul(*args)
 
 
 # BitBLAS repacks incoming GPTQ/AWQ tensors into its own operator layout, so the
@@ -770,41 +926,6 @@ class BitblasLinear(BitblasBaseQuantLinear):
     QUANT_TYPE = "gptq_bitblas"
     SUPPORTS_METHODS = [METHOD.GPTQ]
 
-    @classmethod
-    def _bf16_signed_weight_error(cls, bits: int, layer: Optional[str] = None) -> NotImplementedError:
-        location = f" for layer pattern `{layer}`" if layer is not None else ""
-        return NotImplementedError(
-            f"{cls.__name__} does not support `torch.bfloat16` with symmetric `{bits}`-bit GPTQ weights{location}. "
-            "This is blocked by an upstream BitBLAS CUDA codegen failure for signed low-bit dequantization. "
-            "Use `torch.float16`, asymmetric GPTQ/unsigned weights, or a different backend."
-        )
-
-    @classmethod
-    def _validate_kernel_combo(
-        cls,
-        *,
-        bits: int,
-        sym: bool,
-        dtype: Optional[torch.dtype],
-        dynamic: Optional[dict] = None,
-    ) -> Tuple[bool, Optional[Exception]]:
-        if dtype != torch.bfloat16:
-            return True, None
-
-        if sym and bits in BITBLAS_BF16_UNSUPPORTED_SIGNED_BITS:
-            return False, cls._bf16_signed_weight_error(bits)
-
-        if dynamic is None:
-            return True, None
-
-        for layer, overrides in dynamic.items():
-            layer_bits = overrides.get("bits", bits)
-            layer_sym = overrides.get("sym", sym)
-            if layer_sym and layer_bits in BITBLAS_BF16_UNSUPPORTED_SIGNED_BITS:
-                return False, cls._bf16_signed_weight_error(layer_bits, layer=layer)
-
-        return True, None
-
     def repack_from_gptq(self, gptq_module: BaseQuantLinear) -> None:
         bits = self.bits
         packed_weight = (
@@ -817,7 +938,19 @@ class BitblasLinear(BitblasBaseQuantLinear):
         intzeros = None
         if self.quant_config.with_zeros and hasattr(gptq_module, "qzeros") and gptq_module.qzeros is not None:
             intzeros = unpack_gptq_qzeros(gptq_module.qzeros.detach(), bits).contiguous()
-            intzeros = intzeros - 1  # GPTQ stores qzeros offset by +1
+            # A v2-requiring source in the v1 checkpoint domain stores zp-1
+            # fields; shift them back to logical zero points first. Non-v2
+            # sources already carry logical values regardless of the flag.
+            if (
+                getattr(type(gptq_module), "REQUIRES_FORMAT_V2", False)
+                and getattr(gptq_module, "qzero_format", lambda: 2)() == 1
+            ):
+                intzeros = (intzeros + 1) & ((1 << bits) - 1)
+            # Remove the unpacker's +1 and keep each code in its unsigned
+            # field. The v1 correction above wraps a maximum zero point to
+            # zero; subtracting one then leaves -1, whose sign bits would
+            # overwrite neighboring fields in BitBLAS's OR-based compressor.
+            intzeros = (intzeros - 1) & ((1 << bits) - 1)
 
         bias = gptq_module.bias.detach() if self.bias is not None and getattr(gptq_module, "bias", None) is not None else None
         self._load_bitblas_quant_state(

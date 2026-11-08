@@ -25,6 +25,7 @@ from ..utils.looper_helpers import (
 from ..utils.model import move_to, nested_move_to
 from ..utils.torch import torch_sync
 
+
 if TYPE_CHECKING:  # pragma: no cover - imports for typing only
     from logbar.progress import ProgressBar
 
@@ -87,6 +88,23 @@ class ForwardExecutor:
     def _finish_outputs(collection):
         finalize = getattr(collection, "finalize", None)
         return finalize() if callable(finalize) else collection
+
+    def _filter_forward_devices(self, devices: List[torch.device]) -> List[torch.device]:
+        """Apply `compute_device_filter` to the forward device pool, preserving order."""
+
+        quant_config = getattr(self.looper.gptq_model, "quantize_config", None)
+        compute_device_filter = getattr(quant_config, "compute_device_filter", None)
+        if compute_device_filter is None:
+            return list(devices)
+
+        filtered = compute_device_filter(devices)
+        if len(filtered) < 1:
+            self.log.warn(
+                "compute_device_filter returned empty device list. "
+                "Using all devices for forward execution."
+            )
+            return list(devices)
+        return list(filtered)
 
     def _resolve_batch_progress(
         self,
@@ -206,6 +224,11 @@ class ForwardExecutor:
             )
 
         devices = select_forward_devices_fn(cur_layer_device)
+        # Apply `compute_device_filter` before staging replicas. Filtering only in
+        # `run_parallel` leaves a full copy of the module on every excluded GPU,
+        # which both defeats the caller's device restriction and can OOM the
+        # device it was meant to avoid.
+        devices = self._filter_forward_devices(devices)
         if len(devices) <= 1:
             return self.run_single(
                 module=module,
@@ -597,16 +620,7 @@ class ForwardExecutor:
             input_devices: Dict[int, torch.device] = {}
             processed_rows = 0
 
-            if self.looper.gptq_model.quantize_config.compute_device_filter is not None:
-                forward_devices = self.looper.gptq_model.quantize_config.compute_device_filter(devices)
-                if len(forward_devices) < 1:
-                    self.log.warn(
-                        "compute_device_filter returned empty device list. "
-                        "Using all devices for forward execution."
-                    )
-                    forward_devices = devices
-            else:
-                forward_devices = devices
+            forward_devices = self._filter_forward_devices(devices)
 
             device_segments: Dict[torch.device, List[int]] = {}
             segment_start = 0
@@ -771,7 +785,12 @@ class ForwardExecutor:
         for idx in range(total_batches):
             primary = results.get(idx)
             if primary is None:
-                raise RuntimeError("Forward batch returned no output; data-parallel execution produced empty result.")
+                # `StopForward` (MoE early-stop) is a normal outcome and yields no
+                # output; `run_single` already tolerates it by skipping the batch.
+                # Mirror that contract instead of failing the whole data-parallel
+                # forward, otherwise multi-device quantization crashes as soon as
+                # an early-stopping subset is reached.
+                continue
             ordered_outputs.append([primary])
 
         return ordered_outputs

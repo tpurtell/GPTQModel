@@ -57,6 +57,7 @@ class AwqGemmTritonFn(torch.autograd.Function):
     ):
         # Only quantized weights and input metadata are needed for the
         # input-gradient backward; input and bias values are not retained.
+        qweight, qzeros, scales = qweight.contiguous(), qzeros.contiguous(), scales.contiguous()
         ctx.save_for_backward(qweight, qzeros, scales)
         ctx.input_shape = tuple(x.shape)
         ctx.out_features = out_features
@@ -172,8 +173,7 @@ class AwqGEMMTritonLinear(AWQuantLinear):
     SUPPORTS_IN_FEATURES_DIVISIBLE_BY = [32]
     SUPPORTS_OUT_FEATURES_DIVISIBLE_BY = [8]
 
-    # TODO: ROCM also has Triton support. Need to validate ROCM for triton
-    SUPPORTS_DEVICES = [DEVICE.CUDA]
+    SUPPORTS_DEVICES = [DEVICE.CUDA, DEVICE.ROCM]
     SUPPORTS_PLATFORM = [PLATFORM.LINUX, PLATFORM.WIN32]
     SUPPORTS_PACK_DTYPES = [torch.int32]
     SUPPORTS_ADAPTERS = [Lora]

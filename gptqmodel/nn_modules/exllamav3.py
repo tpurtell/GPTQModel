@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 import torch
 import torch.nn as nn
 
+from ..models._const import DEVICE, normalize_device
+
 
 if TYPE_CHECKING:
     from ..exllamav3.modules.quant.exl3 import LinearEXL3
@@ -32,6 +34,14 @@ def _torch_dtype(value: Any) -> torch.dtype:
 class ExllamaV3Linear(nn.Module):
     QUANT_TYPE = "exl3"
     SUPPORTS_SHARDS = True
+    SUPPORTS_DEVICES = [DEVICE.CUDA]
+
+    @classmethod
+    def validate_device(cls, device) -> None:
+        if normalize_device(device) not in cls.SUPPORTS_DEVICES:
+            raise NotImplementedError(
+                "EXL3_EXLLAMA_V3 inference requires NVIDIA CUDA; use EXL3_TORCH on ROCm or CPU."
+            )
 
     def __init__(
         self,
@@ -130,16 +140,31 @@ class ExllamaV3Linear(nn.Module):
                 raise ValueError(f"EXL3 module `{self.name}` has invalid {suffix} geometry")
         return inputs, outputs
 
-    def _ensure_inner(self) -> "LinearEXL3":
-        from ..exllamav3.modules.quant.exl3 import LinearEXL3
+    def _coerce_buffer_dtypes(self) -> None:
+        """Restore the dtypes the EXL3 kernels require after a model-wide cast.
 
+        ``nn.Module._apply`` converts every floating-point buffer to the target
+        model dtype, so loading a bf16 checkpoint turns the unpacked sign vectors
+        ``suh``/``svh`` into bf16. ``LinearEXL3`` asserts they are ``torch.half``
+        because the Hadamard kernels are typed for fp16, which made a bf16 load
+        fail with ``AssertionError: suh is wrong datatype``. The packed ``su``/``sv``
+        are int16 and are untouched by the cast.
+        """
+        for buffer_name in ("suh", "svh"):
+            tensor = getattr(self, buffer_name, None)
+            if tensor is not None and tensor.is_floating_point() and tensor.dtype != torch.half:
+                setattr(self, buffer_name, tensor.half())
+
+    def _ensure_inner(self) -> "LinearEXL3":
         trellis = getattr(self, "trellis", None)
         if trellis is None:
             raise RuntimeError(f"EXL3 module `{self.name}` is missing `trellis`.")
         if trellis.device.type == "meta":
             raise RuntimeError(f"EXL3 module `{self.name}` has not been materialized from checkpoint tensors yet.")
-        if trellis.device.type != "cuda":
-            raise RuntimeError("EXL3 inference requires CUDA/HIP tensors.")
+        self.validate_device(trellis.device)
+        self._coerce_buffer_dtypes()
+
+        from ..exllamav3.modules.quant.exl3 import LinearEXL3
 
         signature = self._current_signature()
         if self._inner is not None and signature == self._inner_signature:
@@ -174,12 +199,15 @@ class ExllamaV3Linear(nn.Module):
 
     def post_init(self) -> None:
         self._drop_inner()
+        self._coerce_buffer_dtypes()
         if getattr(self, "trellis", None) is not None and self.trellis.device.type != "meta":
             self._ensure_inner()
 
     def _apply(self, fn, recurse=True):
         self._drop_inner()
-        return super()._apply(fn, recurse=recurse)
+        result = super()._apply(fn, recurse=recurse)
+        self._coerce_buffer_dtypes()
+        return result
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         inner = self._ensure_inner()

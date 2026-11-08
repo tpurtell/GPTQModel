@@ -687,6 +687,11 @@ def apply_gptq_marlin_linear(
         use_atomics: bool = False,
 
 ) -> torch.Tensor:
+    # Source projections can be column views into fused packed storage.
+    # Materialize only for this separate call; never retain the copies.
+    weight = weight.contiguous()
+    weight_scale = weight_scale.contiguous()
+    weight_zp = weight_zp.contiguous()
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (output_size_per_partition,)
 
@@ -771,10 +776,13 @@ def apply_awq_marlin_linear(
         input_size_per_partition: int,
         bias: Optional[torch.Tensor] = None,
         use_fp32_reduce: bool = True) -> torch.Tensor:
+    weight = weight.contiguous()
+    weight_scale = weight_scale.contiguous()
+    weight_zp = weight_zp.contiguous()
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (output_size_per_partition,)
 
-    use_atomic_add = should_use_atomic_add_reduce(m=reshaped_x.size(0),
+    use_atomic_add = not use_fp32_reduce and should_use_atomic_add_reduce(m=reshaped_x.size(0),
                                                   n=output_size_per_partition,
                                                   k=reshaped_x.size(1),
                                                   device=input.device,

@@ -11,7 +11,6 @@ import tempfile
 import unittest
 
 import torch
-
 from datasets import load_dataset
 from models.model_test import ModelTest
 from parameterized import parameterized
@@ -61,6 +60,7 @@ class TestGroupSize(unittest.TestCase):
         quantize_config = QuantizeConfig(
             bits=4,
             group_size=group_size,
+            desc_act=False,
             quant_method=METHOD.QQQ,
             format=FORMAT.QQQ,
         )

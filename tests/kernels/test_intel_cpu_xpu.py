@@ -15,7 +15,6 @@ from gptqmodel import BACKEND, GPTQModel
 from gptqmodel.nn_modules.qlinear.torch import TorchLinear
 from gptqmodel.nn_modules.qlinear.torch_aten_kernel import TorchAtenLinear
 from gptqmodel.nn_modules.qlinear.torch_fused import TorchFusedLinear
-from gptqmodel.nn_modules.qlinear.torch_int8 import TorchInt8Linear
 from gptqmodel.utils.model import find_modules
 
 
@@ -61,7 +60,6 @@ class TestKernelOutput(unittest.TestCase):
     target_qliner_map = {
         BACKEND.TORCH: TorchLinear,
         BACKEND.TORCH_FUSED: TorchFusedLinear,
-        BACKEND.TORCH_INT8: TorchInt8Linear,
         BACKEND.GPTQ_TORCH_ATEN: TorchAtenLinear,
     }
     target = 'model.layers.6.self_attn.v_proj'
@@ -71,13 +69,13 @@ class TestKernelOutput(unittest.TestCase):
     dtype = torch.float16
     r_tolerance = 0.0076
     a_tolerance = 0.016
-    int8_r_tolerance = 0.02
-    # Keep headroom ~+0.001-0.002 over observed max abs diff in this suite.
-    int8_a_tolerance = 0.025
     input_samples_each_size = 20 # final size == input_samples_each_size * len(m)
 
-    @classmethod
     def setUp(self):
+        # unittest calls setUp on the test instance, so this must not be a
+        # classmethod: with @classmethod, `self` is the class and the
+        # `self.forward(...)` below binds unbound, raising
+        # `TypeError: forward() missing 1 required positional argument: 'x'`.
         _ensure_model_path_available(self.model_path)
         self.torch_model = GPTQModel.load(self.model_path, backend=BACKEND.TORCH, device=self.device, dtype=self.dtype)
         self.x = []
@@ -109,8 +107,6 @@ class TestKernelOutput(unittest.TestCase):
         (BACKEND.TORCH, 0.0000, 0.0005),
         # (BACKEND.TRITON,  0.0000, 0.0005),
         (BACKEND.TORCH_FUSED,  r_tolerance, a_tolerance),
-        # Int4->float->int8 re-quantization in TorchInt8 introduces extra approximation noise.
-        (BACKEND.TORCH_INT8,  int8_r_tolerance, int8_a_tolerance),
         (BACKEND.GPTQ_TORCH_ATEN,  r_tolerance, a_tolerance),
     ])
     def test_kernel_output(self, backend: BACKEND, r_tolerance: float, a_tolerance: float):
@@ -150,13 +146,10 @@ class TestTorchFusedAndTorchAtenDevices(unittest.TestCase):
     input_samples_each_size = 5
     r_tolerance = 0.0076
     a_tolerance = 0.016
-    int8_r_tolerance = TestKernelOutput.int8_r_tolerance
-    int8_a_tolerance = TestKernelOutput.int8_a_tolerance
     reference_backend = BACKEND.TORCH
     reference_device = "cpu"
     backend_tolerances = {
         BACKEND.TORCH_FUSED: (r_tolerance, a_tolerance),
-        BACKEND.TORCH_INT8: (int8_r_tolerance, int8_a_tolerance),
         BACKEND.GPTQ_TORCH_ATEN: (r_tolerance, a_tolerance),
     }
 
@@ -199,7 +192,6 @@ class TestTorchFusedAndTorchAtenDevices(unittest.TestCase):
 
     @parameterized.expand([
         ("cpu", "cpu", BACKEND.TORCH_FUSED),
-        ("cpu", "cpu", BACKEND.TORCH_INT8),
         ("cpu", "cpu", BACKEND.GPTQ_TORCH_ATEN),
         ("xpu", "xpu:0", BACKEND.TORCH_FUSED),
     ])

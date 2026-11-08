@@ -11,8 +11,13 @@
 #define NUM_THREADS 1024
 #define H_INF __ushort_as_half(0x7c00)
 #define H_NINF __ushort_as_half(0xfc00)
+// fp32 +inf for the trellis inner-loop arithmetic. Scalar fp16 arithmetic is
+// emulated (cvt/add/cvt) on AMD GPUs, so the cost/error accumulation runs in
+// fp32 there while the stored costs stay half to keep the shared-memory
+// footprint and layout unchanged.
+#define H_INF_F __int_as_float(0x7f800000)
 
-template <int K, int cb>
+template <int K, int cb, bool compact = false>
 __global__ __launch_bounds__(MIN(NUM_THREADS, 65536 >> K))
 void quantize_tiles_kernel
 (
@@ -38,11 +43,15 @@ void quantize_tiles_kernel
     uint16_t* output_indices = output_indices_ptr + 256 * tile_idx;
     uint16_t* temp_edges = temp_edges_ptr + 256 * edges * tile_idx;
 
-    // Tile buffer
-    half* sh_input_tile = (half*) sh; sh += 256 * sizeof(half);
-
-    half* sh_min = (half*) sh; sh += 32 * sizeof(half);
-    int* sh_idx = (int*) sh; sh += 32 * sizeof(int);
+    // On 64 KiB devices the K=2 cost buffers fill LDS exactly. Read the tiny
+    // input tile through the cache and reuse the dead cost buffer for reduction
+    // scratch after the forward pass, keeping all DP costs in LDS.
+    static_assert(!compact || K == 2);
+    half* sh_input_tile = (half*) sh;
+    if constexpr (!compact) sh += 256 * sizeof(half);
+    half* sh_min = (half*) sh;
+    int* sh_idx = (int*) (sh + 32 * sizeof(half));
+    if constexpr (!compact) sh += 32 * (sizeof(half) + sizeof(int));
 
     // K >= mshk lets temp_costs fit in shmem, otherwise fall back to global temp buffer
     constexpr int mshk = 2;
@@ -51,43 +60,81 @@ void quantize_tiles_kernel
     half* temp_costs_inc = temp_costs + edges;
 
     // Fetch input tile to shmem
-    if (thread < 256) sh_input_tile[thread] = __float2half_rn(input_tile[thread]);
+    if constexpr (!compact)
+        if (thread < 256) sh_input_tile[thread] = __float2half_rn(input_tile[thread]);
     __syncthreads();
+
+    auto input_at = [&](int ri) -> float
+    {
+        if constexpr (compact) return __half2float(__float2half_rn(input_tile[ri]));
+        else return __half2float(sh_input_tile[ri]);
+    };
+
+    // Codebook decode cache. decode_3inst(state) is a pure function of the 16-bit
+    // state, and this thread revisits exactly the same n_oe * max_q states at every
+    // one of the 256 trellis positions (and again on the tail-biting second pass),
+    // so decoding once per tile instead of once per DP step drops ~5 ALU ops from
+    // the innermost loop. The table is 65536 / NUM_THREADS halfs, i.e. 32 packed
+    // VGPRs at NUM_THREADS = 1024, so it is only materialized for K <= 6 where the
+    // whole state space is 65536. K = 7/8 have one out-edge per thread and would
+    // need 128/256 halfs, so they keep decoding inline.
+    constexpr bool dec_cache = (K <= 6);
+    constexpr int n_oe = (edges + NUM_THREADS - 1) / NUM_THREADS;
+    [[maybe_unused]] half dec_tab[dec_cache ? (n_oe * max_q) : 1];
+    if constexpr (dec_cache)
+    {
+        #pragma unroll
+        for (int j = 0; j < n_oe; ++j)
+        {
+            #pragma unroll
+            for (int k = 0; k < max_q; ++k)
+                dec_tab[j * max_q + k] = decode_3inst<cb>((k << Kr) | (thread + j * NUM_THREADS));
+        }
+    }
+
+    // Decoded codebook value for this thread's j-th out-edge and k-th state slot.
+    // All indices are compile-time constants after unrolling, so dec_tab stays in
+    // registers.
+    auto dec_at = [&](int j, int k, int out_edge_idx) -> float
+    {
+        if constexpr (dec_cache) return __half2float(dec_tab[j * max_q + k]);
+        else return __half2float(decode_3inst<cb>((k << Kr) | out_edge_idx));
+    };
 
     auto forward = [&](int roll, int pre_state)
     {
         int ri = roll % 256;
-        half dh, err, min_err, w;
 
         // temp_costs_inc[z] is the cost/cumulative error of an incoming edge from state (z & edge_mask)
         half* t = temp_costs;
         temp_costs = temp_costs_inc;
         temp_costs_inc = t;
 
-        for (int out_edge_idx = thread; out_edge_idx < edges; out_edge_idx += NUM_THREADS)
-        {
-            w = sh_input_tile[ri];
+        const float wf = input_at(ri);
+        const bool constrain = pre_state >= 0;
 
-            int state = out_edge_idx;
-            int in_edge_idx = state >> K;
-            dh = __hsub(decode_3inst<cb>(state), w);
-            err = __hmul(dh, dh);
-            if (pre_state >= 0 && in_edge_idx != pre_state) err = H_INF;
-            min_err = err;
+        #pragma unroll
+        for (int j = 0; j < n_oe; ++j)
+        {
+            int out_edge_idx = thread + j * NUM_THREADS;
+            int in_edge_idx = out_edge_idx >> K;
+            float dh = dec_at(j, 0, out_edge_idx) - wf;
+            float err = dh * dh;
+            if (constrain && in_edge_idx != pre_state) err = H_INF_F;
+            float min_err = err;
             int min_in_edge = in_edge_idx;
 
             #pragma unroll
             for (int k = 1; k < max_q; ++k)
             {
-                state = (k << Kr) | out_edge_idx;
-                in_edge_idx = state >> K;
-                dh = __hsub(decode_3inst<cb>(state), w);
-                err = __hmul(dh, dh);
-                if (pre_state >= 0 && in_edge_idx != pre_state) err = H_INF;
-                if (__hlt(err, min_err)) { min_err = err; min_in_edge = in_edge_idx; }
+                in_edge_idx = ((k << Kr) | out_edge_idx) >> K;
+                dh = dec_at(j, k, out_edge_idx) - wf;
+                err = dh * dh;
+                if (constrain && in_edge_idx != pre_state) err = H_INF_F;
+                if (err < min_err) { min_err = err; min_in_edge = in_edge_idx; }
             }
 
-            temp_costs[out_edge_idx] = min_err;
+            temp_costs[out_edge_idx] = __float2half(min_err);
             temp_edges[edges * ri + out_edge_idx] = (uint16_t) min_in_edge;
         }
 
@@ -104,28 +151,27 @@ void quantize_tiles_kernel
             temp_costs = temp_costs_inc;
             temp_costs_inc = t;
 
-            for (int out_edge_idx = thread; out_edge_idx < edges; out_edge_idx += NUM_THREADS)
-            {
-                w = sh_input_tile[ri];
+            const float wf = input_at(ri);
 
-                int state = out_edge_idx;
-                int in_edge_idx = state >> K;
-                dh = __hsub(decode_3inst<cb>(state), w);
-                err = __hfma(dh, dh, temp_costs_inc[in_edge_idx]);
-                min_err = err;
+            #pragma unroll
+            for (int j = 0; j < n_oe; ++j)
+            {
+                int out_edge_idx = thread + j * NUM_THREADS;
+                int in_edge_idx = out_edge_idx >> K;
+                float dh = dec_at(j, 0, out_edge_idx) - wf;
+                float min_err = fmaf(dh, dh, __half2float(temp_costs_inc[in_edge_idx]));
                 int min_in_edge = in_edge_idx;
 
                 #pragma unroll
                 for (int k = 1; k < max_q; ++k)
                 {
-                    state = (k << Kr) | out_edge_idx;
-                    in_edge_idx = state >> K;
-                    dh = __hsub(decode_3inst<cb>(state), w);
-                    err = __hfma(dh, dh, temp_costs_inc[in_edge_idx]);
-                    if (__hlt(err, min_err)) { min_err = err; min_in_edge = in_edge_idx; }
+                    in_edge_idx = ((k << Kr) | out_edge_idx) >> K;
+                    dh = dec_at(j, k, out_edge_idx) - wf;
+                    float err = fmaf(dh, dh, __half2float(temp_costs_inc[in_edge_idx]));
+                    if (err < min_err) { min_err = err; min_in_edge = in_edge_idx; }
                 }
 
-                temp_costs[out_edge_idx] = min_err;
+                temp_costs[out_edge_idx] = __float2half(min_err);
                 temp_edges[edges * ri + out_edge_idx] = (uint16_t) min_in_edge;
             }
 
@@ -154,8 +200,10 @@ void quantize_tiles_kernel
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
         {
-            half other_min = __shfl_down_sync(0xffffffff, local_min, offset, 32);
-            int other_idx = __shfl_down_sync(0xffffffff, local_idx, offset, 32);
+            // HIP requires a 64-bit shuffle mask; CUDA wants the 32-bit
+            // active-lane mask. __activemask() has the right width on both.
+            half other_min = __shfl_down_sync(__activemask(), local_min, offset, 32);
+            int other_idx = __shfl_down_sync(__activemask(), local_idx, offset, 32);
             if (__hlt(other_min, local_min))
             {
                 local_min = other_min;
@@ -163,8 +211,11 @@ void quantize_tiles_kernel
             }
         }
 
-        sh_min[warp_id] = local_min;
-        sh_idx[warp_id] = local_idx;
+        if (lane_id == 0)
+        {
+            sh_min[warp_id] = local_min;
+            sh_idx[warp_id] = local_idx;
+        }
         __syncthreads();
 
         if (warp_id == 0)
@@ -175,8 +226,8 @@ void quantize_tiles_kernel
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1)
             {
-                half other_min = __shfl_down_sync(0xffffffff, local_min, offset, 32);
-                int other_idx = __shfl_down_sync(0xffffffff, local_idx, offset, 32);
+                half other_min = __shfl_down_sync(__activemask(), local_min, offset, 32);
+                int other_idx = __shfl_down_sync(__activemask(), local_idx, offset, 32);
                 if (__hlt(other_min, local_min))
                 {
                     local_min = other_min;
@@ -216,6 +267,9 @@ void quantize_tiles_kernel
         if (thread == 0) sh_idx[0] = edge;
         __syncthreads();
         edge = sh_idx[0];
+        // The next forward pass overwrites the aliased reduction scratch.
+        // Every thread must finish reading the broadcast before that happens.
+        if constexpr (compact) __syncthreads();
 
         return edge;
     };
@@ -238,6 +292,13 @@ constexpr auto quantize_tiles_kernel_instances = std::array
     __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
 };
 #undef __
+
+constexpr auto quantize_tiles_compact_instances = std::array
+{
+    quantize_tiles_kernel<2, 0, true>,
+    quantize_tiles_kernel<2, 1, true>,
+    quantize_tiles_kernel<2, 2, true>
+};
 
 /*
 Quantize batch of tiles
@@ -297,6 +358,56 @@ void quantize_tiles
     if (mcg) cb = 1;
     if (mul1) cb = 2;
 
+    // Largest dynamic shared-memory request the current device can satisfy.
+    //
+    // Read the device property directly instead of going through
+    // ``cudaDevAttrMaxSharedMemoryPerBlockOptin``: torch's hipify table maps
+    // that attribute onto ``hipDeviceAttributeMaxSharedMemoryPerBlock``, the
+    // *non*-opt-in limit, which is a flat 64 KiB on every AMD part. On CDNA4
+    // (gfx950, 160 KiB) and CDNA5 (gfx1250, 320 KiB) that would reject a 2-bit
+    // codebook the device can actually host.
+    int max_shmem = 0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+    cudaDeviceProp device_props;
+    cudaGetDeviceProperties(&device_props, device);
+    max_shmem = (int) device_props.sharedMemPerBlockOptin;
+#else
+    cudaDeviceGetAttribute
+    (
+        &max_shmem,
+        cudaDevAttrMaxSharedMemoryPerBlockOptin,
+        device
+    );
+#endif
+    TORCH_CHECK(max_shmem > 0, "EXL3 quantize_tiles could not query the device shared-memory limit.");
+
+    // Resolve the kernel and its LDS layout once for all workspace batches.
+    const int kernel_idx = K - 1 + 8 * cb;
+    const bool compact = K == 2 && max_shmem >= 65536 && max_shmem < 66240;
+    const int shmem = 2 * (65536 >> K) * sizeof(half) + (compact ? 0 : 704);
+    auto quantize_tiles_kernel = compact ? quantize_tiles_compact_instances[cb]
+                                        : quantize_tiles_kernel_instances[kernel_idx];
+
+    // Reject unsupported configurations before the runtime can abort the process.
+    TORCH_CHECK
+    (
+        shmem <= max_shmem,
+        "EXL3 quantize_tiles needs ", shmem, " B of dynamic shared memory "
+        "for K=", K, ", but this device allows at most ", max_shmem,
+        " B per block. Use bits >= 3 for this codebook on this GPU."
+    );
+
+    cudaFuncSetAttribute
+    (
+        // HIP only provides hipFuncSetAttribute(const void*, ...); the CUDA
+        // template overload that accepts a function pointer directly has no
+        // HIP equivalent. Casting keeps one spelling valid for both runtimes.
+        (const void*) quantize_tiles_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem
+    );
+    cuda_check(cudaPeekAtLastError());
+
     int batch_i = 0;
     do
     {
@@ -309,18 +420,10 @@ void quantize_tiles
         uint16_t* temp_edges_ptr = (uint16_t*) temp_edges.data_ptr();
 
         int bsz = batch_j - batch_i;
-        int kernel_idx = K - 1 + 8 * cb;
-        int shmem = 2 * (65536 >> K) * sizeof(half) + 512 + 64 + 128;
 
-        cudaFuncSetAttribute
-        (
-            quantize_tiles_kernel_instances[kernel_idx],
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shmem
-        );
-        cuda_check(cudaPeekAtLastError());
-
-        quantize_tiles_kernel_instances[kernel_idx]<<<bsz, threads, shmem, stream>>>
+        // See pack.cu: an indexed instantiation is mis-parsed by HIPify, so bind it
+        // to a local identifier before the launch.
+        quantize_tiles_kernel<<<bsz, threads, shmem, stream>>>
         (
             input_tiles_ptr,
             output_tiles_ptr,

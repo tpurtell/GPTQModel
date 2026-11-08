@@ -21,9 +21,12 @@ from ...quantization.config import (
     _normalize_bitsandbytes_format,
 )
 from ...utils.backend import BACKEND
+from ...utils.cpu_features import cpu_bf16x3_matmul, has_avx512_bf16
+from ...utils.env import env_flag
 from ...utils.logger import setup_logger
 from . import WeightOnlyQuantLinear
 from .gguf import _apply_optional_smoother
+
 
 log = setup_logger()
 
@@ -43,24 +46,152 @@ _BITSANDBYTES_4BIT_STATE_BUFFER_NAMES = (
 _BITSANDBYTES_8BIT_STATE_BUFFER_NAMES = ("weight_scb",)
 _MLX_4BIT_MIN_ELEMENTS = 4 * 1024 * 1024
 _MLX_INT8_MIN_ELEMENTS = 8 * 1024 * 1024
+_CPU_PACKED_ENV = "GPTQMODEL_BITSANDBYTES_CPU_PACKED"
+_CPU_PACKED_SMALL_WEIGHT_ELEMENTS = 512 * 512
+_CPU_PACKED_SMALL_WEIGHT_MAX_M = 512
+_CPU_PACKED_SMALL_WEIGHT_MULTITHREAD_MAX_M = 64
+_CPU_PACKED_WIDE_WEIGHT_MAX_M = 48
+_CPU_PACKED_SINGLE_THREAD_MAX_M = 32
+_CPU_PACKED_SMALL_WEIGHT_MIN_THREADS = 4
+_CPU_PACKED_REL_TOL = 2e-3
+_CPU_INT8_DENSE_ENV = "GPTQMODEL_BITSANDBYTES_CPU_INT8_DENSE"
+_CPU_INT8_DENSE_MIN_ROWS = 64
+_CPU_INT8_DENSE_MAX_ROWS = 256
+_CPU_INT8_DENSE_SQUARE = 512
+_CPU_INT8_DENSE_MAX_WEIGHT_ELEMENTS = 512 * 512
+_CPU_INT8_DENSE_TILE_FEATURES = 512
 
 
 def _is_bitsandbytes_available() -> bool:
     try:
         import bitsandbytes as bnb
+        return version.parse(bnb.__version__) >= version.parse(MINIMUM_BITSANDBYTES_VERSION)
     except Exception as exc:  # pragma: no cover - optional dependency
-        log.debug("bitsandbytes import failed: %s", exc)
+        # A missing package, a shared-library failure, or an unparsable
+        # ``__version__`` all mean "this backend is unusable", never a crash.
+        # ``validate_once`` promises a ``(bool, exception)`` tuple, so the probe
+        # must not raise either.
+        log.debug("bitsandbytes is unavailable: %s", exc)
         return False
 
-    return version.parse(bnb.__version__) >= version.parse(MINIMUM_BITSANDBYTES_VERSION)
+
+@lru_cache(maxsize=1)
+def _probe_bitsandbytes_available() -> bool:
+    """Probe bitsandbytes once, on first real use.
+
+    Importing bitsandbytes is expensive and must not happen while the kernel
+    registry is merely being discovered. The probe is cached so repeated
+    ``validate_once`` calls stay cheap.
+    """
+
+    return _is_bitsandbytes_available()
+
+
+_probe_cache_clear = _probe_bitsandbytes_available.cache_clear
+
+
+def bitsandbytes_available() -> bool:
+    """Return whether a supported bitsandbytes is usable.
+
+    The legacy ``BITSANDBYTES_AVAILABLE`` name is materialized from the probe on first
+    attribute access, so this accessor reads the same attribute when present
+    and otherwise probes.
+    """
+
+    namespace = sys.modules[__name__].__dict__
+    if "BITSANDBYTES_AVAILABLE" in namespace:
+        return bool(namespace["BITSANDBYTES_AVAILABLE"])
+    return _probe_bitsandbytes_available()
+
+
+def _clear_availability_state() -> None:
+    """Drop the materialized value, the probe result and validation caches.
+
+    This is the escape hatch for tests and for long-lived processes where the
+    environment changes after the first probe (a package installed later, a
+    toolchain that becomes available). It also removes a value restored by
+    ``monkeypatch.undo()``, which is indistinguishable from an explicit
+    override once materialized.
+
+    The kernel's ``cached_validate_once()`` result is invalidated as well, or a
+    kernel that failed before the backend appeared stays unselectable until the
+    process ends.
+    """
+
+    sys.modules[__name__].__dict__.pop("BITSANDBYTES_AVAILABLE", None)
+    _probe_cache_clear()
+    cls = globals().get("BitsAndBytesLinear")
+    if cls is not None:
+        cls.cached_validate_once.cache_clear()
+    # ``validate_quant_linear()`` keeps its own bounded cache of
+    # ``(bool, error)`` results. Clearing only the kernel-level cache leaves a
+    # stale "unavailable" answer there, and that cache short-circuits before
+    # ``validate()`` is ever called again. Import lazily: ``importer`` imports
+    # the kernel package, so a module-level import here would be circular.
+    from ...utils.importer import clear_validation_cache
+
+    clear_validation_cache()
+
+
+# ``cache_clear`` is the documented knob; keep it on the probe, extended with
+# the materialized attribute so clearing really re-arms everything.
+_probe_bitsandbytes_available.cache_clear = _clear_availability_state
+
+
+def __getattr__(name: str):
+    if name == "BITSANDBYTES_AVAILABLE":
+        # Materialize the probe as a normal module attribute. A plain attribute
+        # keeps ``del`` and ``monkeypatch`` semantics working: pytest reads the
+        # old value from ``__dict__`` and restores it on ``undo()``, so two
+        # consecutive patch contexts behave like they did before the lazy
+        # change.
+        value = _probe_bitsandbytes_available()
+        sys.modules[__name__].__dict__[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    # ``__getattr__`` names are invisible to ``dir()``/star-import unless
+    # advertised. Keep the pre-lazy surface.
+    return sorted(set(globals()) | {"BITSANDBYTES_AVAILABLE"})
 
 
 def import_bitsandbytes():
     import bitsandbytes as bnb
 
-    if version.parse(bnb.__version__) < version.parse(MINIMUM_BITSANDBYTES_VERSION):
+    # ``getattr`` + ``try`` keep a build with a missing or unparsable
+    # ``__version__`` on the documented ``ImportError`` path instead of letting
+    # ``AttributeError`` escape the kernel constructor.
+    try:
+        parsed_version = version.parse(getattr(bnb, "__version__", ""))
+    except Exception as exc:
+        raise ImportError(BITSANDBYTES_INSTALL_HINT) from exc
+    if parsed_version < version.parse(MINIMUM_BITSANDBYTES_VERSION):
         raise ImportError(BITSANDBYTES_INSTALL_HINT)
     return bnb
+
+
+@lru_cache(maxsize=1)
+def _cpu_packed_kernels():
+    try:
+        from bitsandbytes.functional import (
+            _convert_weight_packed_for_cpu,
+            _convert_weight_packed_for_cpu_inverse,
+            has_avx512bf16,
+        )
+    except Exception as exc:  # pragma: no cover - optional dependency
+        log.debug("bitsandbytes CPU packed kernels unavailable: %s", exc)
+        return None
+
+    try:
+        if not has_avx512bf16():
+            return None
+    except Exception as exc:  # pragma: no cover - optional dependency
+        log.debug("bitsandbytes AVX512-BF16 probe failed: %s", exc)
+        return None
+
+    return _convert_weight_packed_for_cpu, _convert_weight_packed_for_cpu_inverse
 
 
 @lru_cache(maxsize=1)
@@ -72,6 +203,19 @@ def _mlx_quantization_available() -> bool:
     except ImportError:
         return False
     return True
+
+
+@lru_cache(maxsize=1)
+def _triton_backend():
+    """Load the RDNA Triton 4-bit kernels lazily; ``None`` when unavailable."""
+
+    try:
+        from . import bitsandbytes_triton
+
+        return bitsandbytes_triton
+    except Exception as exc:  # pragma: no cover - optional acceleration
+        log.debug("bitsandbytes Triton kernels unavailable: %s", exc)
+        return None
 
 
 def _mlx_array_to_cpu_tensor(value) -> torch.Tensor:
@@ -135,7 +279,69 @@ def _quantize_int8_weight_mlx_to_torch(weight: torch.Tensor):
     return _mlx_array_to_cpu_tensor(packed), _mlx_array_to_cpu_tensor(scales)
 
 
-BITSANDBYTES_AVAILABLE = _is_bitsandbytes_available()
+def _dequantize_int8_weight(
+    weight: torch.Tensor,
+    weight_scb: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize BnB INT8 weights with the same row-scale math as the native op."""
+
+    return weight.to(torch.float32) * (weight_scb.to(torch.float32) / 127.0).unsqueeze(1)
+
+
+def _cpu_packed_max_rows(
+    *,
+    in_features: int,
+    out_features: int,
+    threads: Optional[int] = None,
+) -> int:
+    """Return the measured packed-kernel crossover for the current CPU shape.
+
+    The packed GEMV path wins decode-sized batches. Its tiled GEMM scales worse
+    than canonical dequantize-plus-GEMM as rows grow, while smaller weights
+    amortize that overhead over more rows. The crossover also depends on the
+    active PyTorch intra-op thread count.
+    """
+
+    if threads is None:
+        threads = torch.get_num_threads()
+    if threads <= 1:
+        return _CPU_PACKED_SINGLE_THREAD_MAX_M
+    if in_features * out_features <= _CPU_PACKED_SMALL_WEIGHT_ELEMENTS:
+        if threads >= _CPU_PACKED_SMALL_WEIGHT_MIN_THREADS:
+            return _CPU_PACKED_SMALL_WEIGHT_MAX_M
+        return _CPU_PACKED_SMALL_WEIGHT_MULTITHREAD_MAX_M
+    return _CPU_PACKED_WIDE_WEIGHT_MAX_M
+
+
+def _cpu_int8_dense_should_use(
+    *,
+    rows: int,
+    in_features: int,
+    out_features: int,
+    compute_dtype: torch.dtype,
+) -> bool:
+    """Return whether a tiled FP32 recompute is accurate and faster than native INT8.
+
+    The native path is an A8W8 format: it quantizes activations as well as
+    weights. The measured crossover for a 512x512 BF16 layer is 64 to 256 rows;
+    below that the native A8W8 kernel wins, and above it the larger oneDNN
+    native GEMM catches up. Other small shapes regress in the current oneDNN
+    dispatch, so they stay native until a shape-specific crossover is measured.
+    The tiled path dequantizes only one bounded feature tile at a time and never
+    retains a dense weight.
+    """
+
+    if not env_flag(_CPU_INT8_DENSE_ENV, default=True):
+        return False
+    if not has_avx512_bf16():
+        return False
+    if compute_dtype != torch.bfloat16 or not (
+        _CPU_INT8_DENSE_MIN_ROWS <= rows <= _CPU_INT8_DENSE_MAX_ROWS
+    ):
+        return False
+    if in_features != _CPU_INT8_DENSE_SQUARE or out_features != _CPU_INT8_DENSE_SQUARE:
+        return False
+    return in_features * out_features <= _CPU_INT8_DENSE_MAX_WEIGHT_ELEMENTS
 
 
 def _weight_to_matrix(linear: nn.Module) -> torch.Tensor:
@@ -160,6 +366,7 @@ def _buffer_spec_4bit(
     *,
     in_features: int,
     out_features: int,
+    compute_dtype: torch.dtype,
     quant_type: str,
     block_size: int,
     compress_statistics: bool,
@@ -168,7 +375,8 @@ def _buffer_spec_4bit(
 
     # Quantize a template once so the registered buffers match the exact
     # packed layout bitsandbytes expects during checkpoint load.
-    template = torch.zeros((out_features, in_features), dtype=torch.float16, device="cpu")
+    template_dtype = compute_dtype if compute_dtype is not None else torch.float16
+    template = torch.zeros((out_features, in_features), dtype=template_dtype, device="cpu")
     # Metadata construction also creates temporary tensors inside BNB. Do not
     # inherit a caller's meta-device context when deriving the packed schema.
     with torch.device("cpu"):
@@ -201,7 +409,9 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
     SUPPORTS_AUTO_PADDING = False
     SUPPORTS_IN_FEATURES_DIVISIBLE_BY = [1]
     SUPPORTS_OUT_FEATURES_DIVISIBLE_BY = [1]
-    SUPPORTS_DEVICES = [DEVICE.CPU, DEVICE.CUDA]
+    # HIP uses torch's CUDA namespace for both the vendor 4/8-bit kernels and
+    # our tuned 4-bit Triton path. Keep AMD explicit at the support-family gate.
+    SUPPORTS_DEVICES = [DEVICE.CPU, DEVICE.CUDA, DEVICE.ROCM]
     SUPPORTS_PLATFORM = [PLATFORM.ALL]
     SUPPORTS_PACK_DTYPES = [torch.int8, torch.int16, torch.int32, torch.int64]
     SUPPORTS_ADAPTERS = []
@@ -241,6 +451,9 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
         self.compute_dtype = dtype
         self.quant_state = None
         self._quant_state_signature = None
+        self._cpu_packing_active = False
+        self._cpu_packing_disabled = False
+        self._int8_dense_disabled = False
 
         super().__init__(
             bits=bits,
@@ -260,7 +473,7 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
 
     @classmethod
     def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
-        if not BITSANDBYTES_AVAILABLE:
+        if not bitsandbytes_available():
             return False, ImportError(BITSANDBYTES_INSTALL_HINT)
 
         try:
@@ -281,6 +494,7 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
             buffer_spec = _buffer_spec_4bit(
                 in_features=self.in_features,
                 out_features=self.out_features,
+                compute_dtype=self.compute_dtype,
                 quant_type=self.bnb_format,
                 block_size=self.bnb_block_size,
                 compress_statistics=self.bnb_compress_statistics,
@@ -308,6 +522,7 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
             self.bias = None
 
     def list_buffers(self):
+        self._ensure_unpacked()
         buffers = []
         if hasattr(self, "weight") and self.weight is not None:
             buffers.append(self.weight)
@@ -355,6 +570,9 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
             self._quant_state_signature = None
             return None
 
+        if self._cpu_packing_active:
+            self._ensure_unpacked()
+
         bnb = import_bitsandbytes()
         signature = tuple(
             (
@@ -375,17 +593,165 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
         self._quant_state_signature = signature
         return self.quant_state
 
+    def _cpu_packing_supported(self, x: torch.Tensor, compute_dtype: torch.dtype) -> bool:
+        if self._cpu_packing_disabled or not env_flag(_CPU_PACKED_ENV, default=False):
+            return False
+        if not self.is_4bit or self.training or self.weight.device.type != "cpu":
+            return False
+        if compute_dtype != torch.bfloat16:
+            return False
+        if self.out_features % 32 != 0 or self.in_features % 2 != 0:
+            return False
+        if self.in_features % self.bnb_block_size != 0:
+            return False
+        if torch.is_grad_enabled() and (
+            x.requires_grad or (self.bias is not None and self.bias.requires_grad)
+        ):
+            return False
+
+        rows = x.numel() // self.in_features
+        if rows <= 0 or rows > _cpu_packed_max_rows(
+            in_features=self.in_features,
+            out_features=self.out_features,
+        ):
+            return False
+        return _cpu_packed_kernels() is not None
+
+    def _pack_cpu(self) -> bool:
+        kernels = _cpu_packed_kernels()
+        if kernels is None or self.quant_state is None:
+            return False
+
+        convert, _ = kernels
+        bnb = import_bitsandbytes()
+        try:
+            state_copy = bnb.functional.QuantState.from_dict(
+                self.quant_state.as_dict(),
+                device=self.weight.device,
+            )
+            packed_weight, packed_state = convert(self.weight, state_copy)
+        except Exception as exc:
+            log.debug("bitsandbytes CPU packed conversion failed: %s", exc)
+            self._cpu_packing_disabled = True
+            return False
+
+        self._buffers["weight"] = packed_weight
+        self.quant_state = packed_state
+        self._cpu_packing_active = True
+        return True
+
+    def _ensure_unpacked(self, *, refresh: bool = False) -> None:
+        if not self._cpu_packing_active:
+            return
+
+        kernels = _cpu_packed_kernels()
+        if kernels is None:
+            raise RuntimeError("bitsandbytes CPU packed kernel is no longer available.")
+
+        _, inverse = kernels
+        qweight, _ = inverse(self.weight, self.quant_state)
+        self._buffers["weight"] = qweight
+        self._cpu_packing_active = False
+        self.quant_state = None
+        self._quant_state_signature = None
+        if refresh and self.is_4bit:
+            self._refresh_quant_state(force=True)
+
+    def _cpu_packing_accuracy_ok(
+        self,
+        packed_out: torch.Tensor,
+        canonical_out: torch.Tensor,
+    ) -> bool:
+        packed = packed_out.float()
+        canonical = canonical_out.float()
+        if not torch.isfinite(packed).all() or not torch.isfinite(canonical).all():
+            return False
+
+        denominator = canonical.norm()
+        if denominator == 0:
+            return torch.equal(packed, canonical)
+        relative_error = (packed - canonical).norm() / denominator
+        return bool(relative_error <= _CPU_PACKED_REL_TOL)
+
+    def _cpu_int8_tiled_forward(
+        self,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Recompute an INT8 layer from bounded FP32 tiles without caching weights."""
+
+        x_flat = x.reshape(-1, self.in_features)
+        output = torch.zeros(
+            (x_flat.shape[0], self.out_features),
+            dtype=torch.float32,
+            device=x_flat.device,
+        )
+
+        with cpu_bf16x3_matmul():
+            for start in range(0, self.in_features, _CPU_INT8_DENSE_TILE_FEATURES):
+                end = min(start + _CPU_INT8_DENSE_TILE_FEATURES, self.in_features)
+                weight = _dequantize_int8_weight(
+                    self.weight[:, start:end],
+                    self.weight_scb,
+                )
+                output = output + torch.matmul(
+                    x_flat[:, start:end].to(torch.float32),
+                    weight.t(),
+                )
+
+        if bias is not None:
+            output = output + bias.to(torch.float32)
+        return output.reshape(x.shape[:-1] + (self.out_features,)).to(x.dtype)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        self._ensure_unpacked()
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self._ensure_unpacked()
+        quant_state_key = f"{prefix}weight_quant_state"
+        loaded_quant_state = state_dict.get(quant_state_key)
+        if loaded_quant_state is not None and self.is_4bit:
+            current = self._buffers.get("weight_quant_state")
+            if current is None or current.shape != loaded_quant_state.shape:
+                self._buffers["weight_quant_state"] = torch.empty_like(loaded_quant_state)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._cpu_packing_disabled = False
+
+    def _apply(self, fn, *args, **kwargs):
+        self._ensure_unpacked()
+        return super()._apply(fn, *args, **kwargs)
+
     def post_init(self):
+        self._ensure_unpacked()
         super().post_init()
         if self.is_4bit:
             self._refresh_quant_state(force=True)
 
     def dequantize_weight(self) -> torch.Tensor:
+        self._ensure_unpacked()
         bnb = import_bitsandbytes()
         if self.is_4bit:
             quant_state = self._refresh_quant_state()
             return bnb.functional.dequantize_4bit(self.weight, quant_state=quant_state).contiguous()
-        return bnb.functional.int8_vectorwise_dequant(self.weight, self.weight_scb).contiguous()
+        return _dequantize_int8_weight(self.weight, self.weight_scb).contiguous()
 
     def pack(self, linear: nn.Module, scales: torch.Tensor, zeros: torch.Tensor, g_idx: torch.Tensor = None):
         self.pack_original(linear=linear, scales=scales, zeros=zeros, g_idx=g_idx)
@@ -414,6 +780,8 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
     ):
         del scales, zeros, g_idx
 
+        self._ensure_unpacked()
+        self._cpu_packing_disabled = False
         bnb = import_bitsandbytes()
         weight = _apply_optional_smoother(
             _weight_to_matrix(linear).to(device="cpu").clone(),
@@ -480,14 +848,112 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
         bias = None if self.bias is None else self.bias.to(compute_dtype)
 
         if self.is_4bit:
-            quant_state = self._refresh_quant_state()
-            out = bnb.matmul_4bit(
-                x.to(compute_dtype),
-                self.weight.t(),
-                quant_state=quant_state,
-                bias=bias,
-            )
+            x_compute = x.to(compute_dtype)
+            # RDNA (and other tuned ROCm families) get a fused Triton GEMM for
+            # the row band where the vendor HIP kernel is 2.4x-6.3x slower.
+            # Below that band, and everywhere on CUDA/CPU, bitsandbytes stays.
+            triton_backend = _triton_backend()
+            if (
+                triton_backend is not None
+                and self.weight.device.type == "cuda"
+                and not self._cpu_packing_active
+                and triton_backend.should_use(
+                    self.weight.device,
+                    compute_dtype,
+                    x.numel() // self.in_features,
+                )
+            ):
+                quant_state = self._refresh_quant_state()
+                out = triton_backend.matmul_4bit(
+                    x_compute,
+                    self.weight,
+                    quant_state,
+                    bias=bias,
+                    out_dtype=input_dtype,
+                )
+                return out.to(input_dtype)
+            if self._cpu_packing_active:
+                if not self._cpu_packing_supported(x, compute_dtype):
+                    self._ensure_unpacked(refresh=True)
+                    quant_state = self._refresh_quant_state()
+                    out = bnb.matmul_4bit(
+                        x_compute,
+                        self.weight.t(),
+                        quant_state=quant_state,
+                        bias=bias,
+                    )
+                else:
+                    try:
+                        out = bnb.matmul_4bit(
+                            x_compute,
+                            self.weight,
+                            quant_state=self.quant_state,
+                            bias=bias,
+                        )
+                    except Exception as exc:
+                        log.debug("bitsandbytes CPU packed forward failed: %s", exc)
+                        self._cpu_packing_disabled = True
+                        self._ensure_unpacked(refresh=True)
+                        quant_state = self._refresh_quant_state()
+                        out = bnb.matmul_4bit(
+                            x_compute,
+                            self.weight.t(),
+                            quant_state=quant_state,
+                            bias=bias,
+                        )
+            elif self._cpu_packing_supported(x, compute_dtype):
+                quant_state = self._refresh_quant_state()
+                canonical_out = bnb.matmul_4bit(
+                    x_compute,
+                    self.weight.t(),
+                    quant_state=quant_state,
+                    bias=bias,
+                )
+                if self._pack_cpu():
+                    try:
+                        packed_out = bnb.matmul_4bit(
+                            x_compute,
+                            self.weight,
+                            quant_state=self.quant_state,
+                            bias=bias,
+                        )
+                    except Exception as exc:
+                        log.debug("bitsandbytes CPU packed forward failed: %s", exc)
+                        self._cpu_packing_disabled = True
+                        self._ensure_unpacked(refresh=True)
+                        out = canonical_out
+                    else:
+                        if self._cpu_packing_accuracy_ok(packed_out, canonical_out):
+                            out = packed_out
+                        else:
+                            self._cpu_packing_disabled = True
+                            self._ensure_unpacked(refresh=True)
+                            out = canonical_out
+                else:
+                    out = canonical_out
+            else:
+                quant_state = self._refresh_quant_state()
+                out = bnb.matmul_4bit(
+                    x_compute,
+                    self.weight.t(),
+                    quant_state=quant_state,
+                    bias=bias,
+                )
             return out.to(input_dtype)
+
+        rows = x.numel() // self.in_features
+        if (
+            not self._int8_dense_disabled
+            and self.weight.device.type == "cpu"
+            and not (torch.is_grad_enabled() and x.requires_grad)
+            and _cpu_int8_dense_should_use(
+                rows=rows,
+                in_features=self.in_features,
+                out_features=self.out_features,
+                compute_dtype=compute_dtype,
+            )
+        ):
+            return self._cpu_int8_tiled_forward(x, bias)
 
         x_int8, x_stats, outlier_cols = bnb.functional.int8_vectorwise_quant(
             x.to(torch.float16),
@@ -506,8 +972,10 @@ class BitsAndBytesLinear(WeightOnlyQuantLinear):
 BitsAndBytes4bitLinear = BitsAndBytesLinear
 
 __all__ = [
-    "BITSANDBYTES_AVAILABLE",
+    # Resolved lazily by module ``__getattr__``; ruff cannot see it as a global.
+    "BITSANDBYTES_AVAILABLE",  # noqa: F822
     "BITSANDBYTES_INSTALL_HINT",
+    "bitsandbytes_available",
     "BitsAndBytes4bitLinear",
     "BitsAndBytesLinear",
     "import_bitsandbytes",

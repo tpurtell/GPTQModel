@@ -1,4 +1,6 @@
 recursive-include gptqmodel_ext/awq *.h *.cuh *.cu *.cpp
+recursive-include gptqmodel_ext/allspark *.cuh *.cu *.cpp
+recursive-include gptqmodel_ext/allspark_hip *.cuh *.cu *.cpp
 recursive-include gptqmodel_ext/exllamav3 *.h *.hpp *.cuh *.cu *.cpp *.c
 recursive-include gptqmodel_ext/exllamav2 *.h *.cuh *.cu *.cpp
 recursive-include gptqmodel_ext/marlin *.h *.cuh *.cu *.cpp *.hpp
@@ -6,7 +8,9 @@ recursive-include gptqmodel_ext/machete *.h *.hpp *.cuh *.cu *.cpp *.py
 recursive-include gptqmodel_ext/cutlass_extensions *.h *.hpp *.cuh *.cu *.cpp *.py
 recursive-include gptqmodel_ext/paroquant *.h *.cuh *.cu *.cpp
 recursive-include gptqmodel_ext/qqq *.h *.cuh *.cu *.cpp
+recursive-include gptqmodel_ext/vptq *.h *.cuh *.cu *.cpp
 recursive-include gptqmodel_ext/gptq_block *.cu *.cpp
+recursive-include gptqmodel_ext/int4_qzero_group_scaled_cpu *.cpp *.hpp NOTICE
 recursive-include gptqmodel_ext/hadamard *.h *.cuh *.cu *.cpp LICENSE
 recursive-include gptqmodel_ext/swordfish *.h *.hpp *.cuh *.cu *.cpp *.py LICENSE
 include gptqmodel_ext/swordfish/licenses/LICENSE
