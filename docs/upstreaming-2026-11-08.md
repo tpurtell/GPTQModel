@@ -1,79 +1,101 @@
-# Imagine if we upstreamed everything: what would we have left?
+# GPT-QModel upstream feature extraction and fork remainder
 
-This records the 2026-11-08 extraction of the tpurtell fork into reviewable upstream proposals. The worktree ends on `work/upstream-everything-remainder-20261108`.
+The working fork has been decomposed into **36 draft upstream proposals**: ten initial fixes/utilities and 26 additional feature layers. Each PR has a predecessor link and a comparison isolating its own feature. The final worktree branch is `work/upstream-everything-remainder-20261108`, rebased onto layer 36.
 
-## Preserved history and resolved baseline
+The full original integration/history is preserved in [fork sync PR #3](https://github.com/tpurtell/GPTQModel/pull/3) and local branch `archive/upstream-remainder-before-feature-slices-20261108`. [Fork remainder PR #4](https://github.com/tpurtell/GPTQModel/pull/4) is based on layer 36. No fork or upstream main was merged automatically.
 
-[The fork sync PR](https://github.com/tpurtell/GPTQModel/pull/3) merges upstream `6bf8b0b1bbd4d9d24c4e9253923141c4095c0dc8` into fork main `02c6ac672`. Its merge commit `3eaac09b17cd18e63f1f6b8a2f11bf40190e1ab7` preserves the original history. The original divergence was 156 fork commits and 303 upstream commits. Fifteen files required conflict resolution.
+## Resolve additions onto existing model support
 
-The resolution keeps upstream device filtering, EXL3 buffer dtype coercion, single-use Hessians, GLM dense low-rank attention inputs, and early auxiliary-tensor validation. It retains the fork's padded logical outputs, bounded native adapters, durable recovery, and integrated MTP behavior. Focused CPU checks caught and corrected incompatible test assumptions and writer validation order.
+The overlap audit used current upstream `cc15d5c13`; the extraction originally started at `6bf8b0b1b`.
 
-The extraction branches contain ten commits above upstream. The remainder was rebased onto the complete extraction stack. Its production tree matches the resolved baseline plus the atomic shard-write fix discovered while extracting export behavior. New standalone regression tests and chunk-boundary coverage are also retained. Neither fork main nor upstream main was merged or rewritten.
+| Family | Existing upstream capability | Proposed addition |
+|---|---|---|
+| DeepSeek V4 | Registered model, quantization tree | Causal target/MTP replay, bounded recovery and native export |
+| GLM-5/5.1 | Registered DSA model and replay | Explicit bounded source/MTP adapters and recovery |
+| GLM-5.3 Flash | Hybrid KDA/DSA model; untouched MTP tensor passthrough | Actual MTP calibration/quantization and bounded replay |
+| Kimi K3/K3.1 | No matching registration/adapter found | Explicit AttnRes source/calibration contracts; K3 registration |
+| Dots3 Note | No matching registration found | Separate-expert and router integration |
+| Step-5 | No matching adapter found | Bounded native source/core/MTP calibration |
+| DeepSeek V4.1 | Inventory documentation; no registered loader | Explicit native source/replay utilities, without automatic registration |
 
-## Proposed upstream stack
+Existing model support stays authoritative. In particular, the GLM proposal keeps upstream's module tree, role metadata, dense shared experts, processor-loading policy and normal Defuser path. The fork's custom expert container/forward/converter was removed. MTP is attached before ordinary Defuser conversion; the existing `after_defuser_conversion` hook validates target/MTP expert coverage. Native expert identity and activation behavior are preserved. The global `_convert_model_with_defuser` function is unchanged from upstream.
 
-All upstream PRs are drafts. GitHub cross-fork PRs target upstream `main`; later Files changed views therefore contain predecessors. The incremental comparisons below isolate each layer. Land/rebase in order, then rebase subsequent layers and the final remainder. No PR has automatic merge enabled by this work.
+DeepSeek V4's base module tree is identical to upstream. Its proposed changes extend auxiliary traversal, replay, recovery and export rather than introduce a parallel model registration. Native runner helpers reuse native model blocks and expose explicit calibration boundaries; they are not advertised as replacement default model implementations.
+
+## Stack and individual reviews
+
+GitHub cross-fork PRs target upstream `main`, so later Files changed views contain predecessors. Use the incremental comparisons below for first-line feedback. Land and rebase in dependency order; all proposals remain drafts. This pass carries previously used code and tests rather than requiring a new full validation campaign before asking which features are useful.
 
 | Layer | Proposal | Incremental review |
 |---|---|---|
-| 1 | [fix(config): preserve per-layer-type RoPE dictionaries](https://github.com/ModelCloud/GPTQModel/pull/3579) | [one commit](https://github.com/tpurtell/GPTQModel/compare/6bf8b0b1bbd4d9d24c4e9253923141c4095c0dc8...upstream%2F01-nested-rope-20261108) |
-| 2 | [fix(loader): restore direct nonpersistent rotary buffers](https://github.com/ModelCloud/GPTQModel/pull/3580) | [one commit](https://github.com/tpurtell/GPTQModel/compare/upstream%2F01-nested-rope-20261108...upstream%2F02-lazy-rotary-20261108) |
-| 3 | [fix(writer): stream E8M0 safetensors scales](https://github.com/ModelCloud/GPTQModel/pull/3581) | [one commit](https://github.com/tpurtell/GPTQModel/compare/upstream%2F02-lazy-rotary-20261108...upstream%2F03-e8m0-export-20261108) |
-| 4 | [fix(exl3): match native half rounding in Torch codebooks](https://github.com/ModelCloud/GPTQModel/pull/3582) | [one commit](https://github.com/tpurtell/GPTQModel/compare/upstream%2F03-e8m0-export-20261108...upstream%2F04-exl3-half-rounding-20261108) |
-| 5 | [fix(exl3): preserve logical outputs over padded storage](https://github.com/ModelCloud/GPTQModel/pull/3583) | [one commit](https://github.com/tpurtell/GPTQModel/compare/upstream%2F04-exl3-half-rounding-20261108...upstream%2F05-exl3-logical-padding-20261108) |
-| 6 | [fix(writer): preserve existing shards and config extensions on export](https://github.com/ModelCloud/GPTQModel/pull/3584) | [one commit](https://github.com/tpurtell/GPTQModel/compare/upstream%2F05-exl3-logical-padding-20261108...upstream%2F06-config-only-export-20261108) |
-| 7 | [feat(writer): reuse content-authenticated safetensors shards](https://github.com/ModelCloud/GPTQModel/pull/3585) | [one commit](https://github.com/tpurtell/GPTQModel/compare/upstream%2F06-config-only-export-20261108...upstream%2F07-authenticated-shard-resume-20261108) |
-| 8 | [feat(offload): reference authenticated safetensors payloads](https://github.com/ModelCloud/GPTQModel/pull/3586) | [one commit](https://github.com/tpurtell/GPTQModel/compare/upstream%2F07-authenticated-shard-resume-20261108...upstream%2F08-safetensors-reference-offload-20261108) |
-| 9 | [feat(exl3): add bounded covariance accumulation with an FP64 outer sum](https://github.com/ModelCloud/GPTQModel/pull/3587) | [one commit](https://github.com/tpurtell/GPTQModel/compare/upstream%2F08-safetensors-reference-offload-20261108...upstream%2F09-bounded-covariance-20261108) |
-| 10 | [feat(looper): add authenticated disk-backed layer outputs](https://github.com/ModelCloud/GPTQModel/pull/3588) | [one commit](https://github.com/tpurtell/GPTQModel/compare/upstream%2F09-bounded-covariance-20261108...upstream%2F10-disk-backed-layer-outputs-20261108) |
+| 1 | [fix(config): preserve per-layer-type RoPE dictionaries](https://github.com/ModelCloud/GPTQModel/pull/3579) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/6bf8b0b1bbd4d9d24c4e9253923141c4095c0dc8...upstream%2F01-nested-rope-20261108) |
+| 2 | [fix(loader): restore direct nonpersistent rotary buffers](https://github.com/ModelCloud/GPTQModel/pull/3580) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F01-nested-rope-20261108...upstream%2F02-lazy-rotary-20261108) |
+| 3 | [fix(writer): stream E8M0 safetensors scales](https://github.com/ModelCloud/GPTQModel/pull/3581) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F02-lazy-rotary-20261108...upstream%2F03-e8m0-export-20261108) |
+| 4 | [fix(exl3): match native half rounding in Torch codebooks](https://github.com/ModelCloud/GPTQModel/pull/3582) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F03-e8m0-export-20261108...upstream%2F04-exl3-half-rounding-20261108) |
+| 5 | [fix(exl3): preserve logical outputs over padded storage](https://github.com/ModelCloud/GPTQModel/pull/3583) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F04-exl3-half-rounding-20261108...upstream%2F05-exl3-logical-padding-20261108) |
+| 6 | [fix(writer): preserve existing shards and config extensions on export](https://github.com/ModelCloud/GPTQModel/pull/3584) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F05-exl3-logical-padding-20261108...upstream%2F06-config-only-export-20261108) |
+| 7 | [feat(writer): reuse content-authenticated safetensors shards](https://github.com/ModelCloud/GPTQModel/pull/3585) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F06-config-only-export-20261108...upstream%2F07-authenticated-shard-resume-20261108) |
+| 8 | [feat(offload): reference authenticated safetensors payloads](https://github.com/ModelCloud/GPTQModel/pull/3586) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F07-authenticated-shard-resume-20261108...upstream%2F08-safetensors-reference-offload-20261108) |
+| 9 | [feat(exl3): add bounded covariance accumulation with an FP64 outer sum](https://github.com/ModelCloud/GPTQModel/pull/3587) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F08-safetensors-reference-offload-20261108...upstream%2F09-bounded-covariance-20261108) |
+| 10 | [feat(looper): add authenticated disk-backed layer outputs](https://github.com/ModelCloud/GPTQModel/pull/3588) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F09-bounded-covariance-20261108...upstream%2F10-disk-backed-layer-outputs-20261108) |
+| 11 | [feat(exl3): preserve Hessian conditioning and projection diagnostics](https://github.com/ModelCloud/GPTQModel/pull/3591) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F10-disk-backed-layer-outputs-20261108...upstream%2F11-exl3-numerical-diagnostics-20261108) |
+| 12 | [feat(exl3): retain restart-idempotent projection and route ledgers](https://github.com/ModelCloud/GPTQModel/pull/3592) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F11-exl3-numerical-diagnostics-20261108...upstream%2F12-exl3-error-ledgers-20261108) |
+| 13 | [feat(exl3): checkpoint completed projections atomically](https://github.com/ModelCloud/GPTQModel/pull/3593) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F12-exl3-error-ledgers-20261108...upstream%2F13-exl3-projection-checkpoints-20261108) |
+| 14 | [feat(exl3): persist authenticated capture frontiers](https://github.com/ModelCloud/GPTQModel/pull/3594) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F13-exl3-projection-checkpoints-20261108...upstream%2F14-exl3-capture-frontiers-20261108) |
+| 15 | [feat(exl3): resume capture at calibration-batch boundaries](https://github.com/ModelCloud/GPTQModel/pull/3595) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F14-exl3-capture-frontiers-20261108...upstream%2F15-exl3-capture-batch-spool-20261108) |
+| 16 | [feat(moe): expose ranked router candidates for route recovery](https://github.com/ModelCloud/GPTQModel/pull/3596) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F15-exl3-capture-batch-spool-20261108...upstream%2F16-exl3-router-recovery-20261108) |
+| 17 | [feat(exl3): persist deterministic adjacent mixed-tier plans](https://github.com/ModelCloud/GPTQModel/pull/3597) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F16-exl3-router-recovery-20261108...upstream%2F17-exl3-inline-mixed-tiers-20261108) |
+| 18 | [feat(exl3): dispatch authenticated projections to pipelined workers](https://github.com/ModelCloud/GPTQModel/pull/3598) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F17-exl3-inline-mixed-tiers-20261108...upstream%2F18-exl3-remote-workers-20261108) |
+| 19 | [feat(loader): preserve lazy native sources across replay and export](https://github.com/ModelCloud/GPTQModel/pull/3599) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F18-exl3-remote-workers-20261108...upstream%2F19-lazy-source-replay-contracts-20261108) |
+| 20 | [feat(looper): carry causal replay and durable recovery callbacks](https://github.com/ModelCloud/GPTQModel/pull/3600) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F19-lazy-source-replay-contracts-20261108...upstream%2F20-looper-causal-replay-20261108) |
+| 21 | [feat(exl3): integrate resumable distributed and mixed-tier execution](https://github.com/ModelCloud/GPTQModel/pull/3601) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F20-looper-causal-replay-20261108...upstream%2F21-exl3-durable-execution-20261108) |
+| 22 | [feat(writer): compose native checkpoint passthrough and save overlays](https://github.com/ModelCloud/GPTQModel/pull/3602) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F21-exl3-durable-execution-20261108...upstream%2F22-native-checkpoint-export-20261108) |
+| 23 | [feat(deepseek): carry bounded V4 target and MTP calibration replay](https://github.com/ModelCloud/GPTQModel/pull/3603) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F22-native-checkpoint-export-20261108...upstream%2F23-deepseek-v4-mtp-replay-20261108) |
+| 24 | [feat(glm): integrate Flash target and MTP recovery and export](https://github.com/ModelCloud/GPTQModel/pull/3604) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F23-deepseek-v4-mtp-replay-20261108...upstream%2F24-glm-integrated-mtp-20261108) |
+| 25 | [feat(models): expose Dots3 Note routed experts individually](https://github.com/ModelCloud/GPTQModel/pull/3605) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F24-glm-integrated-mtp-20261108...upstream%2F25-dots3-separate-experts-20261108) |
+| 26 | [feat(kimi): add bounded K3 source and explicit AttnRes model contracts](https://github.com/ModelCloud/GPTQModel/pull/3606) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F25-dots3-separate-experts-20261108...upstream%2F26-kimi-k3-native-source-20261108) |
+| 27 | [feat(kimi): carry causal core calibration and padded EXL3 source storage](https://github.com/ModelCloud/GPTQModel/pull/3607) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F26-kimi-k3-native-source-20261108...upstream%2F27-kimi-core-calibration-20261108) |
+| 28 | [feat(kimi): carry K3.1 source and bounded calibration adapters](https://github.com/ModelCloud/GPTQModel/pull/3608) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F27-kimi-core-calibration-20261108...upstream%2F28-kimi-k31-calibration-20261108) |
+| 29 | [feat(glm): add bounded native core calibration and EXL3 sources](https://github.com/ModelCloud/GPTQModel/pull/3609) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F28-kimi-k31-calibration-20261108...upstream%2F29-glm-core-calibration-20261108) |
+| 30 | [feat(glm): carry native full-MTP alignment and source loading](https://github.com/ModelCloud/GPTQModel/pull/3610) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F29-glm-core-calibration-20261108...upstream%2F30-glm-native-mtp-20261108) |
+| 31 | [feat(glm): carry Flash core and MTP calibration adapters](https://github.com/ModelCloud/GPTQModel/pull/3611) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F30-glm-native-mtp-20261108...upstream%2F31-glm-flash-native-calibration-20261108) |
+| 32 | [feat(step5): carry bounded native core and MTP calibration](https://github.com/ModelCloud/GPTQModel/pull/3612) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F31-glm-flash-native-calibration-20261108...upstream%2F32-step5-native-calibration-20261108) |
+| 33 | [feat(deepseek): carry V4.1 native source and mapped PLE replay](https://github.com/ModelCloud/GPTQModel/pull/3613) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F32-step5-native-calibration-20261108...upstream%2F33-v41-native-source-20261108) |
+| 34 | [feat(deepseek): carry V4.1 routed capture and adjacent recovery](https://github.com/ModelCloud/GPTQModel/pull/3614) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F33-v41-native-source-20261108...upstream%2F34-v41-routed-calibration-20261108) |
+| 35 | [feat(deepseek): persist authenticated typed V4.1 frontiers](https://github.com/ModelCloud/GPTQModel/pull/3615) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F34-v41-routed-calibration-20261108...upstream%2F35-v41-durable-frontiers-20261108) |
+| 36 | [feat(deepseek): carry V4.1 main-input and dSpark replay adapters](https://github.com/ModelCloud/GPTQModel/pull/3616) | [feature diff](https://github.com/tpurtell/GPTQModel/compare/upstream%2F35-v41-durable-frontiers-20261108...upstream%2F36-v41-dspark-replay-20261108) |
 
-The first six layers fix config preservation, lazy rotary restoration, E8M0 serialization, native-format rounding, padded logical outputs, and checkpoint/config export. Export testing exposed a second hazard: truncating a shard that still backs a memory-mapped tensor. Shard writes now use a sibling temporary file and atomic replacement. This protects individual shards and mapped readers; it does not make an entire model save transactional.
+The additional feature sequence covers quantizer diagnostics; error ledgers; projection checkpoints; capture frontiers and batches; router recovery; mixed tiers; authenticated remote scheduling; lazy source contracts; looper and processor integration; native export; and separate DeepSeek, GLM, Dots3, Kimi, Step-5 and V4.1 adapters. Flow/reference pages are carried in the relevant PRs and linked from README.
 
-The remaining layers add explicit reusable APIs: authenticated shard reuse, reference offload, bounded covariance accumulation, and disk-backed activation boundaries. Default pipeline integration for the latter utilities stays with the deferred model-specific work.
+## What is left?
 
-The old TorchAO-extra change was left in the remainder. Current upstream requires `torchao>=0.18.0` as a base dependency, so adding an older extra alone would not make it optional. Removing the dependency would require a fresh audit of current upstream consumers.
+Before this analysis page, the final remainder is **four files, 21 added lines and three removed lines**:
 
-## What remains in the fork
+- `gptqmodel/_banner.py` and `tests/test_startup_banner.py`: the fork's byte-output handling and corresponding regression.
+- `pyproject.toml`: the historical TorchAO extra. Current upstream already requires `torchao>=0.18.0`, so the older extra alone does not make TorchAO optional.
+- `tests/test_xing4_0_support.py`: one historical test-line cleanup.
 
-Against layer 10, before adding this note, the remainder contains **103 files, 32,023 added lines and 756 removed lines**. These counts exclude the preceding stack. They include tests and small historical cleanup differences.
+The earlier 103-file, 32,023-added-line remainder has therefore been proposed as individual features. Duplicate GLM conversion machinery and the fork-specific default shared-expert quantization policy were reconciled with upstream rather than reintroduced into this final branch. Their original form remains in the archived integration history.
 
-| Area | Files | Added | Removed |
-|---|---:|---:|---:|
-| Native model definitions and calibration/source helpers | 27 | 8,205 | 35 |
-| EXL3 orchestration, recovery and durable policy | 9 | 9,139 | 115 |
-| Shared loader/looper/writer integration and metadata | 18 | 2,803 | 287 |
-| Tests for those changes | 49 | 11,876 | 319 |
+## Lightweight validation
 
-The largest retained areas are:
+The new extraction checked dependency order, per-layer Python parsing, whitespace and Mermaid fences. All 26 new reference pages are present; 99 carried Python-file occurrences parse across their feature layers. Existing tests/oracles were retained with their features.
 
-- DeepSeek V4/V4.1 and dSpark continuation, PLE mapping, explicit residual/window state, native checkpoint layouts, and routed calibration.
-- GLM core, Flash and MTP source/calibration runners; Kimi K3/K3.1 AttnRes, KDA and padded core formats; Step-5 fused-expert/indexer adapters; Dots3 expert replacement and router integration.
-- EXL3 error ledgers, authenticated projection/frontier/batch recovery, remote worker scheduling and transport, device-local serialization, mixed adjacent tiers, and model-bound route recovery policy.
-- Shared Hessian ownership, looper replay/materialization hooks, capture/output callbacks, save overlays, native checkpoint passthrough, and active source staging needed by those consumers.
+For the upstream reconciliation, **10 tiny model-plan/registry tests passed** and **two tiny GLM integration tests passed**. The latter demonstrate native expert object/forward preservation and lazy checkpoint materialization through normal Defuser conversion. All used CPU-only offline execution with one BLAS/OpenMP thread. No model quantization, GPU/ROCm work, heavyweight CPU workload or full-model benchmark was run.
 
-These pieces are retained because they cross core execution/lifetime boundaries, depend on native model implementations, or encode operational recovery and publication policy. Their practical correctness needs native model and accelerator evidence. Small utility proposals do not establish that the complete runners are ready. The remainder PR preserves the implementation and dependency boundary for subsequent review; it proposes the remaining changes to the fork, with layer 10 as its base.
+The initial extraction's recorded checks remain documented in its PRs: a 100-pass/36-hardware-skip focused smoke group, exact codebook format-law checks, and separate FP32 arithmetic versus activation-output rounding measurements. Those results describe that earlier validation point; they are not presented as a fresh full-stack runtime rerun.
 
-## Validation and resource limits
-
-All new validation ran offline with `CUDA_VISIBLE_DEVICES=''`, `HIP_VISIBLE_DEVICES=''`, and `OMP_NUM_THREADS=MKL_NUM_THREADS=OPENBLAS_NUM_THREADS=1`; pytest plugin autoload was disabled. No model quantization, GPU computation, model download, or heavyweight model-scale CPU workload was run. Tests use tiny tensors, metadata fixtures and mocked orchestration. Target-hardware accuracy, throughput, and full-model save/reload/quantization remain unverified.
-
-The final rebased branch passed **100 tests with 36 hardware skips** in its focused smoke group:
+Exact focused reconciliation commands, with `CUDA_VISIBLE_DEVICES=''`, `HIP_VISIBLE_DEVICES=''`, `OMP_NUM_THREADS=MKL_NUM_THREADS=OPENBLAS_NUM_THREADS=1`, offline Hugging Face mode and pytest plugin autoload disabled:
 
 ```bash
-python -m pytest -q tests/test_config_only_export.py \
-  tests/test_exl3_native_half_rounding.py tests/test_exllamav3_torch_padding.py \
-  tests/test_disk_backed_layer_outputs.py tests/test_out_of_model_tensors.py \
-  tests/test_glm5_next_upstream_support.py
+python -m pytest -q tests/module_tree/test_dots3_note_fork_plan.py \
+  tests/module_tree/test_kimi_k3_fork_plan.py \
+  tests/module_tree/test_kimi_linear_fork_plan.py \
+  tests/module_tree/test_registered_module_plans.py \
+  -k 'fork_plan or explicit_plan_case or deepseek_v4 or glm5_next or glm_moe_dsa or dots3_note or kimi_k3 or kimi_linear'
+# 10 passed, 196 deselected
+
+python -m pytest -q tests/test_glm5_next_upstream_support.py \
+  -k 'defuser_registry or lazy_turtle'
+# 2 passed, 5 deselected
 ```
-
-Earlier focused groups covered offload/reference export and state collection (69 passed, one hardware skip), shard reuse (five passed), bounded covariance (20 passed), and disk-backed outputs (six passed). Groups overlap; these are not additive totals. Each upstream PR records its focused command, coverage, and remaining gates.
-
-The EXL3 codebook law matched all 65,536 states per codebook, with zero bit mismatches and zero absolute drift. Padded output tests passed 63 CPU cases and skipped 36 CUDA cases. A separate tiny CPU numerical probe used inputs `(1,33,128)`, logical outputs 128/576/1056, bias on/off, K6 MCG, and FP16/BF16/FP32 activations. Each output preserved its activation dtype. Against independently reconstructed Torch weights, with `rtol=atol=2e-3` or tighter:
-
-| Activation | FP32 arithmetic max absolute error | Visible output vs raw FP32 | Visible output vs same-dtype oracle |
-|---|---:|---:|---:|
-| torch.float16 | 1.3038516e-08 | 1.49942935e-05 | 1.52587891e-05 |
-| torch.bfloat16 | 1.11758709e-08 | 0.000120896846 | 6.10351562e-05 |
-| torch.float32 | 1.49011612e-08 | 1.49011612e-08 | 1.49011612e-08 |
-
-Visible-output columns include mandatory low-precision rounding; they are distinct from the FP32 arithmetic error. No GPU or model-scale inference accuracy claim follows from this probe. The covariance utility compares independent FP64 matrices with normalized error below `1e-6` and checks exact boundary storage laws; full-stream GPU validation is still a readiness gate.
