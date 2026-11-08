@@ -421,8 +421,9 @@ class BaseQModel(nn.Module):
 
     # Some models have optional layers that are not loaded or supported by HF so even when they exist in the original
     # model, they are not properly saved on save(). GLM 4.5/4.6 (air) with MTP layers is such example.
-    # Provide either a safetensors filename (the file is copied through if present) or a prefix (all `prefix.` tensors
-    # are merged into the main state dict so they end up in model.safetensors).
+    # Provide either a safetensors filename (the file is copied through if present),
+    # a prefix (all `prefix.` tensors), a suffix, or an exact tensor name. Selected
+    # tensors are merged into the main state dict so they end up in model.safetensors.
     out_of_model_tensors: Optional[Dict[str, Union[str | List[str]]]] = None
 
     supports_desc_act = [True, False]
@@ -2721,6 +2722,7 @@ class BaseQModel(nn.Module):
             decoder_kind = self._decoder_weight_format(
                 weight=weight,
                 checkpoint_tensors=checkpoint_tensors,
+                result_shape=tuple(getattr(module.weight, "shape", weight.shape)),
                 module_name=module_name,
             )
             if decoder_kind is None:
@@ -2771,6 +2773,7 @@ class BaseQModel(nn.Module):
             decoder_kind = self._decoder_weight_format(
                 weight=weight,
                 checkpoint_tensors=checkpoint_tensors,
+                result_shape=tuple(getattr(module.weight, "shape", weight.shape)),
                 module_name=module_name,
             )
             if decoder_kind is None:
@@ -2838,6 +2841,7 @@ class BaseQModel(nn.Module):
             decoder_kind = self._decoder_weight_format(
                 weight=weight,
                 checkpoint_tensors=checkpoint_tensors,
+                result_shape=tuple(getattr(module.weight, "shape", weight.shape)),
                 module_name=module_name,
             )
             if decoder_kind is None:
@@ -2957,6 +2961,26 @@ class BaseQModel(nn.Module):
             # offload_to_disk(model=self.model, module=self.get_base_modules(model=self.model), disk_path=self.quantize_config.offload_to_disk_path)
             pass
 
+    def prepare_input_capture_layer(
+        self,
+        layer: nn.Module,
+        *,
+        module_path: Optional[str],
+        device: torch.device,
+    ) -> nn.Module:
+        """Materialize the first traversed layer before its early-stop hook.
+
+        Auxiliary model definitions may override this when constructing the
+        first layer input does not execute the layer body.  The ordinary model
+        path retains the historical eager materialization behavior.
+        """
+
+        return self.shell_module_materialize(
+            target_submodule=layer,
+            device=device,
+            module_path=module_path,
+        )
+
     def capture_first_layer_positional_inputs(
         self,
         args: tuple[Any, ...],
@@ -2971,6 +2995,18 @@ class BaseQModel(nn.Module):
             return [move_to(args[0], device=batch_device)]
         return []
 
+    def begin_input_capture_example(
+        self,
+        example: Dict[str, Any],
+        batch_device: torch.device,
+    ) -> None:
+        """Expose original model inputs while the first-layer hook executes."""
+
+        del example, batch_device
+
+    def end_input_capture_example(self) -> None:
+        """Release any model-specific original-input capture state."""
+
     def capture_first_layer_input_kwargs(
         self,
         args: tuple[Any, ...],
@@ -2982,6 +3018,45 @@ class BaseQModel(nn.Module):
 
         return layer_input_kwargs
 
+    def quantization_layer_output_required(
+        self,
+        *,
+        layer_index: int,
+        layer_name: str,
+        layer_count: int,
+    ) -> bool:
+        """Return whether a model-specific consumer needs this replay output.
+
+        The default layer loop does not replay the final transformer layer
+        because no ordinary successor consumes it. Auxiliary graphs can opt
+        into a bounded callback without pretending to be additional decoder
+        layers.
+        """
+
+        del layer_index, layer_name, layer_count
+        return False
+
+    def receive_quantization_layer_outputs(
+        self,
+        *,
+        layer_index: int,
+        layer_name: str,
+        layer_outputs: List[List[torch.Tensor]],
+        layer_input_kwargs: List[Dict[str, Any]],
+        position_ids: List[torch.Tensor],
+        attention_masks: List[torch.Tensor | None],
+    ) -> None:
+        """Receive an opted-in post-quantization replay boundary."""
+
+        del (
+            layer_index,
+            layer_name,
+            layer_outputs,
+            layer_input_kwargs,
+            position_ids,
+            attention_masks,
+        )
+
     def prepare_layer_replay_kwargs(
         self,
         layer: nn.Module,
@@ -2992,6 +3067,19 @@ class BaseQModel(nn.Module):
         """Allow model definitions to refresh layer-specific kwargs before cached layer replay."""
 
         return additional_inputs
+
+    def prepare_layer_replay_keep_mask(
+        self,
+        layer: nn.Module,
+        layer_input: List[torch.Tensor],
+        additional_inputs: Dict[str, Any],
+        keep_mask: torch.Tensor | None,
+        target_device: torch.device,
+    ) -> torch.Tensor | None:
+        """Allow transformed replay layers to align processor hook masks."""
+
+        del layer, layer_input, additional_inputs, target_device
+        return keep_mask
 
     def update_layer_replay_kwargs_from_output(
         self,
@@ -3174,6 +3262,15 @@ class BaseQModel(nn.Module):
     ) -> nn.Module:
         """Build a dense CPU source module from checkpoint tensors for quantization."""
 
+        missing = [
+            name for name, parameter in target_submodule.named_parameters()
+            if parameter.is_meta
+            and not isinstance((checkpoint_tensors or {}).get(name), torch.Tensor)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Cannot reload quantization source: missing checkpoint tensors {missing}"
+            )
         quant_source = copy.deepcopy(target_submodule)
         if _module_has_meta_tensors(quant_source):
             quant_source = quant_source.to_empty(device=CPU)
@@ -3181,6 +3278,7 @@ class BaseQModel(nn.Module):
             quant_source = quant_source.to(device=CPU)
         weight = None if checkpoint_tensors is None else checkpoint_tensors.get("weight")
         if isinstance(weight, torch.Tensor) and hasattr(quant_source, "weight"):
+            result_shape = tuple(getattr(quant_source.weight, "shape", weight.shape))
             direct_scale = checkpoint_tensors.get("weight_scale")
             if not isinstance(direct_scale, torch.Tensor):
                 direct_scale = checkpoint_tensors.get("scale")
@@ -3191,6 +3289,7 @@ class BaseQModel(nn.Module):
                 weight=weight,
                 checkpoint_tensors=checkpoint_tensors,
                 module_name=module_name,
+                result_shape=result_shape,
             )
             if decoder_kind == "mimo_mixed":
                 from ..utils.mimo import decode_mimo_weight
@@ -3478,6 +3577,7 @@ class BaseQModel(nn.Module):
         *,
         weight: torch.Tensor,
         checkpoint_tensors: Dict[str, torch.Tensor],
+        result_shape: Optional[tuple[int, ...]] = None,
         module_name: Optional[str] = None,
     ) -> Optional[str]:
         """Infer which floatx decoder matches one checkpoint weight tensor."""
@@ -3498,6 +3598,13 @@ class BaseQModel(nn.Module):
             direct_scale = checkpoint_tensors.get("scale")
         if weight.dtype not in {torch.uint8, torch.int8} or not isinstance(direct_scale, torch.Tensor):
             return None
+        if (
+            result_shape is not None
+            and len(result_shape) == weight.ndim
+            and tuple(result_shape[:-1]) == tuple(weight.shape[:-1])
+            and result_shape[-1] == weight.shape[-1] * 2
+        ):
+            return "fp4"
         if isinstance(checkpoint_tensors.get("weight_scale_2"), torch.Tensor):
             return "fp4"
 
@@ -3740,6 +3847,18 @@ class BaseQModel(nn.Module):
         """Build the first-pass floatx view and defer dense BF16 until quantization."""
 
         decoder_plan = named_module.state.get("auto_module_decoder")
+        if not isinstance(decoder_plan, dict):
+            # Passthrough modules participate in the layer forward but are not
+            # visited by ModulePreProcessor. They still need the run's active
+            # checkpoint decoder when a lazy packed source backs their shell.
+            decoder_config = self._active_auto_module_decoder_config()
+            if decoder_config is not None:
+                decoder_plan = {
+                    "code": decoder_config.code,
+                    "source_dtype": decoder_config.source_dtype,
+                    "target_dtype": decoder_config.target_dtype,
+                }
+                named_module.state["auto_module_decoder"] = decoder_plan
         turtle_model = self.turtle_model
         if not isinstance(decoder_plan, dict) or turtle_model is None:
             return target_submodule
@@ -3761,6 +3880,7 @@ class BaseQModel(nn.Module):
         decoder_kind = self._decoder_weight_format(
             weight=weight,
             checkpoint_tensors=checkpoint_tensors,
+            result_shape=tuple(getattr(target_submodule.weight, "shape", weight.shape)),
             module_name=named_module.full_name,
         )
         if decoder_kind is None:
@@ -3768,6 +3888,7 @@ class BaseQModel(nn.Module):
 
         target_dtype = decoder_plan.get("target_dtype", target_submodule.weight.dtype)
         forward_policy = str(decoder_plan.get("passthrough_forward_policy", "native")).strip().lower()
+        preserve_subclass_forward = type(target_submodule) is not nn.Linear
         defer_quant_source_decode = (
             decoder_plan.get("quant_source_decode_policy") == "defer_until_quantization"
         )
@@ -3779,7 +3900,7 @@ class BaseQModel(nn.Module):
         forward_mode = "decode"
         reason = "native_execution_disabled"
         replacement = target_submodule
-        if forward_policy != "decode" and decoder_kind == "fp8" and device_supports_dtype(device, weight.dtype, require_validation=True):
+        if forward_policy != "decode" and not preserve_subclass_forward and decoder_kind == "fp8" and device_supports_dtype(device, weight.dtype, require_validation=True):
             fp8_module = self._build_fp8_forward_module(
                 target_submodule=target_submodule,
                 checkpoint_tensors=checkpoint_tensors,
@@ -3792,7 +3913,7 @@ class BaseQModel(nn.Module):
                 reason = "validated_native_fp8"
             else:
                 reason = "native_fp8_wrapper_unavailable"
-        elif forward_policy != "decode" and decoder_kind == "fp4" and device_supports_native_fp4(device, require_validation=True):
+        elif forward_policy != "decode" and not preserve_subclass_forward and decoder_kind == "fp4" and device_supports_native_fp4(device, require_validation=True):
             fp4_module = self._build_fp4_forward_module(
                 target_submodule=target_submodule,
                 checkpoint_tensors=checkpoint_tensors,
@@ -4174,6 +4295,7 @@ class BaseQModel(nn.Module):
                     decoder_kind = self._decoder_weight_format(
                         weight=weight,
                         checkpoint_tensors=checkpoint_tensors,
+                        result_shape=tuple(getattr(target_submodule.weight, "shape", weight.shape)),
                         module_name=named_module.full_name,
                     )
                     if decoder_kind is not None:
