@@ -27,7 +27,7 @@ def metrics(count):
         "hessian_weighted_reference_denominator": 1000.,"hessian_weighted_relative_error": .001}
 
 
-@pytest.mark.parametrize("bits",[4,6])
+@pytest.mark.parametrize("bits",range(1,9))
 @pytest.mark.parametrize("dtype",[torch.float16,torch.bfloat16,torch.float32])
 def test_quantizer_owns_raw_inputs_and_preserves_standard_padded_storage(monkeypatch,bits,dtype):
     w=(torch.arange(576*128).reshape(576,128)/8192).to(dtype)
@@ -70,7 +70,7 @@ def test_quantizer_rejects_fallback_or_invalid_metric(monkeypatch,key,value):
         core.quantize_projection(torch.ones(576,128),{"H": torch.eye(128),"count": 3,"finalized": False},bits=4,device="cpu")
 
 
-@pytest.mark.parametrize("options",[{"bits": 2},{"bits": True},{"bits": 4.},{"seed": False},
+@pytest.mark.parametrize("options",[{"bits": 0},{"bits": 9},{"bits": True},{"bits": 4.},{"seed": False},
     {"sigma": 0},{"sigma": float("inf")}])
 def test_quantizer_rejects_unreviewed_parameters(options):
     with pytest.raises(ValueError):

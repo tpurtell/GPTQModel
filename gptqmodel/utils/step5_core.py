@@ -77,11 +77,11 @@ def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, de
     its declared ``identity_rows`` count is retained in the returned evidence.
     Dense callers omit that key and therefore declare zero synthetic rows.
     """
-    if (isinstance(bits, bool) or bits not in (4, 5, 6) or not isinstance(bits, int)
+    if (isinstance(bits, bool) or not isinstance(bits, int) or not 1 <= bits <= 8
             or isinstance(seed, bool) or not isinstance(seed, int)
             or isinstance(sigma, bool) or not isinstance(sigma, (int, float))
             or not math.isfinite(sigma) or sigma <= 0):
-        raise ValueError("Step-5 projection requires K4/K5/K6, integer seed and positive finite sigma")
+        raise ValueError("Step-5 projection requires integer bits in 1..8, integer seed and positive finite sigma")
     if (not isinstance(weight, torch.Tensor) or weight.ndim != 2
             or weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
             or min(weight.shape) <= 0 or weight.shape[1] % 128):
