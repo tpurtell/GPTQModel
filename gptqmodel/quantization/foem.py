@@ -21,6 +21,8 @@ from ..looper.named_module import NamedModule
 from ..quantization import QuantizeConfig
 from ..utils.torch import torch_sync
 from .gptq import GPTQ
+from .quantizer import _neutralize_dead_columns
+
 
 _MLX_FOEM_MIN_ELEMENTS = 256 * 1024
 
@@ -229,12 +231,10 @@ class FOEM(GPTQ):
 
         H = self.H
         del self.H
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        W[:, dead] = 0
-
         if self.gptaq:
-            self.dXXT[:, dead] = 0
+            _neutralize_dead_columns(H, W, self.dXXT)
+        else:
+            _neutralize_dead_columns(H, W)
 
         # g_idx = []
         scale = []
@@ -300,6 +300,7 @@ class FOEM(GPTQ):
             if isinstance(self.module, transformers.Conv1D):
                 Q = Q.t()
             Q = Q.reshape(self.module.weight.shape).type_as(self.module.weight.data)
+            scale, zero = self._sanitize_scale_and_log(scale, zero)
             return (
                 Q,
                 scale,
@@ -387,11 +388,9 @@ class FOEM(GPTQ):
         group_size = self.qcfg.group_size if self.qcfg.group_size != -1 else self.columns
 
         if self.qcfg.static_groups and self.qcfg.desc_act:
-            g_idx = [perm[i] // group_size for i in range(self.columns)]
+            g_idx = (perm // group_size).to(dtype=torch.int32, device=Q.device)
         else:
-            g_idx = [i // group_size for i in range(self.columns)]
-
-        g_idx = torch.tensor(g_idx, dtype=torch.int32, device=Q.device)
+            g_idx = torch.arange(self.columns, dtype=torch.int32, device=Q.device) // group_size
 
         if self.qcfg.desc_act:
             Q = Q[:, invperm]
@@ -413,6 +412,7 @@ class FOEM(GPTQ):
 
         scale = torch.cat(scale, dim=1)
         zero = torch.cat(zero, dim=1)
+        scale, zero = self._sanitize_scale_and_log(scale, zero)
 
         duration = time.time() - start
 

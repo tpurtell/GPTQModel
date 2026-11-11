@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent native decoder and checkpoint-ownership contracts for Flash."""
-import json
 import inspect
+import json
 
 import pytest
 import torch
-from torch import nn
 from safetensors.torch import save_file
+from torch import nn
 
 from gptqmodel.utils import glm5_flash_core as core
 from gptqmodel.utils import glm5_flash_mtp as mtp
@@ -45,14 +45,14 @@ def initialize(block):
 
 @pytest.mark.parametrize("layer",[0,1])
 def test_staged_mhc_replay_is_byte_exact_to_native_decoder(layer,monkeypatch):
-    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
     from transformers.models.glm5_next import modeling_glm5_next as native
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
     function=getattr(native.chunk_kimi_delta_attention,"_gptqmodel_kda_original",native.chunk_kimi_delta_attention)
     monkeypatch.setattr(native,"chunk_kimi_delta_attention",core.bounded_kda(inspect.unwrap(function)))
     core.install_bounded_kda()
     block=initialize(Glm5NextTextDecoderLayer(config(),layer))
     hidden=torch.randn(1,9,4,128,generator=torch.Generator().manual_seed(1)).bfloat16()
-    state=dict(hidden=hidden)
+    state={"hidden": hidden}
     with torch.inference_mode():
         expected=core.native_forward(block,state)
         actual=core.staged_forward(block,state)
@@ -97,8 +97,8 @@ def test_source_remaps_native_names_and_owns_checkpoint_buffers(tmp_path,layer):
             for part,value in (("gate_proj",gate),("up_proj",up),("down_proj",original.mlp.experts.down_proj[expert])):
                 tensors[prefix+f"mlp.experts.{expert}.{part}.weight"]=value.contiguous()
     save_file(tensors,tmp_path/"weights.safetensors")
-    (tmp_path/"config.json").write_text(json.dumps(dict(model_type="glm5_next",text_config=cfg.to_dict())))
-    (tmp_path/"model.safetensors.index.json").write_text(json.dumps(dict(weight_map={k:"weights.safetensors" for k in tensors})))
+    (tmp_path/"config.json").write_text(json.dumps({"model_type": "glm5_next","text_config": cfg.to_dict()}))
+    (tmp_path/"model.safetensors.index.json").write_text(json.dumps({"weight_map": dict.fromkeys(tensors, "weights.safetensors")}))
     source=core.GlmFlashBF16Source(tmp_path)
     block=source.load_block(layer,"cpu",include_experts=True)
     assert source._reader is None

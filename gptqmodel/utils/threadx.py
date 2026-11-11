@@ -68,6 +68,10 @@ class WarmupTask:
     scope: WarmUpCtx = WarmUpCtx.DEVICE
 
 
+def _noop() -> None:
+    """Placeholder task used only to make a worker run its pending warmups."""
+
+
 # --------------------------- Backend availability helpers ---------------------------
 # We keep these helpers small and side-effect free—only feature checks—so we can
 # query once and rely on final results without redundant availability if-ladders.
@@ -89,6 +93,12 @@ def _coerce_device(d: DeviceLike) -> torch.device:
     """
     if isinstance(d, torch.device):
         return d
+    # ``DEVICE.ROCM`` (and the other DEVICE members) are support-family enums;
+    # their value is not necessarily a torch device type. Resolve to the
+    # runtime family (ROCm -> ``cuda``) so family-wide locks keep working.
+    family = getattr(d, "type", None)
+    if isinstance(family, str) and hasattr(d, "to_torch_device"):
+        return torch.device(family)
     if isinstance(d, int):
         if torch.cuda.is_available():
             return torch.device("cuda", d)
@@ -830,6 +840,8 @@ class DeviceThreadPool:
         self._ordered_keys = sorted(self._locks.keys())
         self._rebuild_family_keys()
 
+        self._kick_worker_warmups()
+
         # GC diagnostics counters
         self._gc_passes = 0
         self._last_gc_ts: Optional[float] = None
@@ -883,7 +895,27 @@ class DeviceThreadPool:
 
         self._family_keys = fam_map
 
+    def _kick_worker_warmups(self) -> None:
+        """
+        Start accelerator warmups during pool construction instead of blocking
+        the first real task on them.
+
+        Workers run their warmup plan lazily, immediately before the first task
+        they execute. Enqueueing a no-op here means the one-time library setup
+        (BLAS handle creation, solver backends, ...) overlaps with whatever the
+        caller does next rather than delaying the first unit of real work.
+        """
+        if not self._worker_warmups:
+            return
+        for key in self._ordered_keys:
+            if self._devices_by_key[key].type not in ("cuda", "xpu", "npu", "mps"):
+                continue
+            for worker in self._worker_groups.get(key, ()):
+                worker.submit(_noop)
+
     def _resolve_device_key(self, device: DeviceLike | str) -> str:
+        if hasattr(device, "to_torch_device"):
+            device = device.type
         if isinstance(device, str):
             if device == "all":
                 raise ValueError("'all' is not a valid concrete device specification")
@@ -1242,6 +1274,8 @@ class DeviceThreadPool:
           - 'all' for every device in the pool
         Returns a context manager.
         """
+        if hasattr(device, "to_torch_device"):
+            device = device.type
         # Family string shortcut (e.g., "cuda" or "all")
         if isinstance(device, str):
             if device == "all":
@@ -1453,6 +1487,8 @@ class DeviceThreadPool:
         keys: List[str] = []
         seen: set[str] = set()
         for s in scope:
+            if hasattr(s, "to_torch_device"):
+                s = s.type
             if isinstance(s, str):
                 if s == "all":
                     for key in self._ordered_keys:

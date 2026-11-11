@@ -2,15 +2,15 @@
 """CPU execution/ownership contracts and independent FP64 covariance oracles."""
 import importlib.util
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-from torch import nn
 from safetensors.torch import save_file
+from torch import nn
 
 
 _root = Path(__file__).parents[1] / "gptqmodel/utils"
@@ -27,7 +27,8 @@ _spec.loader.exec_module(k31)
 def test_dense_real_rows_match_independent_fp64_oracle(dtype):
     x = torch.linspace(-2, 2, 513 * 16).reshape(513, 16).to(dtype)
     state = k31.DenseRawHessian(16, device="cpu")
-    state.add(x[:241]); state.update(x[241:].reshape(1, 272, 16))
+    state.add(x[:241])
+    state.update(x[241:].reshape(1, 272, 16))
     raw = state.raw_dict(minimum_rows=513)
     oracle = x.double().T @ x.double()
     assert raw["count"] == 513 and raw["finalized"] is False
@@ -107,15 +108,15 @@ def test_source_deferred_experts_one_active_reader_and_f32_indexer(tmp_path, mon
     save_file({name: weight, packed_name: torch.full((2, 16), 0x32, dtype=torch.uint8),
                scale_name: torch.full((2, 1), 127, dtype=torch.uint8)}, str(snapshot / "a.safetensors"))
     save_file({"other": torch.ones(1)}, str(snapshot / "b.safetensors"))
-    config = dict(model_type="kimi_k31", architectures=["KimiK31ForConditionalGeneration"],
-                  text_config=dict(num_hidden_layers=4))
+    config = {"model_type": "kimi_k31", "architectures": ["KimiK31ForConditionalGeneration"],
+                  "text_config": {"num_hidden_layers": 4}}
     (snapshot / "config.json").write_text(json.dumps(config))
-    (snapshot / "model.safetensors.index.json").write_text(json.dumps(dict(weight_map={
-        name: "a.safetensors", packed_name: "a.safetensors", scale_name: "a.safetensors", "other": "b.safetensors"})))
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        name: "a.safetensors", packed_name: "a.safetensors", scale_name: "a.safetensors", "other": "b.safetensors"}}))
     reference = ModuleType("families.kimi_k3.model")
     reference.load_official = lambda _: (SimpleNamespace(KimiDecoderLayer=Block), SimpleNamespace(),
-                                         dict(format="mxfp4-pack-quantized"))
-    reference.source_identity = lambda _: dict(revision=k31.REVISION)
+                                         {"format": "mxfp4-pack-quantized"})
+    reference.source_identity = lambda _: {"revision": k31.REVISION}
     monkeypatch.setitem(sys.modules, "families.kimi_k3.model", reference)
     import safetensors
     original, opens = safetensors.safe_open, []
@@ -153,7 +154,7 @@ def test_source_deferred_experts_one_active_reader_and_f32_indexer(tmp_path, mon
 @pytest.mark.parametrize("bad", ["nonzero", "negative-zero", "wrong-dtype", "wrong-length"])
 def test_padded_a_log_requires_exact_zero_f32_tail(bad):
     source = object.__new__(k31.KimiK31Source)
-    source.text_config = dict(linear_attn_config=dict(num_heads=96))
+    source.text_config = {"linear_attn_config": {"num_heads": 96}}
     name = "language_model.model.layers.0.self_attn.A_log"
     source.weight_map = {name: "unused"}
     value = torch.cat((torch.linspace(-2, 2, 96), torch.zeros(32)))

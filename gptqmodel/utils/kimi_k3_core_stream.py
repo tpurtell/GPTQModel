@@ -179,6 +179,6 @@ class DenseRawHessian:
         if (not bool(torch.isfinite(self.H).all())
                 or float(self.H.diagonal().sum()) <= 0):
             raise ValueError("invalid dense Hessian covariance")
-        return dict(H=self.H, count=self.count, finalized=False)
+        return {"H": self.H, "count": self.count, "finalized": False}
 
     as_dict = raw_dict

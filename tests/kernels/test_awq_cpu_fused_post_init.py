@@ -9,7 +9,6 @@ import torch
 from gptqmodel.adapter.adapter import Lora
 from gptqmodel.nn_modules.qlinear.torch_aten_kernel_awq import TorchAtenAwqLinear
 from gptqmodel.nn_modules.qlinear.torch_fused_awq import TorchFusedAwqLinear
-from gptqmodel.nn_modules.qlinear.torch_int8_awq import TorchInt8AwqLinear
 from gptqmodel.quantization import FORMAT, METHOD
 from gptqmodel.utils.backend import BACKEND
 from gptqmodel.utils.importer import select_quant_linear
@@ -20,7 +19,6 @@ from gptqmodel.utils.importer import select_quant_linear
     [
         pytest.param(TorchFusedAwqLinear, id="torch_fused_awq"),
         pytest.param(TorchAtenAwqLinear, id="torch_aten_awq"),
-        pytest.param(TorchInt8AwqLinear, id="torch_int8_awq"),
     ],
 )
 def test_awq_fused_post_init_calls_adapter(monkeypatch, kernel_cls):
@@ -40,7 +38,10 @@ def test_awq_fused_post_init_calls_adapter(monkeypatch, kernel_cls):
 
     module = kernel_cls(
         bits=4,
-        group_size=16,
+        # `TorchAtenAwqLinear` only accepts [32, 64, 128, 256] and `32` is
+        # also valid for `TorchFusedAwqLinear` ([-1, 16, 32, 64, 128]);
+        # this test only exercises adapter post_init.
+        group_size=32,
         sym=True,
         desc_act=False,
         in_features=32,

@@ -46,6 +46,8 @@ from safetensors import safe_open
 from torch import nn
 
 from ..utils.logger import setup_logger
+from .p2p import safe_move_to
+from .torch import as_torch_device
 
 
 # =========================
@@ -555,7 +557,9 @@ def _ensure_target_storage_on_device_(param: torch.nn.Parameter, device: torch.d
     if param.device == device:
         return param
     # CPU or wrong GPU -> rebind data storage on target device
-    param.data = param.data.to(device, copy=True)  # alloc new storage on device; keeps Parameter identity
+    # Allocate new storage on the target device; a direct peer copy on an
+    # asymmetric ROCm link can segfault, so use the direction-aware helper.
+    param.data = safe_move_to(param.data, device, copy=True)  # keeps Parameter identity
     return param
 
 
@@ -797,6 +801,46 @@ class _LazyCheckpointAssembly:
     groups: tuple[tuple[int, ...], ...]
     merge_dim: int
     concat_dim: Optional[int]
+
+
+# A shard holding several model layers is re-opened and re-read once per layer
+# it contains. The layout is fixed per checkpoint, so a process only needs to
+# hear it once.
+_NON_LAYERWISE_SHARD_WARNING_LOCK = threading.Lock()
+_NON_LAYERWISE_SHARD_WARNING_EMITTED = False
+
+# Path segments that conventionally introduce a decoder/encoder layer index in
+# Hugging Face checkpoints. Used only when the model's `module_tree` does not
+# describe the checkpoint naming scheme.
+_LAYER_CONTAINER_SEGMENTS = frozenset(
+    {
+        "block",
+        "blocks",
+        "decoder_block",
+        "decoder_blocks",
+        "decoder_layer",
+        "decoder_layers",
+        "encoder_block",
+        "encoder_blocks",
+        "encoder_layer",
+        "encoder_layers",
+        "h",
+        "layer",
+        "layers",
+        "transformer_block",
+        "transformer_blocks",
+        "transformer_layer",
+        "transformer_layers",
+    }
+)
+
+
+def reset_non_layerwise_shard_warning() -> None:
+    """Allow the one-shot checkpoint shard-layout warning to fire again."""
+
+    global _NON_LAYERWISE_SHARD_WARNING_EMITTED
+    with _NON_LAYERWISE_SHARD_WARNING_LOCK:
+        _NON_LAYERWISE_SHARD_WARNING_EMITTED = False
 
 
 class LazyTurtle:
@@ -1376,7 +1420,7 @@ class LazyTurtle:
         """Materialize only direct meta params/buffers for one shell submodule."""
 
         if device is not None:
-            device = torch.device(device)
+            device = as_torch_device(device)
             if device.type == "meta":
                 raise ValueError("materialize_direct_meta_tensors() does not support meta target devices.")
 
@@ -1395,10 +1439,37 @@ class LazyTurtle:
                 "_non_persistent_buffers_set",
                 set(),
             )
+            # Non-persistent buffers are absent from the checkpoint, so the
+            # recursive path rebuilds them from a constructor template whenever
+            # they are meta or not on the requested device. Match that here
+            # instead of only rebuilding meta tensors.
+            restore_device = device
+            if restore_device is None:
+                # A materialized direct parameter anchors this module's
+                # execution device before any init-only buffer does.
+                resolved = next(
+                    (
+                        param.device
+                        for param in target_submodule.parameters(recurse=False)
+                        if not _is_meta_tensor(param)
+                    ),
+                    None,
+                )
+                if resolved is None:
+                    resolved = next(
+                        (
+                            buffer.device
+                            for buffer in direct_buffers.values()
+                            if not _is_meta_tensor(buffer)
+                        ),
+                        None,
+                    )
+                restore_device = resolved if resolved is not None else torch.device("cpu")
             missing_nonpersistent_buffers = [
                 (name, name)
                 for name, buffer in direct_buffers.items()
-                if name in nonpersistent and _is_meta_tensor(buffer)
+                if name in nonpersistent
+                and (_is_meta_tensor(buffer) or buffer.device != restore_device)
             ]
             if missing_nonpersistent_buffers:
                 self._restore_missing_nonpersistent_buffers(
@@ -1406,7 +1477,7 @@ class LazyTurtle:
                     target_submodule=target_submodule,
                     t_bufs=direct_buffers,
                     missing_nonpersistent_buffers=missing_nonpersistent_buffers,
-                    device=device,
+                    device=restore_device,
                 )
             return target_submodule
 
@@ -1570,6 +1641,24 @@ class LazyTurtle:
             checkpoint_pattern, runtime_prefix = renaming_patterns
             reversed_map.append(_LazyWeightRenaming(runtime_prefix, checkpoint_pattern))
         return reversed_map or None
+
+    @classmethod
+    def convert_hf_checkpoint_key(
+        cls,
+        key: str,
+        conversion_mapping: Optional[Any],
+        *,
+        to_runtime: bool = False,
+    ) -> str:
+        """Apply one reversible key rename from a model's HF conversion map."""
+        if to_runtime:
+            conversion_mapping = cls.reverse_hf_conversion_map(conversion_mapping)
+
+        for renaming in cls._normalize_runtime_to_checkpoint_renamings(conversion_mapping):
+            converted, _ = renaming.rename_source_key(key)
+            if converted != key:
+                return converted
+        return key
 
     @classmethod
     def infer_hf_conversion_map_reversed(
@@ -1763,6 +1852,105 @@ class LazyTurtle:
                     continue
                 return parts[start : end + 1], parts[end + 1 :]
         return (), parts
+
+    @staticmethod
+    def _fallback_layer_key(name: str) -> Optional[str]:
+        """Infer a layer key from a checkpoint path without `module_tree` prefixes."""
+
+        parts = tuple(part for part in name.split(".") if part)
+        for index in range(1, len(parts)):
+            if parts[index].isdigit() and parts[index - 1] in _LAYER_CONTAINER_SEGMENTS:
+                return ".".join(parts[: index + 1])
+        return None
+
+    def checkpoint_layer_key(self, name: str) -> Optional[str]:
+        """Return the layer that owns checkpoint tensor `name`, if any.
+
+        Tensors that are not owned by a layer (embeddings, the language
+        model head, model-level norms, ...) return `None` and are ignored by the
+        shard-layout check.
+        """
+
+        layer_head, _ = self._split_layer_relative_path(name)
+        if layer_head:
+            return ".".join(layer_head)
+        return self._fallback_layer_key(name)
+
+    def checkpoint_shard_layer_groups(self) -> Dict[str, frozenset[str]]:
+        """Map every checkpoint shard to the layers whose tensors it stores."""
+
+        groups: Dict[str, set[str]] = {}
+        for tensor_name, shard_name in self._weight_map.items():
+            bucket = groups.setdefault(shard_name, set())
+            layer_key = self.checkpoint_layer_key(tensor_name)
+            if layer_key is not None:
+                bucket.add(layer_key)
+        return {shard_name: frozenset(layer_keys) for shard_name, layer_keys in groups.items()}
+
+    def warn_if_checkpoint_shards_are_not_layerwise(self) -> None:
+        """Warn once per process when a shard stores tensors from several layers.
+
+        LazyTurtle is only used by the quantization offload path, so this check
+        intentionally stays out of the inference load path. The warning is
+        advisory: a failure while inspecting the index must never disable lazy
+        loading.
+        """
+
+        global _NON_LAYERWISE_SHARD_WARNING_EMITTED
+
+        try:
+            shard_groups = self.checkpoint_shard_layer_groups()
+        except Exception as exc:  # never let an advisory break lazy loading
+            log.debug("LazyTurtle: checkpoint shard-layout check skipped: %s", exc)
+            return
+
+        multi_layer_shards = {
+            shard_name: layer_keys
+            for shard_name, layer_keys in shard_groups.items()
+            if len(layer_keys) > 1
+        }
+        if not multi_layer_shards:
+            return
+
+        with _NON_LAYERWISE_SHARD_WARNING_LOCK:
+            if _NON_LAYERWISE_SHARD_WARNING_EMITTED:
+                return
+            _NON_LAYERWISE_SHARD_WARNING_EMITTED = True
+
+        example_shard, example_layers = max(
+            multi_layer_shards.items(),
+            key=lambda item: len(item[1]),
+        )
+
+        log.warning(
+            "LazyTurtle: loading this checkpoint for quantization, but its shards are not layer-wise: "
+            "%s. The same shard is opened and re-read once per layer it holds, adding "
+            "avoidable I/O during quantization; re-shard so each layer has its own file.",
+            self._format_shard_layout_detail(
+                shard_groups=shard_groups,
+                multi_layer_shards=multi_layer_shards,
+                example_shard=example_shard,
+                example_layer_count=len(example_layers),
+            ),
+        )
+
+    @staticmethod
+    def _format_shard_layout_detail(
+        *,
+        shard_groups: Dict[str, frozenset[str]],
+        multi_layer_shards: Dict[str, frozenset[str]],
+        example_shard: str,
+        example_layer_count: int,
+    ) -> str:
+        """Describe the offending shards, keeping the count grammar-correct."""
+
+        if len(shard_groups) == 1:
+            return f"`{example_shard}` holds {example_layer_count} model layers"
+        verb = "holds" if len(multi_layer_shards) == 1 else "hold"
+        return (
+            f"{len(multi_layer_shards)} of {len(shard_groups)} safetensors files {verb} multiple "
+            f"model layers (e.g. `{example_shard}` holds {example_layer_count})"
+        )
 
     def _module_tree_name_aliases(self, name: str) -> list[str]:
         """Generate checkpoint-name candidates from MoE aliases declared in `module_tree`."""
@@ -2580,7 +2768,7 @@ class LazyTurtle:
 
         if self.is_no_placement_tensor(module_path, rel_name):
             return torch.device("cpu")
-        return torch.device(default_device)
+        return as_torch_device(default_device)
 
     def is_no_placement_tensor(self, module_path: str, rel_name: str) -> bool:
         """Check Transformers' accelerator placement exclusions."""
@@ -3116,7 +3304,7 @@ class LazyTurtle:
                         persistent = leaf not in getattr(t_parent, "_non_persistent_buffers_set", set())
                         source = tensor.detach()
                         if target_buffer is None:
-                            new_buffer = source.to(device=device)
+                            new_buffer = safe_move_to(source, device)
                             t_parent.register_buffer(leaf, new_buffer, persistent=persistent)
                             t_bufs[rel_name] = new_buffer
                         elif getattr(target_buffer, "is_meta", False) or target_buffer.device.type == "meta":
@@ -3231,7 +3419,7 @@ class LazyTurtle:
 
                                 source = tensor.detach()
                                 if target_buffer is None:
-                                    new_buffer = source.to(device=device)
+                                    new_buffer = safe_move_to(source, device)
                                     t_parent.register_buffer(leaf, new_buffer, persistent=persistent)
                                     t_bufs[rel_name] = new_buffer
                                 else:
@@ -3397,7 +3585,7 @@ class LazyTurtle:
                 source_buffer = source_buffer.detach()
 
             target_dtype = source_buffer.dtype if current_buffer is None else current_buffer.dtype
-            materialized = source_buffer.to(device=device, dtype=target_dtype)
+            materialized = safe_move_to(source_buffer, device, dtype=target_dtype)
             owner_module.register_buffer(leaf, materialized, persistent=False)
             t_bufs[rel_name] = materialized
 

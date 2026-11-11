@@ -23,9 +23,9 @@ from ..nn_modules.qlinear import AWQuantLinear, BaseQuantLinear, GPTQQuantLinear
 from ..quantization import FORMAT, METHOD, QuantizeConfig
 from .backend import BACKEND, normalize_backend
 from .importer import (
-    AUTO_BACKEND_KERNEL_MAPPING,
-    BACKEND_TO_METHOD_FORMAT_MAPPING,
     _as_selector_device,
+    get_auto_backend_kernel_mapping,
+    get_backend_to_method_format_mapping,
     select_quant_linear,
     validate_quant_linear,
 )
@@ -96,9 +96,34 @@ def _resolve_pack_dtype(
     return torch.int16 if method == METHOD.AWQ and format_value == FORMAT.GEMV_FAST else torch.int32
 
 
-def _normalize_pack_impl(pack_impl: Optional[str], module: BaseQuantLinear) -> str:
+def _auto_pack_impl(module: BaseQuantLinear, linear: Optional[nn.Module] = None) -> str:
+    """Resolve ``pack_impl="auto"`` to the fastest available packer.
+
+    Accelerator packing is preferred whenever a CUDA/ROCm device is present and
+    the module implements it.  Embedding layers keep the CPU block packer because
+    ``pack_gpu`` does not emit their packed layout.
+    """
+    if (
+        not isinstance(linear, nn.Embedding)
+        and torch.cuda.is_available()
+        and hasattr(module, "pack_gpu")
+    ):
+        return "gpu"
+    if hasattr(module, "pack_block"):
+        return "block"
+    return "original"
+
+
+def _normalize_pack_impl(
+    pack_impl: Optional[str],
+    module: BaseQuantLinear,
+    linear: Optional[nn.Module] = None,
+) -> str:
     """Map a user supplied pack implementation to one of gpu/block/original."""
     requested = (pack_impl or "original").strip().lower()
+
+    if requested in {"auto", "default"}:
+        return _auto_pack_impl(module=module, linear=linear)
 
     if requested in {"cpu", "block", "pack_block"}:
         if not hasattr(module, "pack_block"):
@@ -436,7 +461,7 @@ def hf_check_best_packing_format(
     method = _normalize_method(quant_method)
 
     if formats is None:
-        candidates = list(BACKEND_TO_METHOD_FORMAT_MAPPING.get(method, {}).keys())
+        candidates = list(get_backend_to_method_format_mapping().get(method, {}).keys())
     else:
         candidates = [_normalize_format(candidate) for candidate in formats]
     if not candidates:
@@ -444,7 +469,7 @@ def hf_check_best_packing_format(
 
     ranked: List[tuple] = []
     for fmt in candidates:
-        kernels = AUTO_BACKEND_KERNEL_MAPPING.get(method, {}).get(fmt)
+        kernels = get_auto_backend_kernel_mapping().get(method, {}).get(fmt)
         if not kernels:
             continue
         best_priority = max(
@@ -515,10 +540,11 @@ def hf_pack_layer(
             ``[out_features, num_groups]``.  When omitted and the module is
             symmetric (``sym=True``), ``2 ** (bits - 1)`` is used.
         g_idx: Activation-order group index of length ``in_features``.
-        pack_impl: Packing implementation: ``"original"`` (default),
-            ``"block"``/``"cpu"`` or ``"gpu"``.  GPU/block requests fall back to
-            the original packer when unavailable.  Ignored by QQQ and AWQ
-            kernels, which expose a single ``pack()`` implementation.
+        pack_impl: Packing implementation: ``"original"`` (default), ``"auto"``
+            (accelerator pack when available), ``"block"``/``"cpu"`` or
+            ``"gpu"``.  GPU/block requests fall back to the original packer when
+            unavailable.  Ignored by QQQ and AWQ kernels, which expose a single
+            ``pack()`` implementation.
         device: Target CUDA device for ``pack_impl="gpu"``.
         block_in: Input channels per block for ``pack_impl="block"``.
         workers: Worker threads for ``pack_impl="block"``.
@@ -562,7 +588,9 @@ def hf_pack_layer(
             )
 
         resolved_zeros = _resolve_zeros(module=module, scales=scales, zeros=zeros)
-        effective_impl = _normalize_pack_impl(pack_impl=pack_impl, module=module)
+        effective_impl = _normalize_pack_impl(
+            pack_impl=pack_impl, module=module, linear=linear
+        )
 
         if effective_impl == "gpu":
             try:
@@ -605,18 +633,27 @@ def hf_pack_layer(
             )
 
     if isinstance(module, GPTQQuantLinear):
-        # Every raw GPTQ packer writes the checkpoint/v1 qzero layout.  A
-        # caller may reuse a module that was previously converted to v2, so
-        # reset the metadata before deciding whether another conversion is
-        # needed.  Without this, a second pack can skip v1->v2 or apply
-        # v2->v1 to freshly-written v1 words.
-        module.qzero_format(format=1)
+        # Every raw GPTQ packer writes logical zero points (the internal/v2
+        # qzero layout).  A caller may reuse a module that was previously
+        # converted to v1, so reset the metadata before deciding whether a
+        # conversion is needed.  Without this, a second pack can skip v2->v1
+        # or apply v1->v2 to freshly-written v2 words.
+        module.qzero_format(format=2)
         requested_format = checkpoint_format
         if requested_format is None:
             requested_format = getattr(module, "format", None) or FORMAT.GPTQ
         requested_format = _normalize_format(requested_format)
         if requested_format in (FORMAT.GPTQ, FORMAT.GPTQ_V2):
-            wanted_qzero_format = 1 if requested_format == FORMAT.GPTQ else 2
+            # The v1-checkpoint convention (stored zero point minus one) only
+            # applies to kernels that require the v2 runtime layout; other
+            # kernels keep the raw packer words for both checkpoint flavors,
+            # matching `pack_module`.
+            wanted_qzero_format = (
+                1
+                if requested_format == FORMAT.GPTQ
+                and getattr(module, "REQUIRES_FORMAT_V2", False)
+                else 2
+            )
             if module.qzero_format() != wanted_qzero_format:
                 from .model import (
                     convert_gptq_v1_to_v2_format_module,
@@ -635,6 +672,21 @@ def hf_pack_layer(
                     )
 
     if post_init:
+        if (
+            isinstance(module, GPTQQuantLinear)
+            and getattr(module, "REQUIRES_FORMAT_V2", False)
+            and module.qzero_format() == 1
+        ):
+            # A v1-checkpoint request left zp-1 words for export, but the v2
+            # runtime layout is what flag-blind decoders read; restore it before
+            # the module becomes usable.
+            from .model import convert_gptq_v1_to_v2_format_module
+
+            convert_gptq_v1_to_v2_format_module(
+                module=module,
+                bits=module.bits,
+                pack_dtype=getattr(module, "pack_dtype", torch.int32),
+            )
         module.post_init(**(post_init_kwargs or {}))
 
     return module

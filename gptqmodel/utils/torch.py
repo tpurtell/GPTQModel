@@ -6,6 +6,7 @@
 import contextlib
 import importlib
 import os
+import sys
 import time
 from contextlib import contextmanager
 from enum import Enum
@@ -37,6 +38,26 @@ HAS_NPU = False
 CPU = torch.device("cpu")
 META = torch.device("meta")
 
+
+def as_torch_device(device_like) -> torch.device:
+    """Resolve a device-like value without assigning an implicit ordinal.
+
+    GPT-QModel's ``DEVICE`` enum names a kernel support family, and its
+    ``DEVICE.ROCM`` member intentionally has the value ``"rocm"`` even though
+    PyTorch exposes ROCm through the ``cuda`` namespace.  ``torch.device``
+    therefore rejects it. Resolve enums through their runtime ``type`` while
+    keeping families indexless, just like ``torch.device("cuda")``. Calling
+    ``to_torch_device()`` here would pin family selectors to device 0 instead
+    of honoring the caller's current CUDA/XPU/NPU device.
+    """
+    if isinstance(device_like, torch.device):
+        return device_like
+    resolver = getattr(device_like, "to_torch_device", None)
+    if callable(resolver):
+        return torch.device(device_like.type)
+    return torch.device(device_like)
+
+
 class BalanceStrategy(str, Enum):
     MEMORY = "memory", # make vram more spread out
     GPU = "gpu" # vram is less balanced (gpu0) but gpu0 is also used for quantization
@@ -60,15 +81,34 @@ def timed_gc_collect() -> int:
     log.info(f"gc.collect() reclaimed {collected} objects in {duration:.3f}s")
     return collected
 
-# reset dynamo cache on each model load since during ci loop model inference may exhuast cache
-try:
-    torch._dynamo.reset()
-    # Increase the dynamo cache size limit, default of 8 is too low
-    if torch._dynamo.config.cache_size_limit < 128:
-        torch._dynamo.config.cache_size_limit = 128
-except BaseException:
-    # triton built from source maybe incompatible with _dynamo private api
-    pass
+def configure_dynamo_cache(*, ensure_import: bool = False) -> bool:
+    """
+    Raise dynamo's recompile cache limit to the project minimum (128).
+
+    `torch._dynamo` is imported lazily: pulling it in costs about a second of
+    process startup because it drags `torch._inductor` (and its cudagraph
+    machinery) along with it, and the cache limit only matters once something
+    actually compiles. Callers that are about to compile pass `ensure_import=True`
+    so the limit is in place before the first `torch.compile`.
+    """
+    dynamo = sys.modules.get("torch._dynamo")
+    if dynamo is None:
+        if not ensure_import:
+            return False
+        try:
+            import torch._dynamo as dynamo
+        except Exception:
+            # triton built from source maybe incompatible with _dynamo private api
+            return False
+
+    try:
+        # default of 8 is too low: ci loop model inference may exhaust the cache
+        if dynamo.config.cache_size_limit < 128:
+            dynamo.config.cache_size_limit = 128
+        return True
+    except Exception:
+        # triton built from source maybe incompatible with _dynamo private api
+        return False
 
 try:
     HAS_CUDA = torch.cuda.is_available()
@@ -104,13 +144,38 @@ except Exception:
     HAS_NPU = False
 
 
-# mlx check
-try:
-    import mlx.core  # type: ignore # noqa: F401
-    import mlx.core.metal  # noqa: F401
+mlx = None
+
+
+def _detect_mlx() -> bool:
+    """Probe for a usable MLX install, binding the package on success.
+
+    MLX is an optional accelerator: absence (or a broken native install) is
+    expected on most hosts, so probe failures are reported as "unavailable".
+    ``except Exception`` is deliberate -- ``KeyboardInterrupt``/``SystemExit``
+    must stay visible rather than being reported as a missing dependency.
+
+    ``mlx`` and ``HAS_MLX`` are updated together so callers guarded by
+    ``if HAS_MLX: mlx.core.clear_cache()`` can never see one without the other.
+    A partially-installed package binds ``mlx`` while ``mlx.core.metal`` raises,
+    so the failure path clears it again.
+    """
+    global HAS_MLX, mlx
+
+    try:
+        import mlx.core  # type: ignore # noqa: F401
+        import mlx.core.metal  # noqa: F401
+    except Exception:
+        HAS_MLX = False
+        mlx = None
+        return HAS_MLX
+
     HAS_MLX = True
-except BaseException:
-    pass
+    return HAS_MLX
+
+
+# mlx check
+HAS_MLX = _detect_mlx()
 
 try:
     torch.backends.fp32_precision
@@ -174,6 +239,7 @@ def torch_compile(module: Union[torch.nn.Module, Callable], backend:str ="induct
 
     if not TORCH_HAS_COMPILE:
         return module
+    configure_dynamo_cache(ensure_import=True)
     if HAS_MPS and not TORCH_GTE_28:
         if not torch._dynamo.config.suppress_errors:
             log.warn("To use compile() with MPS, you need to have torch version >= 2.8.0, "
@@ -182,7 +248,7 @@ def torch_compile(module: Union[torch.nn.Module, Callable], backend:str ="induct
         return module
     try:
         return torch.compile(module, backend=backend, mode=mode, fullgraph=fullgraph)
-    except BaseException as e:
+    except Exception as e:
         log.warn.once(f"Failed to compile `{module}`, {e}")
         return module
 
@@ -345,6 +411,52 @@ def empty_cache_for_device(device: torch.device) -> bool:
     return False
 
 
+@lru_cache(maxsize=12)
+def resolve_memory_stats_callable(device_type: str) -> Optional[Callable[[torch.device], dict]]:
+    """Return the allocator-stats callable for `device_type`, or None when absent.
+
+    Mirrors ``resolve_empty_cache_callable``: allocator diagnostics should ask the
+    active accelerator, because ``torch.cuda`` only reports CUDA allocations and
+    stays empty on NPU/XPU/CPU-only builds.
+    """
+
+    try:
+        if device_type == "cuda" and HAS_CUDA:
+            candidate = torch.cuda.memory_stats
+        elif device_type == "xpu" and HAS_XPU:
+            candidate = torch.xpu.memory_stats
+        elif device_type == "npu" and HAS_NPU:
+            candidate = torch.npu.memory_stats
+        else:
+            candidate = None
+    except Exception:
+        candidate = None
+
+    if callable(candidate):
+        return candidate
+
+    return None
+
+
+def memory_stats_for_device(device: torch.device) -> dict:
+    """Return allocator statistics for `device`, or an empty mapping when unsupported.
+
+    Best-effort telemetry uses this instead of ``torch.cuda.memory_stats``. The
+    CUDA call reports nothing for a non-CUDA device, so accelerator memory log
+    rows silently read zero on NPU/XPU/CPU-only builds even while the device is
+    holding allocations.
+    """
+
+    fn = resolve_memory_stats_callable(device.type)
+    if fn is None:
+        return {}
+
+    try:
+        return fn(device)
+    except Exception:
+        return {}
+
+
 def torch_empty_cache_any(
     device: Union[torch.device, str, int, None] = None,
     gc: bool = True,
@@ -392,7 +504,19 @@ def torch_empty_cache_any(
 def torch_empty_cache(device: torch.device = None, gc: bool = True, sync: bool = False) -> bool:
     return torch_empty_cache_any(device=device, gc=gc, sync=sync)
 
+def resolve_torch_device(device: Union[torch.device, str, int, None] = None):
+    """Resolve ``auto`` or a concrete device without assuming CUDA exists."""
+    if device is None or (isinstance(device, str) and device.lower() == "auto"):
+        return auto_select_torch_device()
+    return _normalize_device(device)
+
+
 def auto_select_torch_device(index: int = 0):
+    """Return the fastest available Torch accelerator, with CUDA precedence.
+
+    The ordering preserves existing multi-GPU defaults while allowing the same
+    callers to run on Apple MPS and CPU-only machines.
+    """
     assert index >= 0, f"device index should be a positive integer: actual = `{index}`"
 
     if HAS_CUDA:

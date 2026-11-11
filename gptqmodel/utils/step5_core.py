@@ -7,19 +7,20 @@ This adapter adds loading, observation and stage boundaries, never attention mat
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
 import copy
 import importlib.util
 import json
 import math
-from pathlib import Path
 import sys
 import types
+from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from torch import nn
 
 from . import glm5_core as base
+
 
 PREFIX = "model."
 REVISION = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1"
@@ -107,13 +108,13 @@ def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, de
     working = torch.zeros((inputs, stored_outputs), device=weight.device, dtype=torch.float32)
     working[:, :outputs].copy_(weight.T)
     target = torch.device(device)
-    raw = dict(H=H.to(device=target, copy=True), count=raw_hessian["count"], finalized=False)
-    args = dict(K=bits, seed=seed, sigma_reg=float(sigma), devices=[target], mcg=True, apply_out_scales=None)
+    raw = {"H": H.to(device=target, copy=True), "count": raw_hessian["count"], "finalized": False}
+    args = {"K": bits, "seed": seed, "sigma_reg": float(sigma), "devices": [target], "mcg": True, "apply_out_scales": None}
     _, _, packed = base._quantizer().quantize_exl3(working, raw, args, return_weight_q=False)
     metrics = args.get("error_metrics", {})
-    required = dict(quantizer_path="hessian_ldlq", hessian_metric_status="ok",
-        hessian_numerical_contract="signed-block-hadamard-congruence-fp64-v1", hessian_transform_compute_dtype="torch.float64",
-        hessian_storage_dtype="torch.float32", hessian_sample_count=raw_hessian["count"])
+    required = {"quantizer_path": "hessian_ldlq", "hessian_metric_status": "ok",
+        "hessian_numerical_contract": "signed-block-hadamard-congruence-fp64-v1", "hessian_transform_compute_dtype": "torch.float64",
+        "hessian_storage_dtype": "torch.float32", "hessian_sample_count": raw_hessian["count"]}
     if any(metrics.get(key) != value for key, value in required.items()):
         raise ValueError("projection did not use calibrated FP64-congruence LDLQ")
     for key in ("reported_metric_value", "hessian_weighted_error_numerator",
@@ -298,7 +299,7 @@ def prepare_context(hidden, rotary=None, prev_topk=None, *, position_ids=None, a
             or position_ids.device != hidden.device or bool((position_ids < 0).any())
             or bool((position_ids[1:] != position_ids[:-1] + 1).any())):
         raise ValueError("Step-5 positions must be consecutive and native")
-    return dict(position_ids=position_ids.to(torch.int32), extent=((int(position_ids[-1]) + 128) // 128) * 128)
+    return {"position_ids": position_ids.to(torch.int32), "extent": ((int(position_ids[-1]) + 128) // 128) * 128}
 
 
 def _prepare_rope(block, context):
@@ -365,7 +366,7 @@ def native_forward(block, state):
         # Shifted MTP is sliding attention, and uses the same stage arithmetic.
         return staged_forward(block, state)
     hidden = source.reference.layer_forward(block, source.kernel, state["hidden"], context["extent"])
-    return dict(hidden=hidden, position_ids=context["position_ids"].long())
+    return {"hidden": hidden, "position_ids": context["position_ids"].long()}
 
 
 @torch.inference_mode()
@@ -373,7 +374,7 @@ def staged_forward(block, state):
     context = prepare_context(state["hidden"], position_ids=state.get("position_ids"))
     attention, _ = attention_forward(block, attention_inputs(block, state["hidden"]), context)
     residual, normalized = attention_finish(block, state["hidden"], attention)
-    return dict(hidden=finish_layer(block, residual, normalized), position_ids=context["position_ids"].long())
+    return {"hidden": finish_layer(block, residual, normalized), "position_ids": context["position_ids"].long()}
 
 
 @contextmanager
@@ -483,14 +484,14 @@ def aligned_inputs(previous_hidden, token_ids, embedding, *, position_ids=None):
     context = prepare_context(previous_hidden, position_ids=position_ids)
     shifted = token_ids[1:].contiguous()
     embedded = torch.nn.functional.embedding(shifted, embedding) if isinstance(embedding, torch.Tensor) else embedding(shifted)
-    return dict(target_hidden=previous_hidden[:-1].contiguous(), inputs_embeds=embedded,
-                input_ids=shifted, position_ids=context["position_ids"][1:].long())
+    return {"target_hidden": previous_hidden[:-1].contiguous(), "inputs_embeds": embedded,
+                "input_ids": shifted, "position_ids": context["position_ids"][1:].long()}
 
 
 @torch.inference_mode()
 def forward_aligned(block, aligned):
     hidden = block.eh_proj(mtp_envelope(block, aligned["inputs_embeds"], aligned["target_hidden"])).float()
-    result = staged_forward(block, dict(hidden=hidden, position_ids=aligned["position_ids"]))
+    result = staged_forward(block, {"hidden": hidden, "position_ids": aligned["position_ids"]})
     result["normalized_hidden"] = mtp_head_input(block, result["hidden"])
     return result
 

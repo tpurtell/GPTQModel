@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
+# SPDX-FileCopyrightText: 2026 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 from __future__ import annotations
 
@@ -9,7 +11,7 @@ from typing import Optional
 
 import torch
 
-from ..looper.loop_processor import DTYPE_SIZE_COLUMN, ExecutionConfig, MODULE_FEATURE_COLUMN, LoopProcessor
+from ..looper.loop_processor import DTYPE_SIZE_COLUMN, MODULE_FEATURE_COLUMN, ExecutionConfig, LoopProcessor
 from ..looper.named_module import NamedModule
 from ..models import BaseQModel
 from ..models._const import CPU
@@ -24,11 +26,13 @@ from ..models.writer import (
     QUANT_LOG_LOSS,
     QUANT_LOG_NSAMPLES,
 )
+from ..nn_modules.qlinear.torch import TorchQuantEmbeddings
 from ..quantization.config import (
+    METHOD,
     BitsAndBytesConfig,
     FP8Config,
     GGUFConfig,
-    METHOD,
+    NF12ADConfig,
     RTNConfig,
     clone_weight_only_config_for_module,
     resolve_quant_format,
@@ -36,11 +40,19 @@ from ..quantization.config import (
 from ..quantization.rtn import RTN
 from ..utils.logger import log_time_block, setup_logger
 from ..utils.model import create_quant_module, pack_module
-from ..nn_modules.qlinear.torch import TorchQuantEmbeddings
 from ..utils.module_locks import parent_module_lock
 
 
 log = setup_logger()
+
+
+def _mean_abs_error(reference: torch.Tensor, dequantized: torch.Tensor) -> float:
+    """Measure dequantization error on the dequantized tensor's device."""
+
+    compute_device = dequantized.device
+    dequantized = dequantized.detach().to(dtype=torch.float32)
+    reference = reference.detach().to(device=compute_device, dtype=torch.float32)
+    return (dequantized - reference).abs().mean().item()
 
 
 class WeightOnlyProcessor(LoopProcessor):
@@ -49,7 +61,7 @@ class WeightOnlyProcessor(LoopProcessor):
     def __init__(
         self,
         tokenizer,
-        qcfg: RTNConfig | GGUFConfig | FP8Config | BitsAndBytesConfig,
+        qcfg: RTNConfig | GGUFConfig | FP8Config | BitsAndBytesConfig | NF12ADConfig,
     ):
         """Initializes a weight-only processor for RTN, GGUF, FP8, or BitsAndBytes."""
 
@@ -75,10 +87,12 @@ class WeightOnlyProcessor(LoopProcessor):
         return self.qcfg.dynamic_get(layer_name=module.full_name) is False
 
     @staticmethod
-    def _uses_direct_pack(qcfg: RTNConfig | GGUFConfig | FP8Config | BitsAndBytesConfig) -> bool:
+    def _uses_direct_pack(
+        qcfg: RTNConfig | GGUFConfig | FP8Config | BitsAndBytesConfig | NF12ADConfig,
+    ) -> bool:
         """Returns whether the method packs directly from the original dense weights."""
 
-        return qcfg.method in {METHOD.GGUF, METHOD.FP8, METHOD.BITSANDBYTES}
+        return qcfg.method in {METHOD.GGUF, METHOD.FP8, METHOD.BITSANDBYTES, METHOD.NF12_AD}
 
     def _update_logged_loss(self, module: NamedModule, avg_loss: str) -> None:
         """Backfills the logged loss field after late dequant-error measurement."""
@@ -94,7 +108,7 @@ class WeightOnlyProcessor(LoopProcessor):
         module: NamedModule,
         *,
         device: Optional[torch.device] = None,
-    ) -> Optional[RTNConfig | GGUFConfig | FP8Config | BitsAndBytesConfig]:
+    ) -> Optional[RTNConfig | GGUFConfig | FP8Config | BitsAndBytesConfig | NF12ADConfig]:
         """Clones per-module config, quantizes weights, and logs the result."""
 
         qcfg_clone = clone_weight_only_config_for_module(self.qcfg, module.full_name)
@@ -112,6 +126,8 @@ class WeightOnlyProcessor(LoopProcessor):
         else:
             task = RTN(module=module, qcfg=qcfg_clone)
             wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp_percent, nsamples = task.quantize()
+            if getattr(task, "gsq_diagnostics", None) is not None:
+                module.state["gsq_diagnostics"] = task.gsq_diagnostics
 
             module.stream_state_payload_to_cpu(
                 {
@@ -150,7 +166,9 @@ class WeightOnlyProcessor(LoopProcessor):
         module: NamedModule,
         model: BaseQModel,
         *,
-        qcfg: Optional[RTNConfig | GGUFConfig | FP8Config | BitsAndBytesConfig] = None,
+        qcfg: Optional[
+            RTNConfig | GGUFConfig | FP8Config | BitsAndBytesConfig | NF12ADConfig
+        ] = None,
         **kwargs,
     ):
         """Creates and packs the final quantized module into the model graph."""
@@ -208,13 +226,39 @@ class WeightOnlyProcessor(LoopProcessor):
             with log_time_block("module.pack_original", logger=log, module_name=module_label):
                 with parent_module_lock(parent_key):
                     qmodule = qmodules[module.full_name]
-                    qmodule.pack_original(
-                        linear=original_layer,
-                        scales=None,
-                        zeros=None,
-                        g_idx=None,
-                        smooth=active_qcfg.smooth,
-                    )
+                    calibrated_fp8 = module.state.pop("gsq_fp8_result", None)
+                    if calibrated_fp8 is not None:
+                        if active_qcfg.method != METHOD.FP8:
+                            raise ValueError("Calibrated FP8 payload requires an FP8 module")
+                        qmodule.pack_calibrated(original_layer, calibrated_fp8["weight"], calibrated_fp8["scale_inv"])
+                    else:
+                        qmodule.pack_original(
+                            linear=original_layer,
+                            scales=None,
+                            zeros=None,
+                            g_idx=None,
+                            smooth=active_qcfg.smooth,
+                        )
+                    if active_qcfg.method == METHOD.FP8 and calibrated_fp8 is None:
+                        from ..quantization.gsq_fp8 import refine_fp8_weight
+                        from ..quantization.gsq_scalar import gsq_enabled_for
+
+                        if gsq_enabled_for(active_qcfg.gsq, module.full_name):
+                            teacher = qmodule._weight_to_matrix(original_layer).detach().to(
+                                device=qmodule.weight.device, dtype=torch.float32)
+                            refined = refine_fp8_weight(
+                                qmodule.weight, qmodule.weight_scale_inv, target=teacher,
+                                config=active_qcfg.gsq, method=qmodule.weight_scale_method,
+                                block_size=qmodule.weight_block_size)
+                            if (refined["weight"].shape != qmodule.weight.shape
+                                    or refined["weight"].dtype != qmodule.weight.dtype
+                                    or refined["scale_inv"].shape != qmodule.weight_scale_inv.shape):
+                                raise ValueError("FP8 GSQ export does not match the packed storage geometry")
+                            with torch.no_grad():
+                                qmodule.weight.copy_(refined["weight"])
+                                qmodule.weight_scale_inv.copy_(refined["scale_inv"])
+                            module.state["gsq_diagnostics"] = {
+                                key: refined[key] for key in ("before", "after", "history")}
             if timer is not None and pack_start is not None:
                 timer.record(
                     "submodule_finalize_pack",
@@ -222,13 +266,15 @@ class WeightOnlyProcessor(LoopProcessor):
                     source=f"{module_label} [module.pack_original]",
                 )
 
-            reference_weight = qmodule._weight_to_matrix(original_layer).detach().cpu().to(torch.float32)
+            reference_weight = module.state.pop("fp8_reference_weight", None)
+            if reference_weight is None:
+                reference_weight = qmodule._weight_to_matrix(original_layer).detach()
             dequant_weight = qmodule.dequantize_weight()
-            # BNB exposes native [out, in] weights; FP8/GGUF expose [in, out].
-            if active_qcfg.method != METHOD.BITSANDBYTES:
+            # BNB and NF12-AD expose native [out, in] weights; FP8/GGUF expose
+            # [in, out].
+            if active_qcfg.method in (METHOD.FP8, METHOD.GGUF):
                 dequant_weight = dequant_weight.T
-            dequant_weight = dequant_weight.detach().cpu().to(torch.float32)
-            mean_abs_err = (dequant_weight - reference_weight).abs().mean().item()
+            mean_abs_err = _mean_abs_error(reference_weight, dequant_weight)
             self._update_logged_loss(module, f"{active_qcfg.method.value}: {mean_abs_err:.7f}")
             module.state.pop("tp_pad_info", None)
             module.state.pop("quant_source_module", None)
@@ -248,6 +294,7 @@ class WeightOnlyProcessor(LoopProcessor):
                     quant_linear_cls=model.qlinear_kernel,
                     lock=self.lock,
                     quantize_config=active_qcfg,
+                    device=module.state.get("quant_device"),
                 )
         if timer is not None and pack_start is not None:
             timer.record(
@@ -276,6 +323,8 @@ class WeightOnlyProcessor(LoopProcessor):
             return "weight_only_fp8"
         if self.qcfg.method == METHOD.BITSANDBYTES:
             return "weight_only_bitsandbytes"
+        if self.qcfg.method == METHOD.NF12_AD:
+            return "weight_only_nf12_ad"
         return "weight_only_rtn"
 
 __all__ = ["WeightOnlyProcessor"]

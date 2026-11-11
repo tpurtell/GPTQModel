@@ -16,6 +16,7 @@ from torch import nn
 
 from .kimi_k3 import KimiK3Source
 
+
 _HESSIAN_CONTRACT = "signed-block-hadamard-congruence-fp64-v1"
 
 
@@ -48,8 +49,8 @@ def validate_core_tensors(packed, logical_shape):
         raise ValueError("nonfinite EXL3 scales")
     if outputs != stored_outputs and bool(torch.count_nonzero(svh[outputs:])):
         raise ValueError("EXL3 padded output channels must have zero scales")
-    return dict(native_shape=[outputs, inputs], stored_shape=[stored_outputs, inputs],
-                bits=int(trellis.shape[-1] // 16), output_padding=stored_outputs - outputs)
+    return {"native_shape": [outputs, inputs], "stored_shape": [stored_outputs, inputs],
+                "bits": int(trellis.shape[-1] // 16), "output_padding": stored_outputs - outputs}
 
 
 @torch.no_grad()
@@ -96,9 +97,9 @@ def quantize_core_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.02
     working_weight = torch.zeros((inputs, stored_outputs), device=weight.device, dtype=torch.float32)
     working_weight[:, :outputs].copy_(weight.T)
     target = torch.device(device)
-    working_hessian = dict(H=H.to(device=target, copy=True), count=raw_hessian["count"], finalized=False)
-    args = dict(K=bits, seed=seed, sigma_reg=float(sigma), devices=[target],
-                mcg=True, apply_out_scales=None)
+    working_hessian = {"H": H.to(device=target, copy=True), "count": raw_hessian["count"], "finalized": False}
+    args = {"K": bits, "seed": seed, "sigma_reg": float(sigma), "devices": [target],
+                "mcg": True, "apply_out_scales": None}
     _, _, packed = _quantizer().quantize_exl3(
         working_weight, working_hessian, args, return_weight_q=False)
     metrics = args.get("error_metrics", {})

@@ -6,7 +6,11 @@ dtype. The kernel module is supplied by the caller from an authenticated source.
 
 import torch
 from torch import nn
-from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Attention, DeepseekV41Indexer, select_candidate_blocks
+from transformers.models.deepseek_v41.modeling_deepseek_v41 import (
+    DeepseekV41Attention,
+    DeepseekV41Indexer,
+    select_candidate_blocks,
+)
 
 
 def reference_rotary(x, cos, sin, inverse=False):

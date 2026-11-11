@@ -18,8 +18,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass, field, replace
 from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, Tuple
 
 import pcre
@@ -30,7 +30,8 @@ from ..looper.gptq_processor import GPTQProcessor
 from ..looper.loop_processor import LoopProcessor
 from ..looper.named_module import NamedModule
 from ..models._const import META
-from ..quantization.config import ExpertsRoutingBypass, GcMode, VramStrategy
+from ..models.module_plan import _model_module_plan
+from ..quantization.config import ExpertsRoutingBypass, GcMode, VramStrategy, normalize_bypass_batch_size
 from ..utils.device import get_device
 from ..utils.device_telemetry import emit_device_telemetry
 from ..utils.logger import setup_logger
@@ -40,6 +41,7 @@ from ..utils.torch import torch_empty_cache, torch_sync
 from .awq_processor import AWQProcessor
 from .paroquant_processor import ParoQuantProcessor
 from .qqq_processor import QQQProcessor
+from .vptq_processor import VPTQProcessor
 
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -229,7 +231,7 @@ def _resolve_subset_calibration_coverage_policy(
     """Resolve how this subset handles modules that never receive calibration traffic."""
 
     validate_input_coverage = isinstance(
-        processor, (GPTQProcessor, QQQProcessor, AWQProcessor, ParoQuantProcessor)
+        processor, (GPTQProcessor, QQQProcessor, AWQProcessor, ParoQuantProcessor, VPTQProcessor)
     )
     fallback_enabled = fallback is not None
     prune_uncovered_modules = validate_input_coverage and not fallback_enabled
@@ -330,16 +332,17 @@ def _collect_layer_candidate_names(
 
 def _collect_assignable_moe_group_keys(
     moe_groups: Dict[str, List[str]],
+    plan,
 ) -> List[str]:
     """Return expert families that should stay co-located on one device."""
 
     assignable_group_keys: List[str] = []
     for group_key, module_names in moe_groups.items():
-        suffixes = {name.rsplit(".", 1)[-1] for name in module_names}
-        # Some MoE families route pairs like gate/up or w1/w3 together.
-        if {"gate_proj", "up_proj"}.issubset(suffixes) or {"w1", "w3"}.issubset(
-            suffixes
-        ):
+        if plan is None:
+            assignable_group_keys.append(group_key)
+            continue
+        roles = {role for name in module_names for role in plan.roles(name)}
+        if {"gate", "up"}.issubset(roles):
             assignable_group_keys.append(group_key)
     return assignable_group_keys
 
@@ -505,7 +508,10 @@ def build_subset_plan(
                         forward_device_map[module_name] = target_device
 
         if moe_strategy_active and moe_groups and moe_devices:
-            assignable_group_keys = _collect_assignable_moe_group_keys(moe_groups)
+            assignable_group_keys = _collect_assignable_moe_group_keys(
+                moe_groups,
+                _model_module_plan(looper.gptq_model),
+            )
             if assignable_group_keys:
                 if (
                     looper._moe_vram_strategy == VramStrategy.BALANCED
@@ -598,10 +604,11 @@ def build_subset_plan(
     # module chunk size for staged MoE execution.
     moe_routing = looper.gptq_model.quantize_config.moe
     batch_size = None
-    if moe_routing is not None and isinstance(
-        moe_routing.routing, ExpertsRoutingBypass
-    ):
-        batch_size = moe_routing.routing.batch_size
+    if moe_routing is not None and isinstance(moe_routing.routing, ExpertsRoutingBypass):
+        # Re-validate here: the attribute can be assigned after construction, and
+        # an invalid value would otherwise fall through the `batch_size > 0` guard
+        # below and silently quantize every expert in one chunk.
+        batch_size = normalize_bypass_batch_size(moe_routing.routing.batch_size)
 
     module_chunks = [subset]
     if is_moe_subset and batch_size is not None and batch_size > 0 and execute_forward:
@@ -1638,28 +1645,28 @@ def run_subset_stage(
 
     # Keep the helper callsite compact while still passing the fully resolved
     # execution context into every chunk or single-pass invocation.
-    common_args = dict(
-        looper=looper,
-        processor=processor,
-        module=module,
-        layer_inputs=layer_inputs,
-        layer_input_kwargs=layer_input_kwargs,
-        position_ids=position_ids,
-        attention_masks=attention_masks,
-        cur_layer_device=cur_layer_device,
-        is_lm_head_module=is_lm_head_module,
-        layer_descriptor=layer_descriptor,
-        layer_title=layer_title,
-        layer_index=layer_index,
-        full=full,
-        fallback=fallback,
-        shared_kv_cache_dict=shared_kv_cache_dict,
-        pb=pb,
-        logger=logger,
-        is_awq_processor=is_awq_processor,
-        region_timer=region_timer,
-        previous_processed_subset=previous_processed_subset,
-    )
+    common_args = {
+        "looper": looper,
+        "processor": processor,
+        "module": module,
+        "layer_inputs": layer_inputs,
+        "layer_input_kwargs": layer_input_kwargs,
+        "position_ids": position_ids,
+        "attention_masks": attention_masks,
+        "cur_layer_device": cur_layer_device,
+        "is_lm_head_module": is_lm_head_module,
+        "layer_descriptor": layer_descriptor,
+        "layer_title": layer_title,
+        "layer_index": layer_index,
+        "full": full,
+        "fallback": fallback,
+        "shared_kv_cache_dict": shared_kv_cache_dict,
+        "pb": pb,
+        "logger": logger,
+        "is_awq_processor": is_awq_processor,
+        "region_timer": region_timer,
+        "previous_processed_subset": previous_processed_subset,
+    }
 
     # Once a plan exists, subset execution is just a dispatch over the plan's
     # shape rather than another round of subset analysis.

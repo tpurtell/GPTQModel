@@ -10,10 +10,10 @@ from typing import Any
 
 import torch
 
-from ..base import BaseQModel
-from ..moe_lifecycle import GateUpDownMoELifecycleHooks
 from ...utils.exl3_router_candidates import bind_sigmoid_grouped_router_recovery
 from ...utils.model import move_to
+from ..base import BaseQModel
+from ..moe_lifecycle import GateUpDownMoELifecycleHooks
 
 
 class GlmMoeDsaQModel(BaseQModel):

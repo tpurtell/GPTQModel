@@ -5,9 +5,9 @@
 import torch
 import torch.nn as nn
 
+from ...utils.exl3_router_candidates import bind_sigmoid_grouped_router_recovery
 from ..base import BaseQModel
 from ..moe_lifecycle import GateUpDownMoELifecycleHooks
-from ...utils.exl3_router_candidates import bind_sigmoid_grouped_router_recovery
 
 
 class _SeparateDots3Experts(nn.ModuleList):

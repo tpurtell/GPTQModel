@@ -98,6 +98,7 @@ class V41Capture:
         if self.device.type == "cuda" and torch.backends.cuda.matmul.allow_tf32:
             raise ValueError("direct capture requires TF32 disabled")
         try:
+            batch.validate()
             self._routes(None, (batch.hidden, batch.indices, batch.weights))
             for index in self.expert_ids:
                 tokens, slots = torch.where(batch.indices == index)
@@ -138,7 +139,7 @@ class V41Capture:
         if count != int(self.route_counts[expert]):
             raise ValueError("projection rows differ from natural dispatch count")
         mass = self.gate_squared_mass.sum().item()
-        return dict(H=self.hessians[key].detach().cpu().clone(), count=count, finalized=False), dict(
-            natural_rows=count, expert_gate_squared_mass=self.gate_squared_mass[expert].item(),
-            total_gate_squared_mass=mass,
-            expert_gate_squared_mass_fraction=self.gate_squared_mass[expert].item() / mass if mass else 0.0)
+        return {"H": self.hessians[key].detach().cpu().clone(), "count": count, "finalized": False}, {
+            "natural_rows": count, "expert_gate_squared_mass": self.gate_squared_mass[expert].item(),
+            "total_gate_squared_mass": mass,
+            "expert_gate_squared_mass_fraction": self.gate_squared_mass[expert].item() / mass if mass else 0.0}

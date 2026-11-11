@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
-# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2026 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2026 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
@@ -9,8 +9,9 @@ import contextlib
 import math
 import threading
 import time
-from dataclasses import dataclass
 from concurrent.futures import Future
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -18,12 +19,14 @@ import torch.nn as nn
 import transformers
 from torch.nn.modules.conv import _ConvNd
 
+from .._alloc_conf import large_hessian_alloc_hint
 from ..looper.named_module import NamedModule
 from ..quantization import QuantizeConfig
 from ..quantization.config import FallbackStrategy, SmoothMSE
 from ..utils.device import get_device
 from ..utils.env import env_flag
 from ..utils.logger import setup_logger
+from ..utils.p2p import p2p_all_enabled, safe_move_to
 from .fallback_smooth import mse_optimal_quant, smooth_block
 from .gar import (
     compose_final_perm,
@@ -32,8 +35,9 @@ from .gar import (
     extend_perm_with_tail,
     invert_perm,
 )
+from .gsq_scalar import gsq_enabled_for, refine_gptq_scalar
 from .npu_linalg import npu_inverse_cholesky_factor
-from .quantizer import HF_OPTIMUM, Quantizer
+from .quantizer import HF_OPTIMUM, Quantizer, _neutralize_dead_columns, _replace_zero_scale
 
 
 log = setup_logger()
@@ -313,6 +317,12 @@ def get_number_of_rows_and_cols(layer: nn.Module):
     else:
         # weight shape is (n_out, n_in); math.prod keeps `columns` a plain int
         return layer.weight.shape[0], math.prod(layer.weight.shape[1:])
+
+
+@lru_cache(maxsize=8)
+def _uniform_column_group(count: int, device: torch.device) -> torch.Tensor:
+    """Constant group index for blocks whose columns share one quantizer group."""
+    return torch.zeros(count, device=device, dtype=torch.int32)
 
 
 class GPTQ:
@@ -607,12 +617,35 @@ class GPTQ:
             stage,
             source_device,
         )
+        # A wide projection (e.g. a 40960-wide `down_proj`) needs three
+        # `columns ** 2 * 4` buffers at once: the Hessian, the Cholesky factor
+        # and the cuSOLVER workspace. The native caching allocator fails that
+        # request on a busy multi-device run even with plenty of free memory.
+        hint = large_hessian_alloc_hint()
+        if hint is not None:
+            log.warn("Quantization: Module `%s` -> %s", self.name, hint)
+
+    def _sanitize_scale_and_log(self, scale: torch.Tensor, zero: torch.Tensor):
+        """Bypass zero scales and report the unstable module once per pass."""
+
+        zero_mask = scale == 0
+        if bool(zero_mask.any()):
+            log.error(
+                "Quantization: Module `%s` -> zero scale found and bypassed. "
+                "This module may not be properly trained or received enough calibration data, "
+                "causing unmanageable outliers. If this is a MoE module, please check with the "
+                "model publisher and/or provide more calibration data.",
+                self.name,
+            )
+        return _replace_zero_scale(scale, zero, zero_mask=zero_mask)
 
     def clone_module(self, copy=True, device: torch.device = None):
         if not device:
             device = self.module.weight.data.device
 
-        clone = self.module.weight.data.to(copy=copy, device=device)
+        # A cross-device clone is a peer copy; on an asymmetric ROCm link the
+        # direct path segfaults, so go through the direction-aware helper.
+        clone = safe_move_to(self.module.weight.data, device, copy=copy)
 
         if isinstance(self.module, nn.Embedding):
             clone = clone.t()
@@ -1037,7 +1070,7 @@ class GPTQ:
                     self._wait_hessian_ready(device)
                     if self._H_diag.device != device:
                         source_diag = self._H_diag
-                        self._H_diag = self._H_diag.to(device=device)
+                        self._H_diag = safe_move_to(self._H_diag, device)
                         self._record_hessian_ready(device)
                         self._defer_hessian_sources([source_diag], self._hessian_ready_event)
                     self.H = None
@@ -1057,7 +1090,7 @@ class GPTQ:
                 else:
                     existing_diag = self._H_diag
                     self._wait_hessian_ready(device)
-                    diag = existing_diag.to(device=device, dtype=torch.float32)
+                    diag = safe_move_to(existing_diag, device, dtype=torch.float32)
                     if diag is not existing_diag:
                         source_diag = existing_diag
 
@@ -1076,7 +1109,10 @@ class GPTQ:
                                 torch.cuda.current_stream(device).wait_event(partial_event)
                             else:
                                 partial_event.synchronize()
-                        diag.add_(counts.to(device=device, dtype=torch.float32), alpha=2.0 / float(total_samples))
+                        diag.add_(
+                            safe_move_to(counts, device, dtype=torch.float32),
+                            alpha=2.0 / float(total_samples),
+                        )
 
                 self._H_diag = diag
                 self.H = None
@@ -1097,12 +1133,14 @@ class GPTQ:
                 self._wait_hessian_ready(device)
                 if self.H.device != device:
                     source_hessian = self.H
-                    self.H = self.H.to(device=device)
+                    self.H = safe_move_to(self.H, device)
                     self._record_hessian_ready(device)
                     self._defer_hessian_sources([source_hessian], self._hessian_ready_event)
                 return
 
-            total_samples = sum(self._device_sample_counts.values())
+            previous_samples = self._hessian_total_samples
+            new_samples = sum(self._device_sample_counts.values())
+            total_samples = previous_samples + new_samples
 
             self._wait_hessian_ready(device)
 
@@ -1116,17 +1154,34 @@ class GPTQ:
             result_accum: torch.Tensor
             if reuse_buffer and self.H.dtype == torch.float32:
                 result_accum = self.H
-                result_accum.zero_()
+                if previous_samples:
+                    result_accum.mul_(float(previous_samples) / float(total_samples))
+                else:
+                    result_accum.zero_()
             else:
                 result_accum = torch.zeros(
                     (self.columns, self.columns),
                     dtype=torch.float32,
                     device=device,
                 )
+                if previous_samples and self.H is not None:
+                    source_hessian = self.H
+                    previous = safe_move_to(
+                        source_hessian, device, dtype=torch.float32
+                    )
+                    result_accum.add_(
+                        previous,
+                        alpha=float(previous_samples) / float(total_samples),
+                    )
+                    if previous is not source_hessian:
+                        self._defer_hessian_sources(
+                            [source_hessian], self._hessian_ready_event
+                        )
 
             if total_samples == 0:
                 self.H = result_accum
                 self.nsamples = 0
+                self._hessian_total_samples = 0
                 self._hessian_dirty = False
                 self._final_hessian_device_hint = device
                 self._device_hessian_partials.clear()
@@ -1138,6 +1193,27 @@ class GPTQ:
             # GPU workers can finish in a different order after restart. A
             # stable reduction order avoids changing floating-point rounding.
             reduction_sources = list(self._device_hessian_partials.values())
+            # Reuse one staging buffer instead of allocating a temporary per
+            # partial. With P2P enabled the copy is direct GPU-to-GPU; without
+            # it the regular ``to(device)`` fallback below still applies.
+            reduction_staging = None
+            if result_accum.device.type == "cuda" and len(reduction_sources) > 1:
+                try:
+                    if p2p_all_enabled(
+                        [
+                            *[partial.device for partial in reduction_sources],
+                            result_accum.device,
+                        ]
+                    ):
+                        # Avoid turning a memory-tight layer into an avoidable
+                        # OOM: only allocate the staging buffer when the device
+                        # has room for it.
+                        staging_bytes = result_accum.numel() * result_accum.element_size()
+                        free_bytes, _ = torch.cuda.mem_get_info(result_accum.device)
+                        if free_bytes > staging_bytes * 1.1:
+                            reduction_staging = torch.empty_like(result_accum)
+                except Exception:
+                    reduction_staging = None
             for partial_device in sorted(self._device_hessian_partials, key=_device_reduction_key):
                 partial = self._device_hessian_partials[partial_device]
                 partial_device = torch.device(partial_device)
@@ -1148,14 +1224,24 @@ class GPTQ:
                     else:
                         partial_event.synchronize()
                 if partial.device != result_accum.device or partial.dtype != torch.float32:
-                    result_accum.add_(partial.to(device=result_accum.device, dtype=torch.float32))
+                    if reduction_staging is not None and partial.device.type == "cuda":
+                        reduction_staging.copy_(partial, non_blocking=True)
+                        result_accum.add_(
+                            reduction_staging,
+                            alpha=2.0 / float(total_samples),
+                        )
+                    else:
+                        result_accum.add_(
+                            safe_move_to(partial, result_accum.device, dtype=torch.float32),
+                            alpha=2.0 / float(total_samples),
+                        )
                 else:
-                    result_accum.add_(partial)
-
-            result_accum.mul_(2.0 / float(total_samples))
+                    result_accum.add_(partial, alpha=2.0 / float(total_samples))
+            del reduction_staging
 
             self.H = result_accum
             self.nsamples = total_samples
+            self._hessian_total_samples = total_samples
             self._hessian_dirty = False
             self._final_hessian_device_hint = result_accum.device
             self._device_hessian_partials.clear()
@@ -1193,11 +1279,18 @@ class GPTQ:
             # the leader readiness dependency there before an asynchronous
             # cross-device copy, rather than waiting on the leader stream.
             leader._wait_hessian_ready(target_device)
-            copy = source.detach().to(device=target_device, dtype=torch.float32, copy=True)
+            copy = safe_move_to(
+                source.detach(),
+                target_device,
+                dtype=torch.float32,
+                copy=True,
+                non_blocking=(target_device.type == "cuda" and source.device.type == "cuda"),
+            )
 
         with self.lock:
             self.H = copy
             self.nsamples = nsamples
+            self._hessian_total_samples = nsamples
             self.fwd_counter = fwd_counter
             self._device_hessian_partials.clear()
             self._device_hessian_partial_ready.clear()
@@ -1381,7 +1474,9 @@ class GPTQ:
                     w_min = block_mod.min(dim=1, keepdim=True).values
                     w_max = block_mod.max(dim=1, keepdim=True).values
                     mid = (w_max + w_min) / 2.0
-                    scale = torch.clamp((w_max - w_min) / maxq, min=1e-8)
+                    scale = _replace_zero_scale(
+                        torch.clamp((w_max - w_min) / maxq, min=1e-8)
+                    )
                     zero_mid = torch.full_like(scale, maxq / 2.0)
                     q = torch.round((block_mod - mid) / scale + zero_mid)
                     q = torch.clamp(q, 0, maxq)
@@ -1392,7 +1487,7 @@ class GPTQ:
                     mean = block_mod.mean(dim=1, keepdim=True)
                     max_dev = torch.max((block_mod - mean).abs(), dim=1, keepdim=True).values
                     max_dev = torch.clamp(max_dev, min=1e-8)
-                    scale = (2 * max_dev) / maxq
+                    scale = _replace_zero_scale((2 * max_dev) / maxq)
                     zero_mid = torch.full_like(scale, maxq / 2.0)
                     q = torch.round((block_mod - mean) / scale + zero_mid)
                     q = torch.clamp(q, 0, maxq)
@@ -1403,7 +1498,7 @@ class GPTQ:
                     median = block_mod.median(dim=1, keepdim=True).values
                     max_dev = torch.max((block_mod - median).abs(), dim=1, keepdim=True).values
                     max_dev = torch.clamp(max_dev, min=1e-8)
-                    scale = (2 * max_dev) / maxq
+                    scale = _replace_zero_scale((2 * max_dev) / maxq)
                     zero_mid = torch.full_like(scale, maxq / 2.0)
                     q = torch.round((block_mod - median) / scale + zero_mid)
                     q = torch.clamp(q, 0, maxq)
@@ -1416,7 +1511,9 @@ class GPTQ:
                     std = torch.clamp(std, min=1e-8)
                     lo = mean - sigma * std
                     hi = mean + sigma * std
-                    scale = torch.clamp((hi - lo) / maxq, min=1e-8)
+                    scale = _replace_zero_scale(
+                        torch.clamp((hi - lo) / maxq, min=1e-8)
+                    )
                     zero = torch.round(-lo / scale)
                     zero = torch.clamp(zero, 0, maxq)
                     q = torch.round(block_mod / scale + zero)
@@ -1425,8 +1522,9 @@ class GPTQ:
                 elif strategy == FallbackStrategy.RTN:
                     self.quantizer.find_params(block_mod, weight=True)
                     dequant = self.quantizer.quantize(block_mod)
-                    scale = self.quantizer.scale
-                    zero = self.quantizer.zero
+                    scale, zero = _replace_zero_scale(
+                        self.quantizer.scale, self.quantizer.zero
+                    )
                 else:
                     raise ValueError(f"Unsupported fallback strategy: {strategy}")
 
@@ -1456,6 +1554,8 @@ class GPTQ:
         else:
             valid_cols = self.columns
 
+        scale, zero = self._sanitize_scale_and_log(scale, zero)
+
         group_size = effective_group_size if effective_group_size != -1 else self.columns
         g_idx = torch.arange(valid_cols, device=Q.device, dtype=torch.int32) // group_size
 
@@ -1467,7 +1567,7 @@ class GPTQ:
         else:
             Q = Q.to(self.module.weight.dtype)
 
-        Q = Q.to(device=self.module.weight.data.device, non_blocking=False)
+        Q = safe_move_to(Q, self.module.weight.data.device)
         mean_abs_err = (Q - self.module.weight.data).abs().mean().item()
         duration = time.time() - start_time
         avg_loss = f"fallback({strategy.value}): {mean_abs_err:.7f}"
@@ -1815,8 +1915,14 @@ class GPTQ:
                 scale = torch.cat((full_scale, scale[:, full_group_count:]), dim=1)
                 zero = torch.cat((full_zero, zero[:, full_group_count:]), dim=1)
 
-        abs_max = max(diag.max().item(), 1.0)
-        floor = abs_max * 1e-6
+        scale, zero = self._sanitize_scale_and_log(scale, zero)
+
+        # Keep the floor selection on-device: the following loss read already
+        # synchronizes the stream, so reading `diag.max()` here only adds a
+        # second host round trip per module. `max(x, 1) * 1e-6` is
+        # `max(x * 1e-6, 1e-6)`; computing it in the diagonal dtype can differ
+        # from the former double-precision product by at most one ULP.
+        floor = torch.clamp(diag.max() * 1e-6, min=1e-6)
         effective_diag = torch.clamp(diag, min=floor) + self.qcfg.damp_percent * diag.mean()
         column_error = (original_weight - quantized).square().sum(dim=0)
         if self.nsamples:
@@ -1829,7 +1935,7 @@ class GPTQ:
             g_idx = g_idx[:self._original_columns]
 
         quantized = quantized.t().reshape(self.module.weight.shape).to(self.module.weight.dtype)
-        quantized = quantized.to(device=self.module.weight.device, non_blocking=False)
+        quantized = safe_move_to(quantized, self.module.weight.device)
 
         self.H = None
         self._device_hessian_partials.clear()
@@ -1847,6 +1953,72 @@ class GPTQ:
 
     @torch.inference_mode()
     def quantize(
+            self,
+            blocksize=128,
+    ):
+        config = getattr(self.qcfg, "gsq", None)
+        module_name = self._named_module.full_name if self._named_module is not None else self.name
+        if getattr(self, "_gsq_active", False) or not gsq_enabled_for(config, module_name):
+            return self._quantize_impl(blocksize=blocksize)
+
+        if not isinstance(self.module, nn.Linear):
+            raise ValueError("GSQ currently supports GPTQ linear projections only")
+        if self._tp_pad_cols:
+            raise ValueError("GSQ does not support tensor-parallel padded projections")
+        from ..utils.fallback import should_use_fallback
+
+        if should_use_fallback(self.fallback, float(self.nsamples), self.expected_nsamples):
+            self.gsq_diagnostics = {"status": "skipped", "reason": "data_independent_fallback"}
+            return self._quantize_impl(blocksize=blocksize)
+        if self.nsamples == 0:
+            raise ValueError("GSQ requires calibration activations")
+
+        start = time.time()
+        target = self.clone_module().detach()
+        hessian = self.finalize_hessian(target_device=target.device).detach().clone()
+        self._gsq_active = True
+        try:
+            result = self._quantize_impl(blocksize=blocksize)
+        finally:
+            self._gsq_active = False
+        weight, scales, zeros, groups, duration, avg_loss, damp, samples = result
+        if self.qcfg.mock_quantization or not isinstance(avg_loss, (int, float)) or not math.isfinite(avg_loss):
+            self.gsq_diagnostics = {"status": "skipped", "reason": "initializer_fallback"}
+            return result
+
+        device = weight.device
+        fitted = refine_gptq_scalar(
+            weight,
+            scales.to(device),
+            zeros.to(device),
+            groups.to(device),
+            target=target.to(device),
+            bits=int(self.qcfg.bits),
+            config=config,
+            hessian=hessian.to(device),
+        )
+        self.gsq_diagnostics = {
+            "objective": "calibration_hessian",
+            "before": fitted.before,
+            "after": fitted.after,
+            "learn_scales": config.learn_scales,
+        }
+        return (
+            # The looper assigns this tensor into an inference-mode Parameter.
+            # Match the tensor kind of the original GPTQ result so the next
+            # calibration replay can use the updated weight.
+            fitted.weight.contiguous().clone(),
+            fitted.scales.to(scales.device),
+            fitted.zeros.to(zeros.device),
+            fitted.g_idx.to(groups.device),
+            time.time() - start,
+            avg_loss,
+            damp,
+            samples,
+        )
+
+    @torch.inference_mode()
+    def _quantize_impl(
             self,
             blocksize=128,
     ):
@@ -1912,7 +2084,7 @@ class GPTQ:
             # log.info("copy W to cuda_1")
             W = self.clone_module(device=self.H.device)
         else:
-            W = self.module_copy.to(device=self.H.device)
+            W = safe_move_to(self.module_copy, self.H.device)
             del self.module_copy
 
         self.quantizer.find_params(W, weight=True)
@@ -1920,9 +2092,7 @@ class GPTQ:
         # H = self.H.to(device=self.H.device)
 
         if use_hessian:
-            dead = torch.diag(self.H) == 0
-            self.H[dead, dead] = 1
-            W[:, dead] = 0
+            _neutralize_dead_columns(self.H, W)
 
         # g_idx = []
         scale = []
@@ -1989,6 +2159,13 @@ class GPTQ:
                 self.H = self.H.to(device=cpu_device)[final_perm][:, final_perm]
                 self.quantizer.find_params(W, weight=True)
 
+        static_group_perm = None
+        if self.qcfg.static_groups:
+            if self.qcfg.desc_act and use_hessian:
+                static_group_perm = perm
+            elif self.qcfg.act_group_aware and use_hessian:
+                static_group_perm = final_perm
+
         if use_hessian:
             try:
                 ordering = "desc_act" if self.qcfg.desc_act else (
@@ -2048,7 +2225,7 @@ class GPTQ:
             and W.device.type == "cuda"
             and blocksize == 128
             and self.qcfg.bits in (2, 3, 4, 5, 6, 7, 8)
-            and int(self.quantizer.maxq.item()) == (1 << self.qcfg.bits) - 1
+            and self.quantizer._maxq_value == (1 << self.qcfg.bits) - 1
             and not self.qcfg.mock_quantization
             and type(self.quantizer) is Quantizer
             and not env_flag("GPTQMODEL_DISABLE_GPTQ_CUDA")
@@ -2060,8 +2237,15 @@ class GPTQ:
 
         # Use simplified loop when mock_quantization is active
         if self.qcfg.mock_quantization:
-            for i1 in range(0, self.columns, blocksize):
-                i2 = min(i1 + blocksize, self.columns)
+            # Keep each dynamic group within a block. A group that straddles
+            # Q1 would write beyond its bounds and append duplicate metadata.
+            mock_blocksize = (
+                self.qcfg.group_size
+                if not self.qcfg.static_groups and self.qcfg.group_size > 0
+                else blocksize
+            )
+            for i1 in range(0, self.columns, mock_blocksize):
+                i2 = min(i1 + mock_blocksize, self.columns)
                 count = i2 - i1
 
                 W1 = W[:, i1:i2]
@@ -2070,65 +2254,44 @@ class GPTQ:
                 # Handle group quantization parameters efficiently (similar to original)
                 if self.qcfg.group_size != -1:
                     if not self.qcfg.static_groups:
-                        # Find parameters for entire groups at once (optimized)
-                        group_start_cols = list(range(i1, i2, self.qcfg.group_size))
-                        for group_start in group_start_cols:
-                            group_end = min(group_start + self.qcfg.group_size, self.columns)
-                            if group_start < group_end:
-                                self.quantizer.find_params(W[:, group_start:group_end], weight=True)
-                                scale.append(self.quantizer.scale)
-                                zero.append(self.quantizer.zero)
-                                now_idx += 1
+                        for group_start in range(i1, i2, self.qcfg.group_size):
+                            group_end = min(
+                                group_start + self.qcfg.group_size,
+                                i2,
+                            )
+                            self.quantizer.find_params(
+                                W[:, group_start:group_end],
+                                weight=True,
+                            )
+                            scale.append(self.quantizer.scale)
+                            zero.append(self.quantizer.zero)
+                            now_idx += 1
+                            for column in range(group_start, group_end):
+                                q = self.quantizer.quantize(
+                                    W[:, column : column + 1]
+                                ).flatten()
+                                Q1[:, column - i1] = q
                     else:
-                        # Static groups - use pre-computed groups
+                        # A static block can cross several reordered groups.
                         for i in range(count):
+                            column = i1 + i
                             idx = i1 + i
                             if self.qcfg.desc_act:
                                 idx = perm[idx]
+                            elif self.qcfg.act_group_aware and use_hessian:
+                                idx = final_perm[idx]
                             self.quantizer = groups[idx // self.qcfg.group_size]
-
-                    # Vectorized quantization for the entire block (major optimization)
-                    if len(scale) > 0 and len(zero) > 0:
-                        # Use latest scale and zero for the entire block
-                        latest_scale = scale[-1]
-                        latest_zero = zero[-1]
-
-                        # Vectorized quantization using broadcasting
-                        # Reshape scales and zeros to match block dimensions
-                        if latest_scale.dim() == 1:
-                            latest_scale = latest_scale.view(-1, 1)
-                        if latest_zero.dim() == 1:
-                            latest_zero = latest_zero.view(-1, 1)
-
-                        # Apply quantization formula using the cloned weights W1
-                        maxq_val = 2 ** self.qcfg.bits - 1
-                        if self.qcfg.sym:
-                            # Symmetric quantization: Q = scale * clamp(round(x/scale), -maxq/2, maxq/2)
-                            Q1 = latest_scale * torch.clamp(
-                                torch.round(W1 / latest_scale),
-                                -(maxq_val // 2),
-                                maxq_val // 2
-                            )
-                        else:
-                            # Asymmetric quantization: Q = scale * (clamp(round(x/scale) + zero, 0, maxq) - zero)
-                            quantized = torch.clamp(
-                                torch.round(W1 / latest_scale) + latest_zero,
-                                0,
-                                maxq_val
-                            )
-                            Q1 = latest_scale * (quantized - latest_zero)
-                    else:
-                        # Fallback to individual quantization if no scale/zero available
-                        for i in range(count):
-                            w = W1[:, i]
-                            q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
-                            Q1[:, i] = q
+                            q = self.quantizer.quantize(
+                                W[:, column : column + 1]
+                            ).flatten()
+                            Q1[:, column - i1] = q
                 else:
                     # No grouping - vectorized quantization for entire block
                     maxq_val = 2 ** self.qcfg.bits - 1
                     if hasattr(self.quantizer, 'scale') and hasattr(self.quantizer, 'zero'):
-                        latest_scale = self.quantizer.scale
-                        latest_zero = self.quantizer.zero
+                        latest_scale, latest_zero = _replace_zero_scale(
+                            self.quantizer.scale, self.quantizer.zero
+                        )
 
                         if latest_scale.dim() == 1:
                             latest_scale = latest_scale.view(-1, 1)
@@ -2170,7 +2333,10 @@ class GPTQ:
 
                 W1 = W[:, i1:i2].clone()
                 Q1 = Q[:, i1:i2]
-                Err1 = torch.zeros_like(W1) if Hinv is not None else None
+                # ``Err1`` is fully overwritten per block by the fused kernel (or by
+                # ``torch.sub(..., out=delta)`` in the eager loop) before it is read,
+                # so skip the redundant zero-fill of a 128-column block.
+                Err1 = torch.empty_like(W1) if Hinv is not None else None
                 Losses1 = Losses[:, i1:i2] if Hinv is not None else None
 
                 if Hinv is not None:
@@ -2180,38 +2346,78 @@ class GPTQ:
                     # Group parameters are based on W, which the eager column
                     # loop does not modify until after the block. Thus every
                     # boundary inside this block can be prepared before launch.
-                    block_scales = []
-                    block_zeros = []
-                    column_groups = []
-                    parameter_indices = {}
-                    for i in range(count):
-                        column = i1 + i
-                        if self.qcfg.group_size != -1:
+                    block_group_size = self.qcfg.group_size
+                    uniform_group = block_group_size == -1 or (
+                        i1 // block_group_size == (i2 - 1) // block_group_size
+                        and (
+                            not self.qcfg.static_groups
+                            or static_group_perm is None
+                        )
+                    )
+                    if uniform_group:
+                        # Every column of this block resolves to the same
+                        # quantizer group, so the per-column bookkeeping
+                        # collapses to one lookup and a constant group index.
+                        if block_group_size != -1:
                             if not self.qcfg.static_groups:
-                                if column % self.qcfg.group_size == 0:
+                                if i1 % block_group_size == 0:
                                     self.quantizer.find_params(
-                                        W[:, column : column + self.qcfg.group_size], weight=True,
+                                        W[:, i1 : i1 + block_group_size], weight=True,
                                     )
-                                if (column // self.qcfg.group_size) - now_idx == -1:
+                                if (i1 // block_group_size) - now_idx == -1:
                                     scale.append(self.quantizer.scale)
                                     zero.append(self.quantizer.zero)
                                     now_idx += 1
                             else:
-                                idx = perm[column] if self.qcfg.desc_act else column
-                                self.quantizer = groups[idx // self.qcfg.group_size]
+                                self.quantizer = groups[i1 // block_group_size]
+                        block_scale, block_zero = _replace_zero_scale(
+                            self.quantizer.scale, self.quantizer.zero
+                        )
+                        block_scale = block_scale.flatten().unsqueeze(0)
+                        block_zero = block_zero.flatten().unsqueeze(0)
+                        column_group = _uniform_column_group(count, W.device)
+                    else:
+                        block_scales = []
+                        block_zeros = []
+                        column_groups = []
+                        parameter_indices = {}
+                        for i in range(count):
+                            column = i1 + i
+                            if self.qcfg.group_size != -1:
+                                if not self.qcfg.static_groups:
+                                    if column % self.qcfg.group_size == 0:
+                                        self.quantizer.find_params(
+                                            W[:, column : column + self.qcfg.group_size], weight=True,
+                                        )
+                                    if (column // self.qcfg.group_size) - now_idx == -1:
+                                        scale.append(self.quantizer.scale)
+                                        zero.append(self.quantizer.zero)
+                                        now_idx += 1
+                                else:
+                                    source_column = (
+                                        static_group_perm[column].item()
+                                        if static_group_perm is not None
+                                        else column
+                                    )
+                                    self.quantizer = groups[
+                                        source_column // self.qcfg.group_size
+                                    ]
 
-                        key = id(self.quantizer.scale)
-                        group_index = parameter_indices.get(key)
-                        if group_index is None:
-                            group_index = len(block_scales)
-                            parameter_indices[key] = group_index
-                            block_scales.append(self.quantizer.scale.flatten())
-                            block_zeros.append(self.quantizer.zero.flatten())
-                        column_groups.append(group_index)
+                            key = id(self.quantizer.scale)
+                            group_index = parameter_indices.get(key)
+                            if group_index is None:
+                                group_index = len(block_scales)
+                                parameter_indices[key] = group_index
+                                block_scale, block_zero = _replace_zero_scale(
+                                    self.quantizer.scale, self.quantizer.zero
+                                )
+                                block_scales.append(block_scale.flatten())
+                                block_zeros.append(block_zero.flatten())
+                            column_groups.append(group_index)
 
-                    block_scale = torch.stack(block_scales)
-                    block_zero = torch.stack(block_zeros)
-                    column_group = torch.tensor(column_groups, device=W.device, dtype=torch.int32)
+                        block_scale = torch.stack(block_scales)
+                        block_zero = torch.stack(block_zeros)
+                        column_group = torch.tensor(column_groups, device=W.device, dtype=torch.int32)
                     fused_block_update(
                         W1, Hinv1, block_scale, block_zero, column_group,
                         Q1, Err1, Losses1, (1 << self.qcfg.bits) - 1,
@@ -2233,8 +2439,8 @@ class GPTQ:
                                     now_idx += 1
                             else:
                                 idx = i1 + i
-                                if self.qcfg.desc_act:
-                                    idx = perm[idx]
+                                if static_group_perm is not None:
+                                    idx = static_group_perm[idx].item()
 
                                 self.quantizer = groups[idx // self.qcfg.group_size]
 
@@ -2287,11 +2493,9 @@ class GPTQ:
         group_size = self.qcfg.group_size if self.qcfg.group_size != -1 else self.columns
 
         if self.qcfg.static_groups and self.qcfg.desc_act:
-            g_idx = [perm[i] // group_size for i in range(self.columns)]
+            g_idx = (perm // group_size).to(dtype=torch.int32, device=Q.device)
         else:
-            g_idx = [i // group_size for i in range(self.columns)]
-
-        g_idx = torch.tensor(g_idx, dtype=torch.int32, device=Q.device)
+            g_idx = torch.arange(self.columns, dtype=torch.int32, device=Q.device) // group_size
 
         if self.qcfg.desc_act and use_hessian:
             invperm = invperm.to(device=Q.device)
@@ -2302,16 +2506,20 @@ class GPTQ:
         elif self.qcfg.act_group_aware and use_hessian:
             inv_final = invert_perm(final_perm).to(device=Q.device)
             Q = Q[:, inv_final]
-            inv_global_perm = invert_perm(global_perm)
-            inv_global_perm_list = inv_global_perm.tolist()
-            reordered_group_count = len(inv_global_perm_list)
-            temp_scale = [scale[i] for i in inv_global_perm_list]
-            temp_scale.extend(scale[reordered_group_count:])
-            scale = temp_scale
-            temp_zero = [zero[i] for i in inv_global_perm_list]
-            temp_zero.extend(zero[reordered_group_count:])
-            zero = temp_zero
-            del final_perm, inv_final, global_perm, inv_global_perm, inv_global_perm_list, local_perms
+            if not self.qcfg.static_groups:
+                # Dynamic parameters were measured in reordered group order.
+                # Static parameters were measured before reordering and already
+                # match the original-column g_idx returned below.
+                inv_global_perm = invert_perm(global_perm)
+                inv_global_perm_list = inv_global_perm.tolist()
+                reordered_group_count = len(inv_global_perm_list)
+                temp_scale = [scale[i] for i in inv_global_perm_list]
+                temp_scale.extend(scale[reordered_group_count:])
+                scale = temp_scale
+                temp_zero = [zero[i] for i in inv_global_perm_list]
+                temp_zero.extend(zero[reordered_group_count:])
+                zero = temp_zero
+            del final_perm, inv_final, global_perm, local_perms
 
         if self._tp_pad_cols:
             valid_cols = self._original_columns
@@ -2338,6 +2546,8 @@ class GPTQ:
             scale = self.truncate_last_dim(scale, valid_cols)
             zero = self.truncate_last_dim(zero, valid_cols)
 
+        scale, zero = self._sanitize_scale_and_log(scale, zero)
+
         if cpu_fallback_used and Q.device != result_device:
             log.info(
                 "Quantization: Module `%s` -> CPU fallback complete; moving final quantized weights back to %s.",
@@ -2345,7 +2555,12 @@ class GPTQ:
                 result_device,
             )
 
-        Q = Q.to(device=result_device, non_blocking=False)
+        # ``result_device`` is the module's device, which can differ from the
+        # Hessian/compute device when a follower adopted a leader's Hessian.
+        # That makes this a cross-device move, so route it through the
+        # direction-aware helper; it returns ``Q`` unchanged when the devices
+        # already match.
+        Q = safe_move_to(Q, result_device)
 
         duration = time.time() - start
 

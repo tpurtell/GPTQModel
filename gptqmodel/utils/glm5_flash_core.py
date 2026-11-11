@@ -15,6 +15,7 @@ from torch import nn
 
 from . import glm5_core as base
 
+
 PREFIX = "model.language_model."
 DenseRawHessian = base.DenseRawHessian
 capture_linear_input = base.capture_linear_input
@@ -205,8 +206,8 @@ def prepare_context(hidden, rotary=None, prev_topk=None, *, position_ids=None, a
         attention_mask = torch.ones((batch, length), dtype=torch.bool, device=hidden.device)
     if tuple(attention_mask.shape) != (batch, length):
         raise ValueError("Flash reference requires an unpadded 2D native mask")
-    return dict(attention_mask=attention_mask, position_ids=position_ids,
-                prev_topk_indices=prev_topk, position_embeddings=None)
+    return {"attention_mask": attention_mask, "position_ids": position_ids,
+                "prev_topk_indices": prev_topk, "position_embeddings": None}
 
 
 @torch.inference_mode()
@@ -257,7 +258,7 @@ def native_forward(block, state):
     context = prepare_context(state["hidden"], position_ids=state.get("position_ids"),
                               prev_topk=state.get("prev_topk_indices"))
     hidden, topk = block(state["hidden"], past_key_values=None, use_cache=False, **context)
-    out = dict(hidden=hidden)
+    out = {"hidden": hidden}
     if topk is not None:
         out["prev_topk_indices"] = topk
     return out
@@ -269,7 +270,7 @@ def staged_forward(block, state):
                               prev_topk=state.get("prev_topk_indices"))
     attention, topk = attention_forward(block, attention_inputs(block, state["hidden"]), context)
     residual, normalized = attention_finish(block, state["hidden"], attention)
-    out = dict(hidden=finish_layer(block, residual, normalized))
+    out = {"hidden": finish_layer(block, residual, normalized)}
     if topk is not None:
         out["prev_topk_indices"] = topk
     return out

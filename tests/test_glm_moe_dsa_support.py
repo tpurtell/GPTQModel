@@ -12,8 +12,8 @@ from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
 )
 
 from gptqmodel.models import auto
-from gptqmodel.models.definitions.glm_moe_dsa import GlmMoeDsaQModel
 from gptqmodel.models.definitions.deepseek_v4 import DeepSeekV4MTPQuantizationModel
+from gptqmodel.models.definitions.glm_moe_dsa import GlmMoeDsaQModel
 from gptqmodel.utils.exl3_router_candidates import learned_router_ranked_choices
 from gptqmodel.utils.structure import LazyTurtle, alias_from_turtle_for_submodule
 
@@ -246,8 +246,10 @@ def test_glm_moe_dsa_replay_propagates_topk_indices_to_shared_indexer_layer():
     hidden_states = torch.randn(1, 8, config.hidden_size)
     position_ids = torch.arange(hidden_states.shape[1], dtype=torch.long).unsqueeze(0)
     position_embeddings = model.model.rotary_emb(hidden_states, position_ids=position_ids)
+    # Direct layer calls bypass the model's causal-mask preparation.
+    causal_mask = torch.ones(8, 8, dtype=torch.bool).tril().unsqueeze(0).unsqueeze(0)
     layer_kwargs = {
-        "attention_mask": None,
+        "attention_mask": causal_mask,
         "position_ids": position_ids,
         "position_embeddings": position_embeddings,
         "use_cache": False,

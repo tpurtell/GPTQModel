@@ -15,12 +15,13 @@ from torch.nn import functional as F
 
 from . import glm5_flash_core as core
 
-MTP_CONTRACT = dict(schema="gptqmodel-glm5-flash-mtp-shifted-token-position-v1",
-    target_tap="post-model.norm-unweighted-mhc-stream-mean",
-    pairs="target[t]-with-token[t+1]-within-each-prompt",
-    positions="shifted-token-position[t+1]", position_zero_embedding="zero-before-enorm",
-    fusion="concat-enorm-embedding-then-hnorm-target", decoder="non-mHC-MLA-and-clamped-MoE",
-    indexer="own-full-indexer", output="shared_head.norm-once-before-shared-target-head")
+
+MTP_CONTRACT = {"schema": "gptqmodel-glm5-flash-mtp-shifted-token-position-v1",
+    "target_tap": "post-model.norm-unweighted-mhc-stream-mean",
+    "pairs": "target[t]-with-token[t+1]-within-each-prompt",
+    "positions": "shifted-token-position[t+1]", "position_zero_embedding": "zero-before-enorm",
+    "fusion": "concat-enorm-embedding-then-hnorm-target", "decoder": "non-mHC-MLA-and-clamped-MoE",
+    "indexer": "own-full-indexer", "output": "shared_head.norm-once-before-shared-target-head"}
 
 
 @torch.inference_mode()
@@ -42,8 +43,8 @@ def aligned_inputs(target_frontier, token_ids, embedding, target_norm, *, positi
     if embedded.shape != previous.shape or embedded.dtype != previous.dtype:
         raise ValueError("Flash MTP embedding and target norm geometry differs")
     embedded = torch.where(positions.unsqueeze(-1) == 0, torch.zeros_like(embedded), embedded)
-    return dict(target_hidden=previous, inputs_embeds=embedded, input_ids=shifted,
-                position_ids=positions, attention_mask=torch.ones_like(shifted, dtype=torch.bool))
+    return {"target_hidden": previous, "inputs_embeds": embedded, "input_ids": shifted,
+                "position_ids": positions, "attention_mask": torch.ones_like(shifted, dtype=torch.bool)}
 
 
 class FlashMTPDecoder(nn.Module):
@@ -51,7 +52,10 @@ class FlashMTPDecoder(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         from transformers.models.glm5_next.modeling_glm5_next import (
-            Glm5NextTextAttention, Glm5NextTextMoE, Glm5NextTextRMSNorm)
+            Glm5NextTextAttention,
+            Glm5NextTextMoE,
+            Glm5NextTextRMSNorm,
+        )
         self.config = config
         self.layer_idx = layer_idx
         self.block_type = "deepseek_sparse_attention"
@@ -80,7 +84,7 @@ class GlmFlashMTP(nn.Module):
 
     def forward_aligned(self, aligned, rotary=None):
         hidden = self.eh_proj(self.envelope(aligned))
-        output = core.native_forward(self.decoder, dict(hidden=hidden, position_ids=aligned["position_ids"]))
+        output = core.native_forward(self.decoder, {"hidden": hidden, "position_ids": aligned["position_ids"]})
         output["normalized_hidden"] = self.shared_head_norm(output["hidden"])
         return output
 

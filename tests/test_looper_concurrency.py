@@ -63,6 +63,59 @@ def test_loop_processor_initializes_synchronized_state(monkeypatch, tmp_path):
     assert processor.inputs_cache.unwrap().layer_inputs == []
 
 
+def test_loop_processor_rejects_empty_calibration_before_prepare(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(LoopProcessor, "_init_device_smi_handles", lambda _self: {})
+    monkeypatch.setattr(LoopProcessor, "_init_cpu_device_handle", lambda _self: None)
+
+    prepare_dataset_func = MagicMock()
+    with pytest.raises(ValueError, match="must not be empty"):
+        LoopProcessor(
+            tokenizer=None,
+            qcfg=MagicMock(),
+            calibration=[],
+            prepare_dataset_func=prepare_dataset_func,
+        )
+    prepare_dataset_func.assert_not_called()
+
+
+def test_loop_processor_raises_when_prepare_empties_calibration(monkeypatch, tmp_path):
+    # Regression: the empty check must rerun after prepare_dataset_func filters
+    # rows (e.g. all input_ids <= calibration_data_min_length), not divide by zero.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(LoopProcessor, "_init_device_smi_handles", lambda _self: {})
+    monkeypatch.setattr(LoopProcessor, "_init_cpu_device_handle", lambda _self: None)
+
+    with pytest.raises(ValueError, match="empty after prepare_dataset_func"):
+        LoopProcessor(
+            tokenizer=None,
+            qcfg=MagicMock(),
+            calibration=[{"text": "hi"}],
+            prepare_dataset_func=lambda **kwargs: [],
+        )
+
+
+def test_loop_processor_accepts_nonempty_prepared_calibration(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(LoopProcessor, "_init_device_smi_handles", lambda _self: {})
+    monkeypatch.setattr(LoopProcessor, "_init_cpu_device_handle", lambda _self: None)
+
+    rows = [
+        {"input_ids": torch.arange(16), "attention_mask": torch.ones(16, dtype=torch.long)},
+        {"input_ids": torch.arange(32), "attention_mask": torch.ones(32, dtype=torch.long)},
+    ]
+    processor = LoopProcessor(
+        tokenizer=None,
+        qcfg=MagicMock(),
+        calibration=[{"text": "a"}, {"text": "b"}],
+        prepare_dataset_func=lambda **kwargs: rows,
+    )
+
+    assert processor.num_batches == 2
+    assert processor.calibration_dataset is rows
+    assert processor.total_calibration_tokens == 48
+
+
 def test_collect_worker_results_preserves_submission_order():
     events = []
     futures = [
@@ -363,6 +416,39 @@ def test_device_metric_handles_are_serialized_and_closed():
     assert cpu_handle.closed is True
     assert processor._device_smi_handles == {}
     assert processor._cpu_device_smi is None
+
+
+def test_rocm_vf_reports_torch_memory_without_device_smi(monkeypatch):
+    processor = _make_processor()
+    processor._torch_rocm_memory_devices = []
+    monkeypatch.setattr(processor, "_discover_accelerator_devices", lambda: ["rocm:0"])
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "AMD Instinct MI355X VF")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda index: (3 * 1024**3, 4 * 1024**3))
+    monkeypatch.setattr("gptqmodel.looper.loop_processor._DEVICE_SMI_UNUSABLE", {"rocm:0"})
+    monkeypatch.setattr("gptqmodel.looper.loop_processor.Device", lambda device: pytest.fail("Device-SMI queried"))
+
+    processor._device_smi_handles = processor._init_device_smi_handles()
+
+    assert processor._device_smi_handles == {}
+    assert processor._snapshot_device_memory_gib() == {"rocm:0": 1.0}
+    assert processor.device_memory_report().startswith("rocm 1G")
+
+
+def test_rocm_without_vf_keeps_device_smi(monkeypatch):
+    processor = _make_processor()
+    processor._torch_rocm_memory_devices = []
+    handle = MagicMock()
+    monkeypatch.setattr(processor, "_discover_accelerator_devices", lambda: ["rocm:0"])
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "AMD Instinct MI355X")
+    monkeypatch.setattr("gptqmodel.looper.loop_processor.Device", lambda device: handle)
+    # ``_DEVICE_SMI_UNUSABLE`` is process-scoped and a real AMD SMI poll (for
+    # example a ``WeightOnlyProcessor`` built earlier in the same session) can
+    # leave ``rocm:0`` in it.  Start from a clean set so this test asserts the
+    # VF logic rather than whatever an earlier test probed.
+    monkeypatch.setattr("gptqmodel.looper.loop_processor._DEVICE_SMI_UNUSABLE", set())
+
+    assert processor._init_device_smi_handles() == {"rocm:0": handle}
+    assert processor._torch_rocm_memory_devices == []
 
 
 def test_device_metric_close_failures_are_logged_and_suppressed(monkeypatch):

@@ -7,8 +7,8 @@ returns. A frontier alone is not a completed quantization-block commit.
 import hashlib
 import json
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 import torch
 from safetensors import safe_open
@@ -76,7 +76,7 @@ def _save_state(state, path, *, provenance, kind):
         raise ValueError("provenance must round-trip through JSON unchanged")
     tensors = {}
 
-    manifest = json.dumps(dict(version=1, kind=kind, provenance=provenance, state=_encode_state(state, tensors)),
+    manifest = json.dumps({"version": 1, "kind": kind, "provenance": provenance, "state": _encode_state(state, tensors)},
                           allow_nan=False, separators=(",", ":"))
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

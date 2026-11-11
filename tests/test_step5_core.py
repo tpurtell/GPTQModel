@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ownership, packed-QKV observation, native boundaries and MTP alignment."""
-from contextlib import contextmanager
-import importlib.util
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-from torch import nn
 from safetensors.torch import save_file
+from torch import nn
 
 from gptqmodel.utils import step5_core as core
 
@@ -20,7 +17,7 @@ def source_slice(tmp_path):
     save_file({name:values},tmp_path/"weights.safetensors")
     source = core.Step5BF16Source.__new__(core.Step5BF16Source)
     source.snapshot = tmp_path
-    source.config = dict(moe_layer_list=[3],moe_num_experts=3)
+    source.config = {"moe_layer_list": [3],"moe_num_experts": 3}
     source.weight_map={name:"weights.safetensors"}
     source._reader=source._reader_context=source._reader_shard=None
     return source,values
@@ -71,7 +68,8 @@ def block():
 
 
 def test_capture_packed_qkv_observes_same_operand_without_extra_gemm():
-    b=block();x=torch.randn(5,8)
+    b=block()
+    x=torch.randn(5,8)
     observed={}
     names=["model.layers.4.self_attn."+part+"_proj" for part in "qkv"]
     with core.capture_inputs(b,names,lambda name,value:observed.setdefault(name,value)):
@@ -83,7 +81,8 @@ def test_capture_packed_qkv_observes_same_operand_without_extra_gemm():
 
 
 def test_capture_restores_method_and_hooks_on_failure():
-    b=block();original=b.self_attn._project_packed_qkv
+    b=block()
+    original=b.self_attn._project_packed_qkv
     with pytest.raises(RuntimeError):
         with core.capture_inputs(b,["self_attn.q_proj","self_attn.o_proj"],lambda *_:None):
             raise RuntimeError("abort")
@@ -92,7 +91,8 @@ def test_capture_restores_method_and_hooks_on_failure():
 
 
 def test_replacing_projection_retires_stale_packed_storage():
-    b=block();x=torch.randn(5,8)
+    b=block()
+    x=torch.randn(5,8)
     old=b.self_attn._project_packed_qkv(x)
     replacement=torch.zeros_like(b.self_attn.q_proj.weight)
     core.replace_projection(b,"self_attn.q_proj",replacement)
@@ -180,7 +180,7 @@ def test_router_preserves_native_topk_and_recovers_only_unselected_experts():
 @pytest.mark.parametrize("bits",[4,5,6])
 def test_all_pilot_bits_use_calibrated_contract_without_mutating_raw_hessian(monkeypatch,bits):
     original=torch.eye(128,dtype=torch.float32)
-    hessian=dict(H=original,count=17,finalized=False)
+    hessian={"H": original,"count": 17,"finalized": False}
     class Quantizer:
         def quantize_exl3(self,weight,raw,args,return_weight_q):
             assert raw["H"].data_ptr()!=original.data_ptr()
@@ -193,9 +193,9 @@ def test_all_pilot_bits_use_calibrated_contract_without_mutating_raw_hessian(mon
                 "hessian_sample_count":17,"reported_metric_value":.001,
                 "hessian_weighted_error_numerator":1.,"hessian_weighted_reference_denominator":1000.,
                 "hessian_weighted_relative_error":.001}
-            return None,None,dict(trellis=torch.zeros(8,8,16*bits,dtype=torch.int16),
-                suh=torch.ones(128,dtype=torch.float16),svh=torch.ones(128,dtype=torch.float16),
-                mcg=torch.tensor(-877912083,dtype=torch.int32))
+            return None,None,{"trellis": torch.zeros(8,8,16*bits,dtype=torch.int16),
+                "suh": torch.ones(128,dtype=torch.float16),"svh": torch.ones(128,dtype=torch.float16),
+                "mcg": torch.tensor(-877912083,dtype=torch.int32)}
     monkeypatch.setattr(core.base,"_quantizer",lambda:Quantizer())
     packed,metric,evidence=core.quantize_projection(torch.ones(128,128).bfloat16(),hessian,bits=bits,device="cpu")
     assert torch.equal(original,torch.eye(128))
@@ -203,17 +203,17 @@ def test_all_pilot_bits_use_calibrated_contract_without_mutating_raw_hessian(mon
 
 
 def test_native_config_constructor_cannot_mutate_reviewed_source_document(tmp_path,monkeypatch):
-    document=dict(model_type="step5_vl",text_config=dict(model_type="step5",
-        num_hidden_layers=92,num_nextn_predict_layers=3,norm_dtype="float32",
-        fp32_residual_connection=True,rope_scaling=dict(factor=16.0,nested=dict(values=[1,2]))))
+    document={"model_type": "step5_vl","text_config": {"model_type": "step5",
+        "num_hidden_layers": 92,"num_nextn_predict_layers": 3,"norm_dtype": "float32",
+        "fp32_residual_connection": True,"rope_scaling": {"factor": 16.0,"nested": {"values": [1,2]}}}}
     (tmp_path/"config.json").write_text(json.dumps(document))
-    (tmp_path/"model.safetensors.index.json").write_text(json.dumps(dict(weight_map={})))
+    (tmp_path/"model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
     class MutatingConfig:
         def __init__(self,**config):
             config["rope_scaling"]["rope_theta"]=[10000.0]*95
             config["rope_scaling"]["nested"]["values"].append(3)
     release=SimpleNamespace(Step5Config=MutatingConfig)
-    reference=SimpleNamespace(verify_source=lambda _:dict(revision=core.REVISION),
+    reference=SimpleNamespace(verify_source=lambda _:{"revision": core.REVISION},
         load_release=lambda _:(release,None),decoder_config=lambda value:dict(value["text_config"]),
         validate_config=lambda _:None)
     monkeypatch.setattr(core,"_load_reference",lambda _:reference)
@@ -231,7 +231,8 @@ def test_functional_indexer_weight_capture_observes_native_operand_without_extra
     b.self_attn.sparse_indexer_w=nn.Linear(8,2,bias=False,dtype=torch.float32)
     class Indexer:
         def __init__(self,owner):
-            self.owner=owner;self.calls=0
+            self.owner=owner
+            self.calls=0
         def project(self,hidden,positions):
             self.calls+=1
             query=self.owner.sparse_indexer_q(hidden)
@@ -276,7 +277,8 @@ def test_hessian_products_bound_k_and_preserve_all_actual_rows_without_padding(m
     generator=torch.Generator().manual_seed(51)
     inputs=torch.randn(301,8,generator=generator).bfloat16()
     H=torch.zeros(8,8,dtype=torch.float32)
-    actual=[];addmm=torch.Tensor.addmm_
+    actual=[]
+    addmm=torch.Tensor.addmm_
     def observed(self,left,right,*args,**kwargs):
         if self is H:
             actual.append(right.clone())
@@ -297,7 +299,8 @@ def test_hessian_products_bound_k_and_preserve_all_actual_rows_without_padding(m
 def test_dense_hessian_add_and_update_keep_exact_actual_count_no_identity_rows(monkeypatch):
     inputs=torch.linspace(-2,2,317*8).reshape(317,8).bfloat16()
     capture=core.DenseRawHessian(8,device='cpu')
-    lengths=[];addmm=torch.Tensor.addmm_
+    lengths=[]
+    addmm=torch.Tensor.addmm_
     def observed(self,left,right,*args,**kwargs):
         if self is capture.H:lengths.append(len(right))
         return addmm(self,left,right,*args,**kwargs)
@@ -314,7 +317,8 @@ def test_dense_hessian_add_and_update_keep_exact_actual_count_no_identity_rows(m
 
 def test_bounded_hessian_accumulation_is_deterministic_and_honors_smaller_chunks():
     inputs=torch.randn(519,7,generator=torch.Generator().manual_seed(9))
-    first=torch.zeros(7,7);second=torch.zeros(7,7)
+    first=torch.zeros(7,7)
+    second=torch.zeros(7,7)
     core.accumulate_hessian_fp32(first,inputs,max_rows=64)
     core.accumulate_hessian_fp32(second,inputs,max_rows=64)
     assert torch.equal(first,second)

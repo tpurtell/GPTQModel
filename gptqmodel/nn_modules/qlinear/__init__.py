@@ -18,7 +18,7 @@ import transformers
 from torch.nn.modules.conv import _ConvNd
 
 from ...adapter.adapter import LORA_MERGED_WEIGHT_PATHS, Adapter
-from ...models._const import DEVICE, PLATFORM
+from ...models._const import DEVICE, PLATFORM, normalize_device
 from ...quantization import FORMAT, METHOD
 from ...utils.backend import BACKEND
 from ...utils.env import env_flag
@@ -32,9 +32,43 @@ from ...utils.planar_packing import (
     planar_unpack_rows,
 )
 from ...utils.safe import THREADPOOLCTL
+from ._runtime_cache import tensor_cache_key
 
 
 log = setup_logger()
+
+
+def _device_family(device: DEVICE | t.device | str):
+    """Map a device selector onto its declared support family.
+
+    DEVICE declarations describe families, so both a ``torch.device("cuda:1")``
+    and explicit ``DEVICE.CUDA`` / ``"cuda"`` selectors are checked through
+    ``normalize_device`` (HIP's ``cuda`` namespace maps to ``DEVICE.ROCM``).
+    Unknown device types fall back to their raw string so the caller reports a
+    mismatch instead of raising.
+    """
+    if isinstance(device, (str, t.device)):
+        try:
+            return normalize_device(device)
+        except ValueError:
+            return device.type if isinstance(device, t.device) else device
+    return device
+
+
+def _is_rocm_target(device) -> bool:
+    """True when ``device`` names a ROCm (HIP) target on a ROCm host.
+
+    ``DEVICE.ROCM`` is always a ROCm request.  A ``cuda``/``cuda:N`` device is
+    ROCm when the active torch build is a HIP build, because HIP reuses the CUDA
+    device namespace.  This is used only to make a rejection message actionable;
+    it never widens a kernel's device support.
+    """
+
+    if t.version.hip is None:
+        return False
+    if device == DEVICE.ROCM:
+        return True
+    return isinstance(device, t.device) and device.type == "cuda"
 
 
 def input_rows(x: t.Tensor) -> int:
@@ -277,6 +311,31 @@ class BaseQuantLinear(nn.Module):
                 lora_A=getattr(self, "lora_A", None),
                 lora_B=getattr(self, "lora_B", None))
 
+    def _clear_runtime_weight_cache(self) -> None:
+        clear = getattr(self, "clear_weight_cache", None)
+        if callable(clear):
+            clear()
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        """Invalidate derived-weight caches after a state-dict load.
+
+        ``load_state_dict`` may copy into an existing buffer, which does not
+        replace the Python object. Cache keys catch versioned tensors, but an
+        inference tensor has no version counter, so clear unconditionally.
+        """
+
+        if getattr(self, "_fused_train_state", None) is not None:
+            from ._fused_train_state import discard_fused_train_state
+
+            discard_fused_train_state(self)
+        super()._load_from_state_dict(*args, **kwargs)
+        self._clear_runtime_weight_cache()
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self._clear_runtime_weight_cache()
+        return result
+
     # public/stable api exposed to external integrations (optimum, auto-round, ...)
     def hf_pack(
             self,
@@ -427,8 +486,35 @@ class BaseQuantLinear(nn.Module):
         if DEVICE.ALL not in cls.SUPPORTS_DEVICES and device is not None:
             try:
                 cls.validate_device(device)
-            except NotImplementedError:
+            except NotImplementedError as exc:
+                # `validate_device` overrides raise for reasons that are not
+                # about the device family - compute capability, missing ROCm,
+                # a kernel image that only exists for one SM version. Replacing
+                # that with "does not support device" hides the only actionable
+                # part, so keep the original text.
                 e = f"{cls} does not support device: {device}"
+                # A kernel-specific rejection (compute capability, a missing
+                # extension, ...) must keep its own text: it is what tells the
+                # user which portable backend to select instead.  The base
+                # family check only restates the sentence above, so it is
+                # dropped.
+                reason = str(exc).strip()
+                generic = (
+                    f"{cls} only supports `{cls.SUPPORTS_DEVICES}`: "
+                    f"actual device = `{device}`"
+                )
+                if reason and reason != generic:
+                    e = f"{e} ({reason})"
+                elif _is_rocm_target(device):
+                    # A CUDA-only kernel rejecting a HIP target is the steady
+                    # state on ROCm (Machete, W4A-NVFP4, native AWQ GEMV, ...).
+                    # Say so, and point at the portable backend family instead of
+                    # leaving a bare "unsupported device" string.
+                    e = (
+                        f"{e} ({cls.__name__} is CUDA-only and does not run on ROCm; "
+                        "select a portable `*Torch` or `*Triton` backend for this "
+                        "quantization method instead)"
+                    )
                 return False, NotImplementedError(e)
 
         if trainable and not cls.SUPPORTS_TRAINING:
@@ -511,19 +597,8 @@ class BaseQuantLinear(nn.Module):
         )
 
     @classmethod
-    def validate_device(cls, device: DEVICE | t.device):
-        # DEVICE declarations describe support families.  Keep concrete
-        # torch.device values intact for specialized kernels, while mapping
-        # them to a family for this common declaration check.
-        if isinstance(device, t.device):
-            try:
-                family = DEVICE(device.type)
-            except ValueError:
-                family = device.type
-        else:
-            family = device
-
-        if family not in cls.SUPPORTS_DEVICES:
+    def validate_device(cls, device: DEVICE | t.device | str):
+        if _device_family(device) not in cls.SUPPORTS_DEVICES:
             raise NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_DEVICES}`: actual device = `{device}`")
 
     # use optimize so we don't override native module.compile()
@@ -543,7 +618,12 @@ class BaseQuantLinear(nn.Module):
         # Custom behavior when switching to training mode
         if mode:
             if not self.SUPPORTS_TRAINING:
-                err = f"{self.__class__.__name__}: `{self.name}` switching to training mode."
+                err = (
+                    f"{self.__class__.__name__}: `{self.name}` is an inference-only kernel "
+                    "and cannot switch to training mode. Reload the model with "
+                    '`backend="auto_trainable"` (or a trainable backend for this '
+                    "quantization method) before fine-tuning."
+                )
                 log.error(err)
                 raise NotImplementedError(err)
             else:
@@ -948,11 +1028,44 @@ class GPTQQuantLinear(PackedGroupedQuantLinear):
         self._qzeros_format = format
         return self._qzeros_format
 
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        # `_qzeros_format` is not serialized; restore it from the checkpoint
+        # format the module was constructed for. Without this a direct
+        # state_dict round-trip of v2 words keeps the v1 default and
+        # format-aware consumers read every zero point one high.
+        if self.format in (FORMAT.GPTQ, "gptq", "gemm"):
+            self._qzeros_format = 1
+        elif self.format in (FORMAT.GPTQ_V2, "gptq_v2"):
+            self._qzeros_format = 2
+
 
 class PackableQuantLinear(GPTQQuantLinear):
     def __init__(self, *args, enable_wf_unsqueeze: bool = False, **kwargs):
         self.enable_wf_unsqueeze = enable_wf_unsqueeze
         super().__init__(*args, **kwargs)
+
+    def _ret_idx_is_identity(self) -> bool:
+        """Whether the activation-reorder index is the identity permutation.
+
+        ``ret_idx`` is derived from ``g_idx``; when ``g_idx`` is the canonical
+        ``arange(total) // group_size`` (``desc_act=False``), the permutation
+        is the identity and callers can skip both the gather and its copy.
+        The answer is cached under the same key as ``ret_idx`` so repeated
+        forwards stay O(1).
+
+        Subclasses that reorder activations must implement ``_build_ret_idx``.
+        """
+        cached = getattr(self, "_ret_idx_identity", None)
+        if cached is not None and getattr(self, "_ret_idx_key", None) == tensor_cache_key(self.g_idx):
+            return cached
+        ret_idx = self._build_ret_idx()
+        identity = t.equal(
+            ret_idx,
+            t.arange(ret_idx.numel(), dtype=ret_idx.dtype, device=ret_idx.device),
+        )
+        self._ret_idx_identity = identity
+        return identity
 
     def _wf_device(self):
         if hasattr(self, "g_idx") and self.g_idx is not None:
@@ -1152,9 +1265,11 @@ class PackableQuantLinear(GPTQQuantLinear):
         g_idx = g_idx.to("cpu")
         self.register_buffer("g_idx", g_idx)
 
-        # ---------- ORIGINAL scales/zeros logic (unchanged) ----------
-        scales = scales.T.contiguous()  # [G, out]
-        zeros = zeros.T.contiguous()  # [G, out]
+        # ---------- affine parameters ----------
+        # Match the native/GPU packers: affine intermediates can overflow FP16
+        # even when the original and reconstructed weights are finite.
+        scales = scales.T.to(t.float32).contiguous()  # [G, out]
+        zeros = zeros.T.to(t.float32).contiguous()  # [G, out]
         scale_zeros = zeros * scales  # [G, out]
         num_groups = scales.shape[0]
 
@@ -1299,7 +1414,7 @@ class PackableQuantLinear(GPTQQuantLinear):
             s_blk_T = scales.index_select(0, gsel).T  # [out, blk]
 
             # int_block = round((W + scale_zeros[g_idx]^T) / scales[g_idx]^T)
-            int_block = t.round((Wblk + sz_blk_T) / s_blk_T)  # [out, blk]
+            int_block = t.round((Wblk.to(t.float32) + sz_blk_T) / s_blk_T)  # [out, blk]
             # Values that drift outside the representable range must saturate.
             # Bit-packing an unchecked value wraps it modulo 2**bits and turns
             # a small reconstruction error into a full-range weight error.
@@ -1418,6 +1533,11 @@ class PackableQuantLinear(GPTQQuantLinear):
         if not t.cuda.is_available():
             raise RuntimeError("pack_gpu requires CUDA availability but none was detected.")
 
+        # Embeddings use a different (non-transposed) packing layout; keep them on
+        # the CPU packers so callers can fall back safely.
+        if isinstance(linear, nn.Embedding):
+            raise ValueError("pack_gpu does not support embedding layers")
+
         target_device = t.device(device) if device is not None else t.device("cuda")
         if target_device.type != "cuda":
             raise ValueError(f"pack_gpu expected a CUDA device, got `{target_device}`.")
@@ -1446,7 +1566,10 @@ class PackableQuantLinear(GPTQQuantLinear):
         # Align layout with CPU paths: expect [groups, out_features]
         scales_g = scales.T.contiguous()
         zeros_g = zeros.T.contiguous()
-        scale_zeros_g = zeros_g * scales_g
+        # Match the reference CPU packer (pack_block_cpu.cpp), which performs the
+        # quant math in float32 (`zeros.to(float) * scales.to(float)`). Keeping the
+        # same precision here is required for bit-exact qweight/qzeros output.
+        scale_zeros_g = zeros_g.to(t.float32) * scales_g.to(t.float32)
 
         scales_dev = scales_g.to(device=target_device)
         zeros_dev = zeros_g.to(device=target_device)
@@ -1467,13 +1590,14 @@ class PackableQuantLinear(GPTQQuantLinear):
 
         if bits in (2, 4, 8):
             pack_factor = word_bits // bits
-            shifts_pf64 = (
+            # 4-D shift grid for the fully batched packer: [1, bits, pack_factor, 1].
+            shifts_pf64_batched = (
                 t.arange(pack_factor, dtype=t.int64, device=target_device)
-                .view(1, pack_factor, 1)
+                .view(1, 1, pack_factor, 1)
                 * bits
             )
         elif bits == 3 or self.planar:
-            shifts_pf64 = None
+            shifts_pf64_batched = None
         else:
             raise NotImplementedError(f"Unsupported bits={bits}")
 
@@ -1485,15 +1609,6 @@ class PackableQuantLinear(GPTQQuantLinear):
         )
 
         range10 = t.arange(10, dtype=t.int64, device=target_device).view(-1, 1)
-
-        @t.inference_mode()
-        def _pack_rows_2_4_8(int32_blk_32xN: t.Tensor, dst: t.Tensor, dst_rows_base: int):
-            r64 = int32_blk_32xN.to(t.int64)
-            reshaped = r64.view(bits, pack_factor, -1)
-            packed64 = (reshaped << shifts_pf64).sum(dim=1, dtype=t.int64)
-            dst[dst_rows_base:dst_rows_base + bits] = (
-                (packed64 & mask_tensor).to(self.pack_dtype)
-            )
 
         @t.inference_mode()
         def _pack_rows_3_values(int32_blk_32xN: t.Tensor) -> t.Tensor:
@@ -1523,23 +1638,36 @@ class PackableQuantLinear(GPTQQuantLinear):
             sz_blk_T = scale_zeros_dev.index_select(0, gsel).T
             s_blk_T = scales_dev.index_select(0, gsel).T
 
-            int_block = t.round((Wblk + sz_blk_T) / s_blk_T)
+            # float32 math to stay bit-exact with the CPU packer.
+            int_block = t.round((Wblk.to(t.float32) + sz_blk_T.to(t.float32)) / s_blk_T.to(t.float32))
             int_block.clamp_(0, self.maxq)
             int_block = int_block.to(t.int32).T.contiguous()
 
             groups32 = blk // word_bits
             base_group = (i0 // word_bits)
-            for g in range(groups32):
-                sub = int_block[g * word_bits:(g + 1) * word_bits]
-                dst_rows = (base_group + g) * rows_per_group
-                if bits in (2, 4, 8):
-                    _pack_rows_2_4_8(sub, qweight_dev, dst_rows)
-                elif bits == 3 and not self.planar:
-                    _pack_rows_3(sub, qweight_dev, dst_rows)
-                elif self.planar:
-                    qweight_dev[dst_rows:dst_rows + bits] = planar_pack_rows(sub, bits).to(self.pack_dtype)
-                else:
-                    raise NotImplementedError(f"Unsupported bits={bits}")
+            if bits in (2, 4, 8):
+                # Fully batched pack for the common 2/4/8-bit widths: a single
+                # reshape/shift/sum/copy for the whole block replaces one tiny
+                # launch chain per 32-column group. ``word_bits == bits * pack_factor``,
+                # so the 4-D view groups each word's ``bits`` destination rows
+                # together exactly like the former per-group loop (bit-exact).
+                viewed = int_block.view(groups32, bits, pack_factor, out_features).to(t.int64)
+                packed = (viewed << shifts_pf64_batched).sum(dim=2, dtype=t.int64) & mask_tensor
+                row_lo = base_group * rows_per_group
+                row_hi = row_lo + groups32 * rows_per_group
+                qweight_dev[row_lo:row_hi].view(groups32, bits, out_features).copy_(
+                    packed.to(self.pack_dtype)
+                )
+            else:
+                for g in range(groups32):
+                    sub = int_block[g * word_bits:(g + 1) * word_bits]
+                    dst_rows = (base_group + g) * rows_per_group
+                    if bits == 3 and not self.planar:
+                        _pack_rows_3(sub, qweight_dev, dst_rows)
+                    elif self.planar:
+                        qweight_dev[dst_rows:dst_rows + bits] = planar_pack_rows(sub, bits).to(self.pack_dtype)
+                    else:
+                        raise NotImplementedError(f"Unsupported bits={bits}")
 
         zeros_int = zeros_dev.to(dtype=t.int64)
         if bits in (2, 4, 8):
@@ -1592,8 +1720,11 @@ class PackableQuantLinear(GPTQQuantLinear):
             # self.g_idx = g_idx.clone() if g_idx is not None else self.g_idx
             self.register_buffer("g_idx", g_idx if g_idx is not None else self.g_idx )
 
-            scales = scales.T.contiguous()
-            zeros = zeros.T.contiguous()
+            # Widen before multiplying/adding, not after a low-precision
+            # intermediate has already overflowed or rounded an endpoint.
+            W = W.to(t.float32)
+            scales = scales.T.to(t.float32).contiguous()
+            zeros = zeros.T.to(t.float32).contiguous()
             scale_zeros = zeros * scales
 
             # TODO why clone?

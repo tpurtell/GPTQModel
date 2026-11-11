@@ -41,9 +41,9 @@ class V41MainInput(nn.Module):
             for index, layer in enumerate(self.config.engram_layer_ids):
                 # Store owned CPU rows immediately; never retain both lookups on GPU.
                 rows[layer] = owned_tree(self.tables[str(layer)](hashes[:, :, index]), "cpu")
-        kwargs = dict(position_embeddings=owned_tree(rotary, "cpu"),
-                      position_ids=owned_tree(positions, "cpu"), attention_mask=None,
-                      padding_mask=None, past_key_values=None)
+        kwargs = {"position_embeddings": owned_tree(rotary, "cpu"),
+                      "position_ids": owned_tree(positions, "cpu"), "attention_mask": None,
+                      "padding_mask": None, "past_key_values": None}
         return V41ReplayBatch(0, owned_tree(hidden, "cpu"), owned_tree(pre, "cpu"), {}, kwargs,
                               rows, tuple(self.config.dspark_target_layer_ids))
 

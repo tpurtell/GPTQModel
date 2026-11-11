@@ -16,13 +16,15 @@ import weakref
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 from itertools import chain
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
 import transformers
 
 from ..utils.modelscope import ensure_modelscope_available
+from ..utils.p2p import P2PConfig, configure_p2p
+from ..utils.rocm import IS_ROCM, warn_unsupported_rocm
 from ..utils.structure import LazyTurtle, print_module_tree
 
 
@@ -36,12 +38,15 @@ from packaging.version import InvalidVersion, Version
 from transformers import AutoConfig, PretrainedConfig
 from transformers.utils import is_flash_attn_2_available
 
-from ..adapter.adapter import Adapter
+from ..adapter.adapter import Adapter, normalize_adapter
+from ..adapter.remote import configure_explicit_remote_adapter, resolve_checkpoint_adapter_path
 from ..nn_modules.exllamav3 import ExllamaV3Linear
 from ..nn_modules.exllamav3_torch import ExllamaV3TorchLinear
-from ..nn_modules.qlinear import BaseQuantLinear
+from ..nn_modules.qlinear import BaseQuantLinear, GPTQQuantLinear
 from ..nn_modules.qlinear.exllamav2 import ExllamaV2Linear
+from ..nn_modules.qlinear.fp8 import TorchFP8Linear
 from ..nn_modules.qlinear.gguf import GGUFTorchLinear
+from ..nn_modules.qlinear.vptq_torch import VPTQLinear
 from ..quantization import QuantizeConfig
 from ..quantization.config import (
     FORMAT,
@@ -73,6 +78,7 @@ from ..utils.hf import (
     suspend_hf_weight_init,
 )
 from ..utils.importer import (
+    _selector_devices,
     auto_select_device,
     expand_selector_device_family,
     get_kernel_for_backend,
@@ -100,7 +106,7 @@ from ..utils.model import (
     simple_dispatch_model,
     validate_checkpoint_qweights,
 )
-from ._const import DEVICE, HAS_NPU, normalize_device
+from ._const import DEVICE, EXPERT_INDEX_PLACEHOLDER, HAS_NPU, normalize_device
 
 
 log = setup_logger()
@@ -372,8 +378,49 @@ def _validate_external_backend_format(backend: BACKEND, format_code: FORMAT) -> 
     raise ValueError(f"{backend} backend only supports {supported}: actual = {format_code}")
 
 
+def _explicit_requested_devices(device) -> Optional[List[torch.device]]:
+    """Return the concrete accelerators when the caller named specific devices.
+
+    `device=("cuda:1", "cuda:2")` is a request for exactly those two GPUs.
+    Before this helper both the layer-wise placement map and the quantization
+    device pool ignored the sequence and expanded to *every* visible
+    accelerator, so asking for two GPUs silently used all four. An abstract
+    family selector or a bare `cuda` keeps the historical family-wide path.
+    A sequence of one or more concrete ordinals requests exactly those devices. Integer
+    ordinals use the active accelerator namespace. Mixing a concrete ordinal
+    with an abstract selector is ambiguous and must not expand the request.
+    """
+    if not isinstance(device, (tuple, list)):
+        return None
+
+    targets = _selector_devices(device)
+    concrete = [
+        target for target in targets
+        if isinstance(target, torch.device) and target.type != "cpu" and target.index is not None
+    ]
+    if not concrete:
+        return None
+    if len(concrete) != len(targets):
+        raise ValueError(
+            "A device sequence cannot mix concrete accelerator ordinals with abstract selectors; "
+            "use only concrete ordinals or one accelerator family."
+        )
+    selector_device_family(targets)  # validate every selected family/capability
+    return concrete
+
+
+def _explicit_layerwise_devices(device) -> Optional[List[str]]:
+    """String form of :func:`_explicit_requested_devices` for map rendering."""
+    requested = _explicit_requested_devices(device)
+    return [str(target) for target in requested] if requested is not None else None
+
+
 def _layerwise_device_count(device) -> int:
     """Return the visible device count for layer-wise checkpoint placement."""
+    explicit = _explicit_layerwise_devices(device)
+    if explicit is not None:
+        return len(explicit)
+
     family = selector_device_family(device) or DEVICE.CPU
     if family in (DEVICE.CUDA, DEVICE.ROCM):
         return torch.cuda.device_count()
@@ -386,6 +433,10 @@ def _layerwise_device_count(device) -> int:
 
 def _layerwise_device_strings(device, num_gpus: int) -> list[str]:
     """Render layer-wise placement targets using the selected accelerator."""
+    explicit = _explicit_layerwise_devices(device)
+    if explicit is not None:
+        return explicit[:num_gpus]
+
     family = selector_device_family(device) or DEVICE.CPU
     if family in (DEVICE.CUDA, DEVICE.ROCM):
         if torch.cuda.is_available():
@@ -400,6 +451,16 @@ def _layerwise_device_strings(device, num_gpus: int) -> list[str]:
             return [f"npu:{index}" for index in range(num_gpus)]
         raise RuntimeError("NPU is not available")
     return ["cpu"] * num_gpus
+
+
+def _resolve_default_layerwise_device(device, backend: BACKEND):
+    """Keep explicit device sequences intact instead of collapsing singletons."""
+    requested = _explicit_requested_devices(device)
+    if requested is not None:
+        return tuple(requested)
+    normalized = normalize_device_device_map(device, None)
+    selected = auto_select_device(normalized, backend)
+    return expand_selector_device_family(selected)
 
 
 def _external_runtime_device_kwargs(
@@ -615,7 +676,7 @@ def _set_paged_attention_safe_cuda_graphs(model) -> None:
         cb_config.use_cuda_graph = (False, False)
 
 
-def _setup_rotation_online_had(model, rotation: Optional[str]) -> None:
+def _setup_rotation_online_had(model, rotation: Optional[str], module_plan=None, layer_prefixes=None) -> None:
     """Attach online Hadamard transform state to QuantLinear modules for rotation inference.
 
     Rotation (QuaRot/SpinQuant/Hadamard) fuses an orthogonal ``Q`` and an exact
@@ -639,7 +700,21 @@ def _setup_rotation_online_had(model, rotation: Optional[str]) -> None:
         if not isinstance(module, BaseQuantLinear):
             continue
 
-        if name.endswith("mlp.down_proj"):
+        relative = None
+        if module_plan is not None:
+            for prefix in layer_prefixes or ():
+                if name.startswith(f"{prefix}."):
+                    relative = name[len(prefix) + 1:]
+                    break
+            if relative is not None:
+                _, separator, remainder = relative.partition(".")
+                relative = remainder if separator and _.isdigit() else relative
+        is_down_projection = (
+            relative is not None and "down" in module_plan.roles(relative)
+            if module_plan is not None
+            else name.endswith("mlp.down_proj")
+        )
+        if is_down_projection:
             intermediate_size = module.in_features
             had_K, K = get_hadK(intermediate_size)
             module.online_full_had = True
@@ -778,6 +853,33 @@ def _hf_loader_from_pretrained_with_dynamic_module_retry(loader, model_local_pat
             exc,
         )
         return loader.from_pretrained(model_local_path, **retry_kwargs)
+
+
+def _reject_native_awq_gemv_on_rocm(export_quant_method, format_code, backend=None) -> None:
+    """Refuse the CUDA-only AWQ GEMV/GEMV_FAST/LLM_AWQ layouts on ROCm.
+
+    Those three layouts are only readable by the native CUDA AWQ extension
+    (``gemv_forward``/``gemmv2_forward``/``gemv_fast_forward_decode``), which
+    hipcc cannot build: the sources include ``cuda_fp16.h`` and CUDA-only inline
+    asm, and the hipified warp-sync reduction rejects wave32.  Without this check
+    an AUTO load fails later with a bare "No valid quant linear", so point at the
+    layout and kernels that do run on ROCm.
+    """
+
+    if not IS_ROCM:
+        return
+    if export_quant_method != METHOD.AWQ:
+        return
+    if format_code not in (FORMAT.GEMV, FORMAT.GEMV_FAST, FORMAT.LLM_AWQ):
+        return
+    # The portable Triton GEMV reads the GEMV layout without the extension, so an
+    # explicit selection of it is a supported ROCm placement.
+    if backend == BACKEND.AWQ_GEMV_TRITON:
+        return
+
+    from ..nn_modules.qlinear.gemv_awq import AWQ_GEMV_ROCM_UNSUPPORTED
+
+    raise NotImplementedError(AWQ_GEMV_ROCM_UNSUPPORTED)
 
 
 def _coerce_quantized_awq_dtype(*, backend: BACKEND, qcfg: QuantizeConfig, dtype):
@@ -993,6 +1095,25 @@ def _load_quantized_gguf_checkpoint_into_model(
     model.tie_weights()
 
 
+def _resolve_exl3_auto_backend(device, *, cuda_available: Optional[bool] = None) -> "BACKEND":
+    """Pick the EXL3 kernel for ``backend=AUTO``.
+
+    Only the CUDA family gets ``EXL3_EXLLAMA_V3``: its tensor-core GEMM dispatch
+    table is populated exclusively for CUDA.  On ROCm every entry of that table
+    is ``nullptr`` (``exl3_gemm.cu`` already rejects HIP with an explicit
+    ``TORCH_CHECK``), so the AUTO branch used to load a backend that cannot run.
+    ROCm -- CDNA and RDNA4 alike -- therefore resolves to ``EXL3_TORCH``, the
+    portable kernel that is the supported ROCm path.
+    """
+
+    if cuda_available is None:
+        cuda_available = torch.cuda.is_available()
+    device_family = selector_device_family(device)
+    if cuda_available and device_family in ExllamaV3Linear.SUPPORTS_DEVICES:
+        return BACKEND.EXL3_EXLLAMA_V3
+    return BACKEND.EXL3_TORCH
+
+
 def ModelLoader(cls):
     @classmethod
     def from_pretrained(
@@ -1004,9 +1125,15 @@ def ModelLoader(cls):
             trust_remote_code: bool = False,
             dtype: [str | torch.dtype] = "auto",
             device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = None,
-            device: Optional[Union[str, int]] = None,
+            device: Optional[Union[str, int, torch.device, Sequence[Union[str, int, torch.device]]]] = None,
+            fuse: bool = False,
+            p2p: Optional[Union[P2PConfig, Dict]] = None,
             **model_init_kwargs,
     ):
+        if p2p is not None and quantize_config is not None:
+            # The loopers read this field and install it before enabling peers.
+            quantize_config.p2p = P2PConfig(**p2p) if isinstance(p2p, dict) else p2p
+
         # quantization is unsafe with GIL=0 and torch.compile/graphs
         import torch._dynamo
         torch._dynamo.disable()
@@ -1165,6 +1292,7 @@ def ModelLoader(cls):
                 model,
                 turtle_model=turtle_model,
                 quantized=False,
+                fusion_enabled=fuse,
                 quantize_config=quantize_config,
                 tokenizer=tokenizer,
                 trust_remote_code=trust_remote_code,
@@ -1203,7 +1331,18 @@ def ModelLoader(cls):
         with suspend_hf_weight_init():
             # normalize and auto select quantization device is not passed
             if quantize_config.device is None:
+                requested_devices = _explicit_requested_devices(device)
+                # `quantize_config.device` only carries an accelerator family
+                # (ordinals are stripped by `normalize_device`), so an explicit
+                # device list is expressed through the compute filter.
                 quantize_config.device = auto_select_device(None, None)
+                if requested_devices is not None and quantize_config.compute_device_filter is None:
+                    wanted = {str(target) for target in requested_devices}
+                    quantize_config.compute_device_filter = (
+                        lambda devices, _wanted=wanted: [
+                            target for target in devices if str(target) in _wanted
+                        ]
+                    )
             else:
                 quantize_config.device = normalize_device(quantize_config.device)
 
@@ -1292,6 +1431,10 @@ def ModelLoader(cls):
                         "Loader: using checkpoint-backed lazy turtle source for `%s`",
                         model_local_path,
                     )
+                    # LazyTurtle is only created by this quantization offload path,
+                    # so a shard shared by several layers forces repeated shard I/O
+                    # worth surfacing once.
+                    turtle_model.warn_if_checkpoint_shards_are_not_layerwise()
             else:
                 log.info("Loader: loading model directly to CPU (not using meta device or turtle_model)")
                 model = _hf_loader_from_pretrained_with_dynamic_module_retry(
@@ -1327,6 +1470,7 @@ def ModelLoader(cls):
             model,
             turtle_model=turtle_model,
             quantized=False,
+            fusion_enabled=fuse,
             quantize_config=quantize_config,
             tokenizer=tokenizer,
             trust_remote_code=trust_remote_code,
@@ -1353,13 +1497,24 @@ def ModelLoader(cls):
             cls,
             model_id_or_path: Optional[str],
             device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = None,
-            device: Optional[Union[str, int]] = None,
+            device: Optional[Union[str, int, torch.device, Sequence[Union[str, int, torch.device]]]] = None,
             backend: Union[str, BACKEND] = BACKEND.AUTO,
-            adapter: Optional[Adapter] = None,
+            adapter: Optional[Adapter | Dict] = None,
             dtype: [str | torch.dtype] = "auto",
             trust_remote_code: bool = False,
+            allow_remote_adapter: bool = False,
+            adapter_revision: Optional[str] = None,
+            adapter_sha256: Optional[str] = None,
+            fuse: bool = False,
+            p2p: Optional[Union[P2PConfig, Dict]] = None,
             **kwargs,
     ):
+
+        warn_unsupported_rocm()
+
+        # Install the peer-to-peer policy before any multi-device load so the
+        # pre-enablement below and the inference-time copies use it.
+        configure_p2p(p2p)
 
         # post-quant is safe with GIL=0 and torch.compile/graphs
 
@@ -1393,18 +1548,15 @@ def ModelLoader(cls):
                 explicit_device_map = {"": explicit_device}
                 requested_device_map = explicit_device_map
 
-        # normalized device + device_map into single device
-        normalized_device = device if requested_device_map is None else None  # let device_map dictate placement when present
-        device = normalize_device_device_map(normalized_device, requested_device_map)
-
         # Keep string inputs compatible while allowing canonical method-prefixed names.
         backend = normalize_backend(backend)
-        device = auto_select_device(device, backend)
         if requested_device_map is None:
-            # The default layer-wise map below spans every visible accelerator.
-            # Expand the family now so kernel validation sees the same concrete
-            # devices (and rejects heterogeneous GPU capabilities explicitly).
-            device = expand_selector_device_family(device)
+            # Preserve explicit sequences; normalization reduces a singleton
+            # sequence to a scalar, which would broaden the layer-wise map.
+            device = _resolve_default_layerwise_device(device, backend)
+        else:
+            # The explicit device map determines placement and kernel targets.
+            device = auto_select_device(normalize_device_device_map(None, requested_device_map), backend)
 
         model_local_path = get_model_local_path(model_id_or_path, **kwargs_without_internal)
         trust_remote_code = resolve_trust_remote_code(model_local_path, trust_remote_code=trust_remote_code)
@@ -1490,6 +1642,24 @@ def ModelLoader(cls):
             )
         else:
             qcfg = QuantizeConfig.from_pretrained(model_local_path, **cached_file_kwargs, **kwargs_without_internal)
+
+        if adapter is None:
+            if allow_remote_adapter or adapter_revision is not None or adapter_sha256 is not None:
+                raise ValueError(
+                    "Loader: remote adapter options require an explicit `adapter=` argument; "
+                    "checkpoint metadata cannot authorize remote adapter downloads."
+                )
+            if qcfg.adapter is not None and qcfg.adapter.path not in (None, ""):
+                qcfg.adapter.path = resolve_checkpoint_adapter_path(qcfg.adapter.path, model_local_path)
+        else:
+            qcfg.adapter = normalize_adapter(adapter)
+            configure_explicit_remote_adapter(
+                qcfg.adapter,
+                allow_remote=allow_remote_adapter,
+                revision=adapter_revision,
+                sha256=adapter_sha256,
+            )
+
         export_quant_method = qcfg.export_quant_method()
         format_code = resolve_quant_format(qcfg.format, qcfg.method)
         backend = normalize_backend(backend, quant_method=export_quant_method)
@@ -1523,15 +1693,11 @@ def ModelLoader(cls):
             if backend not in (BACKEND.AUTO, BACKEND.EXL3_EXLLAMA_V3, BACKEND.EXL3_TORCH, BACKEND.MLX):
                 raise TypeError("FORMAT.EXL3 requires AUTO, EXL3_EXLLAMA_V3, EXL3_TORCH, or MLX backend.")
             if backend == BACKEND.AUTO:
-                if torch.cuda.is_available() and selector_device_family(device) in (DEVICE.CUDA, DEVICE.ROCM):
-                    backend = BACKEND.EXL3_EXLLAMA_V3
-                else:
-                    backend = BACKEND.EXL3_TORCH
+                backend = _resolve_exl3_auto_backend(device)
             if backend == BACKEND.EXL3_EXLLAMA_V3:
                 if not torch.cuda.is_available():
-                    raise ValueError("EXL3 CUDA loading requires CUDA/HIP.")
-                if selector_device_family(device) not in (DEVICE.CUDA, DEVICE.ROCM):
-                    raise ValueError("EXL3 CUDA loading requires a CUDA/HIP device.")
+                    raise ValueError("EXL3_EXLLAMA_V3 loading requires NVIDIA CUDA; use EXL3_TORCH instead.")
+                ExllamaV3Linear.validate_device(selector_device_family(device))
         elif format_code == FORMAT.BITSANDBYTES:
             if backend not in (BACKEND.AUTO, BACKEND.BITSANDBYTES, BACKEND.MLX):
                 raise TypeError("FORMAT.BITSANDBYTES requires AUTO, BITSANDBYTES, or MLX backend.")
@@ -1543,11 +1709,9 @@ def ModelLoader(cls):
             log.info("Loading Quantized Model: Auto fix `dtype` to `torch.float16`")
             dtype = torch.float16
 
-        dtype = _coerce_quantized_awq_dtype(backend=backend, qcfg=qcfg, dtype=dtype)
+        _reject_native_awq_gemv_on_rocm(export_quant_method, format_code, backend)
 
-        # inject adapter into qcfg
-        if adapter is not None:
-            qcfg.adapter = adapter
+        dtype = _coerce_quantized_awq_dtype(backend=backend, qcfg=qcfg, dtype=dtype)
 
         qcfg.calculate_bits_per_weight()
 
@@ -1602,6 +1766,7 @@ def ModelLoader(cls):
             instance = cls(
                 model,
                 quantized=True,
+                fusion_enabled=fuse,
                 quantize_config=qcfg,
                 tokenizer=tokenizer,
                 qlinear_kernel=None,
@@ -1614,22 +1779,21 @@ def ModelLoader(cls):
             return instance
 
         if format_code == FORMAT.MARLIN:
-            # CUDA requires the matching Marlin kernel; MLX transcodes AWQ/GPTQ
-            # source packing into the native Metal layout during model loading.
-            expected_marlin_backend = BACKEND.AWQ_MARLIN if qcfg.quant_method == METHOD.AWQ else BACKEND.GPTQ_MARLIN
-            expected_marlin_backends = [expected_marlin_backend]
+            # CUDA uses the shared Marlin backend and lets the checkpoint
+            # method/format route to the GPTQ or AWQ sub-kernel. MLX transcodes
+            # AWQ/GPTQ source packing into the native Metal layout during load.
             if backend == BACKEND.MLX:
                 pass
-            elif backend not in expected_marlin_backends and backend != BACKEND.AUTO:
+            elif backend not in (BACKEND.MARLIN, BACKEND.AUTO):
                 raise TypeError(
-                    f"FORMAT.MARLIN requires BACKEND.AUTO or BACKEND.{expected_marlin_backend.name}: actual = `{backend}`."
+                    f"FORMAT.MARLIN requires BACKEND.AUTO or BACKEND.MARLIN: actual = `{backend}`."
                 )
             else:
-                backend = expected_marlin_backend
+                backend = BACKEND.MARLIN
 
         # marlin_compatible = False if backend == BACKEND.IPEX else _validate_marlin_device_support()
         # check for marlin compat for cuda device only
-        # if backend not in [BACKEND.GPTQ_MARLIN, BACKEND.AWQ_MARLIN] and device == DEVICE.CUDA:
+        # if backend != BACKEND.MARLIN and device == DEVICE.CUDA:
         #     unsupported = _validate_marlin_compatibility(qcfg)
         #     if unsupported is None and marlin_compatible:
         #         logger.info(
@@ -1651,6 +1815,8 @@ def ModelLoader(cls):
 
         if backend in [BACKEND.GPTQ_BITBLAS, BACKEND.AWQ_BITBLAS]:
             from ..nn_modules.qlinear.bitblas import BITBLAS_AVAILABLE, BITBLAS_INSTALL_HINT
+            # ``is False`` (not ``not``) keeps the pre-lazy semantics: an
+            # explicit ``None``/``0`` override means "unknown", not "absent".
             if BITBLAS_AVAILABLE is False:
                 raise ValueError(BITBLAS_INSTALL_HINT)
 
@@ -1766,8 +1932,9 @@ def ModelLoader(cls):
             effective_module_tree = cls._resolve_effective_module_tree(model, qcfg)
             if effective_module_tree is None:
                 raise ValueError(
-                    f"Unsupport model_type {config.model_type}, and failed to auto-detect module tree for model {model}"
+                    f"Unsupported model_type {config.model_type}: no explicit module_tree is registered."
                 )
+            model.gptqmodel_effective_module_tree = copy.deepcopy(effective_module_tree)
 
             with cls._module_tree_context(effective_module_tree):
                 extract_layers_node = cls.extract_layers_node()
@@ -1810,9 +1977,31 @@ def ModelLoader(cls):
                 if qcfg.lm_head and name == cls.lm_head:
                     continue
 
-                if not any(name.startswith(prefix) for prefix in extract_layers_node) or any(name.startswith(ignore_module) for ignore_module in ignore_modules) or all(
-                        not name.endswith(ignore_module) for sublist in simple_layer_modules for ignore_module in sublist
-                ):
+                layer_prefix = next(
+                    (f"{prefix}." for prefix in extract_layers_node if name.startswith(f"{prefix}.")),
+                    None,
+                )
+                relative = name[len(layer_prefix):] if layer_prefix is not None else None
+                if relative is not None:
+                    layer_index, separator, remainder = relative.partition(".")
+                    relative = remainder if separator and layer_index.isdigit() else relative
+                declared = {
+                    item.split(":", 1)[0]
+                    for sublist in simple_layer_modules
+                    for item in sublist
+                }
+                relative_match = (
+                    relative is not None
+                    and any(
+                        relative == leaf
+                        or (relative.startswith(f"{leaf}.") and EXPERT_INDEX_PLACEHOLDER in leaf)
+                        for leaf in declared
+                    )
+                )
+                if layer_prefix is None or any(
+                        name == ignore_module or name.startswith(f"{ignore_module}.")
+                        for ignore_module in ignore_modules
+                ) or not relative_match:
                     # log non-lm-head quantized modules only
                     if name is not cls.lm_head:
                         log.info(f"The layer {name} is not quantized.")
@@ -1867,7 +2056,12 @@ def ModelLoader(cls):
                     is_sharded=is_sharded,
                 )
 
-        validate_checkpoint_qweights(model, model_save_name, format_code)
+        validate_checkpoint_qweights(
+            model,
+            model_save_name,
+            format_code,
+            key_converter=getattr(cls, "checkpoint_key_for_save", None),
+        )
 
         if isinstance(requested_device_map, str) and requested_device_map not in [
                 "auto",
@@ -2053,7 +2247,7 @@ def ModelLoader(cls):
             return device_map
 
         log.info(f"Loader: device = {device}")
-        if True:
+        if explicit_device_map is None:
             layers, _ = get_layers_with_prefixes(model, extract_layers_node)
             num_gpus = _layerwise_device_count(device)
             device_map = build_layerwise_device_map(model, device, layers, ignore_modules, num_gpus)
@@ -2073,6 +2267,16 @@ def ModelLoader(cls):
         dispatch_device_map.update(dict.fromkeys(no_placement_module_names(model), "cpu"))
         log.info(f"Loader: device_map = {device_map}")
 
+        # Multi-device loading moves shards between GPUs. Pre-enable peer access
+        # once so the first transfer is already direct (PyTorch would otherwise
+        # enable it lazily on that first copy). Best effort: never blocks the
+        # load. Device maps may hold strings, ints or torch.device values.
+        from ..utils.p2p import accelerator_devices_from_device_map, enable_for_devices
+
+        map_devices = accelerator_devices_from_device_map(dispatch_device_map)
+        if len(map_devices) > 1:
+            enable_for_devices(map_devices)
+
         load_checkpoint_in_model = native_gguf_qspec is None
         # compat: runtime convert checkpoint gptq(v1) to gptq_v2 format
         if format_code in [FORMAT.GPTQ, FORMAT.GEMM, FORMAT.PAROQUANT]:
@@ -2084,6 +2288,7 @@ def ModelLoader(cls):
                 device_map=device_map,
                 offload_state_dict=True,
                 offload_buffers=True,
+                key_converter=getattr(cls, "checkpoint_key_for_load", None),
             )
 
             load_checkpoint_in_model = False
@@ -2107,25 +2312,23 @@ def ModelLoader(cls):
 
                     qcfg.runtime_format = FORMAT.GPTQ_V2
 
-        if backend in (BACKEND.GPTQ_MACHETE, BACKEND.AWQ_MACHETE):
+        if backend == BACKEND.MACHETE:
             if is_sharded:
                 raise ValueError(
                     "Format: The loading of sharded checkpoints with Machete is currently not supported."
                 )
 
-        if backend in [BACKEND.GPTQ_MARLIN, BACKEND.AWQ_MARLIN] and (
+        if backend == BACKEND.MARLIN and (
                 preload_qlinear_kernel == ExllamaV2Linear or format_code == FORMAT.MARLIN):
             if is_sharded:
                 raise ValueError(
                     "Format: The loading of sharded checkpoints with Marlin is currently not supported."
                 )
-            # GPTQ Marlin and AWQ Marlin support fp16 and bf16 compute on Ampere+.
-            if backend == BACKEND.GPTQ_MARLIN and dtype not in (torch.float16, torch.bfloat16):
+            # Both Marlin sub-kernels support fp16 and bf16 compute on Ampere+.
+            if dtype not in (torch.float16, torch.bfloat16):
                 raise ValueError("Marlin kernel requires dtype=torch.float16 or dtype=torch.bfloat16.")
-            if backend == BACKEND.AWQ_MARLIN and dtype not in (torch.float16, torch.bfloat16):
-                raise ValueError("AWQ Marlin kernel requires dtype=torch.float16 or dtype=torch.bfloat16.")
 
-        if backend in [BACKEND.GPTQ_SWORDFISH, BACKEND.AWQ_SWORDFISH, BACKEND.SWORDFISH]:
+        if backend == BACKEND.SWORDFISH:
             if is_sharded:
                 raise ValueError(
                     "Format: The loading of sharded checkpoints with Swordfish is currently not supported."
@@ -2153,20 +2356,51 @@ def ModelLoader(cls):
         # If we use marlin or bitblas to load the quantized model, the model is already a converted model,
         # and we no longer need to call load_checkpoint_in_model()
         if load_checkpoint_in_model and backend not in [
-            BACKEND.GPTQ_MACHETE,
-            BACKEND.AWQ_MACHETE,
+            BACKEND.MACHETE,
             BACKEND.GPTQ_BITBLAS,
             BACKEND.AWQ_BITBLAS,
         ]:
+            keep_in_fp32_modules = []
+            fp32_bf16_buffer_names = []
+            packed_fp8_buffer_dtypes = {}
+            for name, module in model.named_modules():
+                prefix = f"{name}." if name else ""
+                if isinstance(module, TorchFP8Linear):
+                    packed_fp8_buffer_dtypes[f"{prefix}weight"] = module.fp8_dtype
+                if getattr(module, "weight_scale_inv", None) is not None:
+                    scale_name = f"{prefix}weight_scale_inv"
+                    keep_in_fp32_modules.append(scale_name)
+                    fp32_bf16_buffer_names.append(scale_name)
+                if getattr(module, "bias", None) is not None and (
+                    getattr(module, "weight_scale_inv", None) is not None
+                    or hasattr(module, "gguf_tensor_qtype")
+                    or isinstance(module, VPTQLinear)
+                ):
+                    keep_in_fp32_modules.append(f"{prefix}bias")
+                    if isinstance(module, (GGUFTorchLinear, TorchFP8Linear, VPTQLinear)):
+                        fp32_bf16_buffer_names.append(f"{prefix}bias")
             load_checkpoint_in_model_then_tie_weights(
                 model,
                 dtype=dtype,
+                keep_in_fp32_modules=keep_in_fp32_modules or None,
+                fp32_bf16_buffer_names=fp32_bf16_buffer_names,
+                packed_fp8_buffer_dtypes=packed_fp8_buffer_dtypes,
                 # This is very hacky but works due to https://github.com/huggingface/accelerate/blob/bd72a5f1a80d5146554458823f8aeda0a9db5297/src/accelerate/utils/modeling.py#L292
                 checkpoint=model_save_name,
                 device_map=device_map,
                 # offload_state_dict=True,
                 # offload_buffers=True,
+                key_converter=getattr(cls, "checkpoint_key_for_load", None),
             )
+
+            if format_code == FORMAT.GPTQ_V2:
+                # Native v2 checkpoints store logical zero points; the v1->v2
+                # conversion above only runs for v1 checkpoints. Mark the
+                # loaded modules so decoders and repack bookkeeping read the
+                # words as v2 instead of misreading every zero point one high.
+                for m in model.modules():
+                    if isinstance(m, GPTQQuantLinear):
+                        m.qzero_format(format=2)
 
         if native_gguf_qspec is not None:
             model = simple_dispatch_model(model, dispatch_device_map)
@@ -2241,6 +2475,7 @@ def ModelLoader(cls):
         instance = cls(
             model,
             quantized=True,
+            fusion_enabled=fuse,
             quantize_config=qcfg,
             tokenizer=tokenizer,
             qlinear_kernel=qlinear_kernel,
@@ -2251,7 +2486,12 @@ def ModelLoader(cls):
         )
         if backend == BACKEND.MLX:
             instance._runtime_generate = partial(mlx_generate, tokenizer=tokenizer)
-        _setup_rotation_online_had(instance.model, qcfg.rotation)
+        _setup_rotation_online_had(
+            instance.model,
+            qcfg.rotation,
+            module_plan=instance.module_plan(),
+            layer_prefixes=instance.extract_layers_node(),
+        )
         _set_paged_attention_safe_cuda_graphs(instance.model)
         if qcfg.dynamic:
             log_dynamic_override_cache_stats(instance._dynamic_cache_stats_before, dynamic=qcfg.dynamic)

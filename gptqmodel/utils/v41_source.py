@@ -7,8 +7,8 @@ projection, shared embedding or auxiliary output heads.
 """
 
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 
 import torch
 from safetensors import safe_open
@@ -143,9 +143,9 @@ class V41Source:
 
     def load_dspark_input(self, device="cuda:0", *, native_kernels, embedding=None):
         """Load only dSpark's input adapter; optionally share an existing embedding."""
+        from ..models.definitions.deepseek_v41 import DeepSeekV41RMSNorm
         from .v41_dspark import V41DSparkInput
         from .v41_native import V41NativeLinear
-        from ..models.definitions.deepseek_v41 import DeepSeekV41RMSNorm
 
         config = self.block_config()
         if embedding is None:
@@ -166,8 +166,8 @@ class V41Source:
 
     def load_main_input(self, hash_state, device="cuda:0"):
         """Use an already-bound, attested hash state; never initialize a tokenizer."""
-        from .v41_inputs import V41MainInput
         from ..models.definitions.deepseek_v41 import DeepSeekV41MappedEmbedding, DeepSeekV41RotaryEmbedding
+        from .v41_inputs import V41MainInput
 
         config = self.block_config()
         if hash_state.token_map.numel() != config.vocab_size:
@@ -195,7 +195,7 @@ class V41Source:
 
     @torch.no_grad()
     def load_decoded_block(self, layer_index, device="cuda:0", *, native_kernels=None, namespace="layers"):
-        from ..models.definitions.deepseek_v41 import DeepSeekV41Experts, DeepSeekV41DecoderLayer
+        from ..models.definitions.deepseek_v41 import DeepSeekV41DecoderLayer, DeepSeekV41Experts
 
         config = self.block_config(namespace)
         if type(layer_index) is not int or not 0 <= layer_index < config.num_hidden_layers:
@@ -234,6 +234,7 @@ class V41Source:
         # Rotary embedding constants are nonpersistent buffers initialized on meta.
         # Recreate these tiny modules on the execution device from their config.
         from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41RotaryEmbedding
+
         from ..models.definitions.deepseek_v41 import DeepSeekV41RotaryEmbedding
         for name, module in list(block.named_modules()):
             if isinstance(module, DeepseekV41RotaryEmbedding):
@@ -242,6 +243,7 @@ class V41Source:
                 with torch.device(device):
                     setattr(parent, leaf, DeepSeekV41RotaryEmbedding(config))
         from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41RMSNorm
+
         from ..models.definitions.deepseek_v41 import DeepSeekV41RMSNorm
 
         for name, module in list(block.named_modules()):

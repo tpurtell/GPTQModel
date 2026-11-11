@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from defuser.model_registry import MODEL_CONFIG
 from torch import nn
 
 from gptqmodel.models import auto
@@ -11,7 +12,6 @@ from gptqmodel.models.loader import _convert_model_with_defuser
 from gptqmodel.models.moe_lifecycle import GateUpDownMoELifecycleHooks
 from gptqmodel.utils.model import find_modules
 from gptqmodel.utils.structure import LazyTurtle
-from defuser.model_registry import MODEL_CONFIG
 
 
 def _tiny_text_config():
@@ -54,7 +54,7 @@ def test_glm5_next_model_type_selects_definition(monkeypatch):
     assert auto.check_and_get_model_definition("glm-5.3-flash-fixture") is Glm5NextQModel
 
 
-def test_glm5_next_module_tree_preserves_fork_quantization_boundary():
+def test_glm5_next_module_tree_preserves_upstream_quantization_boundary():
     config = SimpleNamespace(text_config=SimpleNamespace(n_routed_experts=2))
     layer_modules = Glm5NextQModel.simple_layer_modules(
         model_config=config,
@@ -84,10 +84,10 @@ def test_glm5_next_module_tree_preserves_fork_quantization_boundary():
         for block in Glm5NextQModel.full_layer_modules(model_config=config)
         for name in block
     }
-    # This fork allows these projections; the EXL3 recipe restricts actual
-    # work to routed experts. MTP is instantiated and calibrated, not copied.
-    assert {"self_attn.q_a_proj", "self_attn.kv_a_proj_with_mqa",
-            "mlp.shared_experts.gate_proj"} <= flat
+    assert flat <= full
+    # Keep upstream low-rank and shared-expert policy; add integrated MTP.
+    assert {"self_attn.q_a_proj", "self_attn.kv_a_proj_with_mqa"}.isdisjoint(flat)
+    assert "mlp.shared_experts.gate_proj" not in flat
     assert not Glm5NextQModel.out_of_model_tensors
 
 
@@ -127,6 +127,8 @@ def test_glm5_next_defuser_registry_preserves_expert_forward():
         expected = experts(hidden_states, topk_indices, topk_weights)
 
     assert _convert_model_with_defuser(Glm5NextQModel, model, cleanup_original=False) is True
+    assert model.model.language_model.layers[3].mlp.experts is experts
+    assert "convert_model_structure" not in Glm5NextQModel.__dict__
 
     with torch.no_grad():
         actual = model.model.language_model.layers[3].mlp.experts(
@@ -209,7 +211,7 @@ def test_glm5_next_lazy_turtle_materializes_defused_experts(tmp_path):
         show_progress=False,
     )
 
-    expert0 = layer.mlp.experts[0]
+    expert0 = layer.mlp.experts.get_submodule("0")
     torch.testing.assert_close(expert0.gate_proj.weight, expected_gate)
     torch.testing.assert_close(expert0.up_proj.weight, expected_up)
     torch.testing.assert_close(expert0.down_proj.weight, expected_down)

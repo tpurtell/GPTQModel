@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from gptqmodel.looper.exllamav3_processor import EXL3Processor
 from gptqmodel.utils.exl3_capture_frontier import (
     EXL3CaptureFrontierStore,
@@ -21,6 +22,7 @@ from gptqmodel.utils.exl3_inline_mixed import (
     InlineMixedPolicy,
     inline_mixed_policy,
 )
+
 
 FAMILY = {
     "model_type": "qwen4_exp",
@@ -199,9 +201,10 @@ def test_integrated_policies_reject_ambiguous_or_mismatched_contracts(tmp_path):
 def test_qwen_softmax_recovery_preserves_live_top10_and_ranks_11_through_20(
     device, tied
 ):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextTopKRouter
+
     from gptqmodel.looper.exllamav3_processor import _router_recovery_candidates
     from gptqmodel.utils.exl3_router_candidates import bind_softmax_router_recovery
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextTopKRouter
 
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")

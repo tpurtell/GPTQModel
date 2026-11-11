@@ -6,6 +6,9 @@ import struct
 
 import pytest
 import torch
+from safetensors.torch import save_file
+from torch import nn
+
 from gptqmodel.exllamav3.modules.quant.exl3_lib.quantize import (
     reconstruction_error_metrics,
 )
@@ -23,8 +26,6 @@ from gptqmodel.utils.exllamav3 import (
     replace_exllamav3_placeholders,
 )
 from gptqmodel.utils.model_dequant import detect_format
-from safetensors.torch import save_file
-from torch import nn
 
 
 @pytest.mark.parametrize("codebook", ["3inst", "mcg", "mul1"])
@@ -58,7 +59,7 @@ def test_exllamav3_torch_codebook_matches_native_half_law_all_states(codebook):
 
 
 def test_exllamav3_fractional_bits_fail_closed_instead_of_flooring():
-    with pytest.raises(ValueError, match="fractional `bits` is not a matrix encoding"):
+    with pytest.raises(ValueError, match="not an integer trellis width"):
         QuantizeConfig(
             quant_method=METHOD.EXL3,
             format=FORMAT.EXL3,
@@ -220,6 +221,21 @@ def test_exllamav3_module_include_rejects_invalid_regex():
         EXL3Config(bits=2.0, module_include=["("])
 
 
+def test_exllamav3_rejects_fractional_bits():
+    """EXL3 packs one integer trellis depth per module; a fractional width cannot
+    be realised and would silently quantize narrower than requested."""
+
+    for bits in (2.5, 2.25, 3.5):
+        with pytest.raises(ValueError, match="not an integer trellis width"):
+            EXL3Config(bits=bits)
+
+    with pytest.raises(ValueError, match="not an integer trellis width"):
+        EXL3Config(bits=3, head_bits=4.5)
+
+    with pytest.raises(ValueError, match="not an integer trellis width"):
+        EXL3Config(bits=3, dynamic={"model.layers.0.mlp.down_proj": {"bits": 2.5}})
+
+
 class _TinyModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -336,3 +352,54 @@ def test_detect_format_identifies_exllamav3(tmp_path):
         tmp_path, json.loads(config_path.read_text(encoding="utf-8"))
     )
     assert detected == "exl3"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_exllamav3_torch_rocm_forward_runs_and_matches_oracle(dtype):
+    """Hardware test: the AUTO ROCm backend (EXL3_TORCH) must actually forward.
+
+    On gfx1201 this failed before the Hadamard dtype fix: ``_forward_eager``
+    casts activations to FP16 while the cached Hadamard matrix was FP32, so
+    ``torch.matmul`` raised ``c10::Half != float`` at the first forward.
+    """
+
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip("ROCm GPU required")
+
+    from test_exllamav3_cpu import _independent_weight_oracle, _pack_symbols, _relative_l2
+
+    in_features, out_features = 384, 256
+    generator = torch.Generator().manual_seed(17 if dtype is torch.float16 else 29)
+    symbols = torch.randint(
+        0,
+        1 << 4,
+        (in_features // 16, out_features // 16, 256),
+        dtype=torch.int64,
+        generator=generator,
+    )
+    module = ExllamaV3TorchLinear.from_tensors(
+        in_features=in_features,
+        out_features=out_features,
+        name="rocm_forward",
+        tensors={
+            "trellis": _pack_symbols(symbols, 4),
+            "suh": (torch.rand(in_features, generator=generator) * 0.02 + 0.001).to(torch.float16),
+            "svh": (torch.rand(out_features, generator=generator) * 0.02 + 0.001).to(torch.float16),
+            "bias": torch.randn(out_features, generator=generator, dtype=torch.float16) * 0.01,
+        },
+    ).eval()
+    module = module.to(device="cuda", dtype=torch.float16)
+
+    x = torch.randn(7, in_features, dtype=dtype, generator=generator).cuda()
+    with torch.inference_mode():
+        actual = module(x)
+        repeated = module(x)
+
+    expected = x.double().cpu() @ _independent_weight_oracle(
+        symbols, 4, module.suh.cpu(), module.svh.cpu()
+    ) + module.bias.double().cpu()
+
+    assert actual.dtype == dtype
+    torch.testing.assert_close(repeated, actual)
+    assert _relative_l2(actual.cpu(), expected) <= 2e-3
+    assert _relative_l2(actual.cpu(), expected.to(dtype)) <= 2e-3

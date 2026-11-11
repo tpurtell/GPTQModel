@@ -63,106 +63,6 @@ class _Glm5NextSharedHead(nn.Module):
         )
 
 
-class _Glm5NextDefusedExpert(nn.Module):
-    def __init__(self, config, *, device: torch.device, dtype: torch.dtype):
-        super().__init__()
-        self.swiglu_limit = config.swiglu_limit
-        self.gate_proj = nn.Linear(
-            config.hidden_size,
-            config.moe_intermediate_size,
-            bias=False,
-            device=device,
-            dtype=dtype,
-        )
-        self.up_proj = nn.Linear(
-            config.hidden_size,
-            config.moe_intermediate_size,
-            bias=False,
-            device=device,
-            dtype=dtype,
-        )
-        self.down_proj = nn.Linear(
-            config.moe_intermediate_size,
-            config.hidden_size,
-            bias=False,
-            device=device,
-            dtype=dtype,
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(hidden_states).clamp(max=self.swiglu_limit)
-        up = self.up_proj(hidden_states).clamp(
-            min=-self.swiglu_limit,
-            max=self.swiglu_limit,
-        )
-        return self.down_proj(torch.nn.functional.silu(gate) * up)
-
-
-class _Glm5NextDefusedExperts(nn.ModuleList):
-    """Callable expert list matching the checkpoint's per-expert namespace."""
-
-    def __init__(self, config, *, device: torch.device, dtype: torch.dtype):
-        super().__init__(
-            [
-                _Glm5NextDefusedExpert(config, device=device, dtype=dtype)
-                for _ in range(int(config.n_routed_experts))
-            ]
-        )
-        self.num_experts = int(config.n_routed_experts)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        final = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            mask = torch.nn.functional.one_hot(
-                top_k_index,
-                num_classes=self.num_experts,
-            ).permute(2, 1, 0)
-            hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx_tensor in hit:
-            expert_idx = int(expert_idx_tensor[0])
-            top_k_pos, token_idx = torch.where(mask[expert_idx])
-            current = self[expert_idx](hidden_states[token_idx])
-            current = current * top_k_weights[token_idx, top_k_pos, None]
-            final.index_add_(0, token_idx, current.to(final.dtype))
-        return final
-
-
-def _defuse_glm5_next_experts(model: nn.Module, *, cleanup_original: bool) -> int:
-    from transformers.models.glm5_next.modeling_glm5_next import (
-        Glm5NextTextExperts,
-    )
-
-    replacements: list[tuple[nn.Module, Glm5NextTextExperts]] = []
-    for module in model.modules():
-        experts = getattr(module, "experts", None)
-        if isinstance(experts, Glm5NextTextExperts):
-            replacements.append((module, experts))
-
-    for parent, source in replacements:
-        gate_up = source.gate_up_proj
-        down = source.down_proj
-        replacement = _Glm5NextDefusedExperts(
-            parent.config,
-            device=gate_up.device,
-            dtype=gate_up.dtype,
-        )
-        if not gate_up.is_meta:
-            for expert_idx, expert in enumerate(replacement):
-                gate, up = gate_up[expert_idx].chunk(2, dim=0)
-                expert.gate_proj.weight = nn.Parameter(gate.clone())
-                expert.up_proj.weight = nn.Parameter(up.clone())
-                expert.down_proj.weight = nn.Parameter(down[expert_idx].clone())
-        parent.experts = replacement
-        if cleanup_original:
-            del source
-    return len(replacements)
-
-
 class Glm5NextMTPDecoderLayer(nn.Module):
     """Checkpoint-exact layer-45 MTP body used only during quantization.
 
@@ -354,7 +254,7 @@ class Glm5NextQuantizationLoader:
 class Glm5NextQModel(BaseQModel):
     loader = Glm5NextQuantizationLoader
     require_pkgs = ["transformers>=5.16.0"]
-    require_load_processor = False
+    require_load_processor = True
     layer_modules_strict = False
 
     dynamic_expert_index = "n_routed_experts"
@@ -363,18 +263,27 @@ class Glm5NextQModel(BaseQModel):
     moe_lifecycle_hooks = GateUpDownMoELifecycleHooks()
 
     @classmethod
-    def convert_model_structure(cls, model, *, cleanup_original: bool) -> bool:
-        converted = _defuse_glm5_next_experts(
-            model,
-            cleanup_original=cleanup_original,
-        )
-        expected = _expert_layer_count(model.config.text_config)
-        if converted != expected:
+    def after_defuser_conversion(cls, model):
+        """Check target/MTP coverage after the normal upstream Defuser pass."""
+        config = model.config.text_config
+        expected = _expert_layer_count(config)
+        containers = [
+            module for name, module in model.named_modules()
+            if name.endswith(".mlp.experts")
+        ]
+        if len(containers) != expected:
             raise RuntimeError(
                 "GLM-5.3 expert defusion coverage mismatch: "
-                f"converted={converted} expected={expected}"
+                f"converted={len(containers)} expected={expected}"
             )
-        return True
+        for experts in containers:
+            if not callable(getattr(experts, "_apply_gate", None)):
+                raise RuntimeError("GLM-5.3 native expert activation is missing")
+            for index in range(int(config.n_routed_experts)):
+                expert = experts.get_submodule(str(index))
+                if not all(isinstance(getattr(expert, part, None), nn.Linear)
+                           for part in ("gate_proj", "up_proj", "down_proj")):
+                    raise RuntimeError("GLM-5.3 expert projections were not defused")
 
     module_tree = [
         "model",
@@ -382,30 +291,65 @@ class Glm5NextQModel(BaseQModel):
         "layers",
         "#",
         {
+            # Checkpoint-only MTP block (layer 45) envelope. The public
+            # checkpoint stores the normalized token embedding and the
+            # normalized target state, projects them together (``eh_proj``),
+            # and normalizes the MTP output (``shared_head.norm``) before the
+            # shared target head. All four tensors are checkpoint-owned and stay
+            # in the source representation; only the routed gate/up/down
+            # projections of that block are quantizable. Target layers 0..44 do
+            # not have these leaves, which this non-strict tree tolerates, and
+            # the order matches the MTP forward.
+            "enorm": ("enorm:!",),
+            "hnorm": ("hnorm:!",),
+            "eh_proj": ("eh_proj:!",),
+            "attn_hc:!": ("input_norm:!",),
             "input_layernorm": ("input_layernorm:!",),
             "self_attn": (
-                "q_proj:0",
-                "k_proj:0",
-                "v_proj:0",
-                "q_a_proj:0",
-                "kv_a_proj_with_mqa:0",
-                "q_b_proj:1",
-                "kv_b_proj:1",
-                "o_proj:2",
+                # KDA (linear-attention) layers.
+                "b_proj:!",
+                "conv1d:!",
+                "forget_gate:!",
+                "forget_gate.f_a_proj:!",
+                "forget_gate.f_b_proj:!",
+                "g_a_proj:!",
+                "g_b_proj:!",
+                "o_norm:!",
+                "q_proj:0:q",
+                "k_proj:0:k",
+                "v_proj:0:v",
+                # DSA layers. The low-rank input and sparse indexer stay dense.
+                "q_a_proj:!",
+                "q_a_layernorm:!",
+                "kv_a_proj_with_mqa:!",
+                "kv_a_layernorm:!",
+                "indexer:!",
+                "indexer.wq_b:!",
+                "indexer.wk:!",
+                "indexer.k_norm:!",
+                "indexer.weights_proj:!",
+                "q_b_proj:0:q:in=q_a",
+                "kv_b_proj:0:k:v:in=kv_a",
+                "o_proj:1",
             ),
+            "ffn_hc:!": ("input_norm:!",),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
             "mlp:moe": {
-                "gate": ("gate:!",),
-                "experts": {
-                    "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
+                # Dense fallback used by the first three decoder layers.
+                "": ("gate_proj:0:gate", "up_proj:0:up", "down_proj:1:down"),
+                "gate": ("gate:!", "e_score_correction_bias:!"),
+                "experts:routed:expert_activation=experts._apply_gate": {
+                    "#": ("gate_proj:0:gate", "up_proj:0:up", "down_proj:1:down"),
                 },
-                "shared_experts": (
-                    "gate_proj:0",
-                    "up_proj:0",
-                    "down_proj:1",
+                "shared_experts:shared": (
+                    "gate_proj:!",
+                    "up_proj:!",
+                    "down_proj:!",
                 ),
-                "": ("gate_proj:0", "up_proj:0", "down_proj:1"),
             },
+            # MTP output normalization before the shared target head. Absent on
+            # target layers 0..44; dense by design.
+            "shared_head.norm": ("shared_head.norm:!",),
         },
     ]
 

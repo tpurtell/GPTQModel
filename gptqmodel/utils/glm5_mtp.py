@@ -172,7 +172,8 @@ def load_mtp(source, device="cuda:0", *, include_experts=False) -> GlmMTP:
     F32 correction biases and applies the indexer FP32 execution policy.
     """
     from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
-        GlmMoeDsaDecoderLayer, GlmMoeDsaRMSNorm,
+        GlmMoeDsaDecoderLayer,
+        GlmMoeDsaRMSNorm,
     )
     config = copy.deepcopy(source.native_config())
     layer_idx = int(config.num_hidden_layers)

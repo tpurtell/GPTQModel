@@ -19,11 +19,13 @@ from ..utils.logger import setup_logger
 from ..utils.looper_helpers import (
     clone_module_for_devices,
     forward_batch_worker,
+    move_nested_to_device,
     rehome_module_to_device,
     select_forward_devices,
 )
 from ..utils.model import move_to, nested_move_to
 from ..utils.torch import torch_sync
+
 
 if TYPE_CHECKING:  # pragma: no cover - imports for typing only
     from logbar.progress import ProgressBar
@@ -87,6 +89,23 @@ class ForwardExecutor:
     def _finish_outputs(collection):
         finalize = getattr(collection, "finalize", None)
         return finalize() if callable(finalize) else collection
+
+    def _filter_forward_devices(self, devices: List[torch.device]) -> List[torch.device]:
+        """Apply `compute_device_filter` to the forward device pool, preserving order."""
+
+        quant_config = getattr(self.looper.gptq_model, "quantize_config", None)
+        compute_device_filter = getattr(quant_config, "compute_device_filter", None)
+        if compute_device_filter is None:
+            return list(devices)
+
+        filtered = compute_device_filter(devices)
+        if len(filtered) < 1:
+            self.log.warn(
+                "compute_device_filter returned empty device list. "
+                "Using all devices for forward execution."
+            )
+            return list(devices)
+        return list(filtered)
 
     def _resolve_batch_progress(
         self,
@@ -206,6 +225,11 @@ class ForwardExecutor:
             )
 
         devices = select_forward_devices_fn(cur_layer_device)
+        # Apply `compute_device_filter` before staging replicas. Filtering only in
+        # `run_parallel` leaves a full copy of the module on every excluded GPU,
+        # which both defeats the caller's device restriction and can OOM the
+        # device it was meant to avoid.
+        devices = self._filter_forward_devices(devices)
         if len(devices) <= 1:
             return self.run_single(
                 module=module,
@@ -332,10 +356,10 @@ class ForwardExecutor:
                 cached_layer_kwargs = layer_input_kwargs[batch_idx]
                 input_device = cached_layer_inputs[0].device if cached_layer_inputs else cur_layer_device
 
-                layer_input = [nested_move_to(inp, device=exec_device) for inp in cached_layer_inputs]
+                layer_input = move_nested_to_device(cached_layer_inputs, device=exec_device)
 
                 raw_mask = attention_masks[batch_idx]
-                attn_tensor = raw_mask if raw_mask is None else move_to(raw_mask, device=exec_device)
+                attn_tensor = raw_mask if raw_mask is None else move_nested_to_device(raw_mask, device=exec_device)
 
                 keep_mask = None
                 if attn_tensor is not None:
@@ -351,15 +375,15 @@ class ForwardExecutor:
                 if position_ids:
                     pos = position_ids[batch_idx]
                     if pos is not None:
-                        additional_inputs["position_ids"] = move_to(pos, device=exec_device)
+                        additional_inputs["position_ids"] = move_nested_to_device(pos, device=exec_device)
 
                 for key, value in cached_layer_kwargs.items():
                     if key in ["past_key_values", "past_key_value"]:
                         continue
-                    additional_inputs[key] = nested_move_to(value, device=exec_device)
+                    additional_inputs[key] = move_nested_to_device(value, device=exec_device)
 
                 if reuse_kv and prev_kv is not None:
-                    additional_inputs["kv_last_layer"] = nested_move_to(prev_kv, device=exec_device)
+                    additional_inputs["kv_last_layer"] = move_nested_to_device(prev_kv, device=exec_device)
 
                 additional_inputs["use_cache"] = False
                 additional_inputs = self.looper.gptq_model.prepare_layer_replay_kwargs(
@@ -597,19 +621,9 @@ class ForwardExecutor:
             input_devices: Dict[int, torch.device] = {}
             processed_rows = 0
 
-            if self.looper.gptq_model.quantize_config.compute_device_filter is not None:
-                forward_devices = self.looper.gptq_model.quantize_config.compute_device_filter(devices)
-                if len(forward_devices) < 1:
-                    self.log.warn(
-                        "compute_device_filter returned empty device list. "
-                        "Using all devices for forward execution."
-                    )
-                    forward_devices = devices
-            else:
-                forward_devices = devices
+            forward_devices = self._filter_forward_devices(devices)
 
             device_segments: Dict[torch.device, List[int]] = {}
-            segment_start = 0
             num_devices = len(forward_devices)
 
             # Check if balanced mode is active - if so, assign batches where data already resides
@@ -771,7 +785,12 @@ class ForwardExecutor:
         for idx in range(total_batches):
             primary = results.get(idx)
             if primary is None:
-                raise RuntimeError("Forward batch returned no output; data-parallel execution produced empty result.")
+                # `StopForward` (MoE early-stop) is a normal outcome and yields no
+                # output; `run_single` already tolerates it by skipping the batch.
+                # Mirror that contract instead of failing the whole data-parallel
+                # forward, otherwise multi-device quantization crashes as soon as
+                # an early-stopping subset is reached.
+                continue
             ordered_outputs.append([primary])
 
         return ordered_outputs

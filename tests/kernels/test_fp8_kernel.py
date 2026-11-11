@@ -1,16 +1,98 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
 
+import weakref
+
 import pytest
 import torch
 import torch.nn as nn
 
-from gptqmodel.nn_modules.qlinear.fp8 import TorchFP8Linear, quantize_fp8_weight
+import gptqmodel.nn_modules.qlinear.fp8 as fp8_module
 from gptqmodel.quantization.dtype import available_float8_dtype_names
 
 
 def _available_fp8_quant_formats():
     return [fmt for fmt in available_float8_dtype_names() if fmt != "float8_e8m0fnu"]
+
+
+def _make_fp8_kernel(*, in_features: int = 64, out_features: int = 64) -> fp8_module.TorchFP8Linear:
+    torch.manual_seed(3)
+    linear = nn.Linear(in_features, out_features, bias=True).eval()
+    kernel = fp8_module.TorchFP8Linear(
+        bits=8,
+        group_size=-1,
+        desc_act=False,
+        sym=True,
+        in_features=in_features,
+        out_features=out_features,
+        bias=True,
+        pack_dtype=torch.int32,
+        format="float8_e4m3fn",
+        weight_scale_method="row",
+        weight_block_size=None,
+        register_buffers=False,
+    )
+    kernel.pack_original(linear=linear, scales=None, zeros=None)
+    kernel._scaled_mm_hard_disabled = True
+    return kernel.eval()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="NVIDIA FP8 scaled matmul required",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("biased", [False, True])
+@pytest.mark.parametrize("prefix", [(2,), (2, 3)])
+def test_fp8_empty_cuda_forward_preserves_scaled_mm_for_later_tokens(monkeypatch, dtype, biased, prefix):
+    linear = nn.Linear(64, 64, bias=biased).eval()
+    module = fp8_module.TorchFP8Linear(
+        bits=8, group_size=-1, desc_act=False, sym=True,
+        in_features=64, out_features=64, bias=biased,
+        format="float8_e4m3fn", weight_scale_method="tensor",
+    )
+    module.pack_original(linear, scales=None, zeros=None)
+    module = module.eval().to(device="cuda")
+    x = torch.randn(*prefix, 64, device="cuda", dtype=dtype)
+    empty = x[:0]
+    x_flat = x.reshape(-1, 64)
+    if not module._can_use_scaled_mm(x_flat):
+        pytest.skip("Native FP8 scaled matmul unavailable on this GPU")
+    try:
+        module._forward_scaled_mm(x_flat)
+    except Exception as exc:
+        pytest.skip(f"Native FP8 scaled matmul unavailable: {exc}")
+
+    native_calls = []
+    dequant_refs = []
+    native_forward = module._forward_scaled_mm
+    dequantize_weight = module.dequantize_weight
+
+    def counted_native(tensor):
+        native_calls.append(tuple(tensor.shape))
+        return native_forward(tensor)
+
+    def tracked_dequant(*args, **kwargs):
+        weight = dequantize_weight(*args, **kwargs)
+        dequant_refs.append(weakref.ref(weight))
+        return weight
+
+    monkeypatch.setattr(module, "_forward_scaled_mm", counted_native)
+    monkeypatch.setattr(module, "dequantize_weight", tracked_dequant)
+    with torch.inference_mode():
+        empty_output = module(empty)
+        assert empty_output.shape == empty.shape[:-1] + (64,)
+        assert empty_output.dtype == dtype
+        assert not module._scaled_mm_hard_disabled
+        assert native_calls == []
+        assert all(ref() is None for ref in dequant_refs)
+
+        output = module(x)
+        assert output.shape == x.shape
+        assert output.dtype == dtype
+        assert torch.isfinite(output).all()
+        assert native_calls == [tuple(x_flat.shape)]
+        assert not module._scaled_mm_hard_disabled
 
 
 @pytest.mark.parametrize("fmt", _available_fp8_quant_formats())
@@ -20,7 +102,7 @@ def test_fp8_pack_matches_reference_quantizer(fmt: str, weight_scale_method: str
     linear = nn.Linear(64, 64, bias=True).eval()
     block_size = (16, 16) if weight_scale_method == "block" else None
 
-    kernel = TorchFP8Linear(
+    kernel = fp8_module.TorchFP8Linear(
         bits=8,
         group_size=-1,
         desc_act=False,
@@ -36,7 +118,7 @@ def test_fp8_pack_matches_reference_quantizer(fmt: str, weight_scale_method: str
     )
     kernel.pack_original(linear=linear, scales=None, zeros=None)
 
-    expected_weight, expected_scale_inv = quantize_fp8_weight(
+    expected_weight, expected_scale_inv = fp8_module.quantize_fp8_weight(
         linear.weight.detach().to(torch.float32),
         format=fmt,
         weight_scale_method=weight_scale_method,
@@ -53,7 +135,7 @@ def test_fp8_pack_rejects_e8m0fnu(weight_scale_method: str):
     linear = nn.Linear(64, 64, bias=True).eval()
     block_size = (16, 16) if weight_scale_method == "block" else None
 
-    kernel = TorchFP8Linear(
+    kernel = fp8_module.TorchFP8Linear(
         bits=8,
         group_size=-1,
         desc_act=False,
@@ -80,7 +162,7 @@ def test_fp8_forward_matches_dequantized_reference(fmt: str, weight_scale_method
     linear = nn.Linear(64, 64, bias=True).eval()
     block_size = (16, 16) if weight_scale_method == "block" else None
 
-    kernel = TorchFP8Linear(
+    kernel = fp8_module.TorchFP8Linear(
         bits=8,
         group_size=-1,
         desc_act=False,
@@ -113,6 +195,143 @@ def test_fp8_forward_matches_dequantized_reference(fmt: str, weight_scale_method
     torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)
 
 
+def test_fp8_forward_dequantizes_per_call_without_dense_cache(monkeypatch):
+    kernel = _make_fp8_kernel()
+    x = torch.randn(5, 64)
+
+    calls = 0
+    dequantize_weight = kernel.dequantize_weight
+
+    def counted_dequantize_weight(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return dequantize_weight(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "dequantize_weight", counted_dequantize_weight)
+
+    with torch.inference_mode():
+        first = kernel(x)
+        second = kernel(x)
+
+    assert calls == 2
+    assert not hasattr(kernel, "_dequant_weight_cache")
+    torch.testing.assert_close(second, first, rtol=0, atol=0)
+
+
+def test_fp8_optimize_compiles_cpu_forward(monkeypatch):
+    kernel = _make_fp8_kernel()
+    x = torch.randn(7, 64)
+    with torch.inference_mode():
+        eager = kernel(x)
+
+    calls = []
+
+    def fake_compile(fn, **kwargs):
+        calls.append(kwargs)
+        return lambda value, bias=None: fn(value, bias=bias)
+
+    monkeypatch.setattr(fp8_module, "TORCH_HAS_COMPILE", True)
+    monkeypatch.setattr(fp8_module, "torch_compile", fake_compile)
+
+    assert kernel.optimize(backend="inductor") is kernel
+    assert kernel.optimized
+    assert kernel._compiled_forward is not None
+    assert calls == [{"backend": "inductor", "mode": None, "fullgraph": False}]
+
+    with torch.inference_mode():
+        compiled = kernel(x)
+    torch.testing.assert_close(compiled, eager, rtol=0, atol=0)
+
+    kernel.optimize(backend="inductor")
+    assert len(calls) == 1
+
+
+def test_fp8_compiled_forward_invalidates_on_move_and_state_load(monkeypatch):
+    kernel = _make_fp8_kernel()
+    monkeypatch.setattr(fp8_module, "TORCH_HAS_COMPILE", True)
+    monkeypatch.setattr(
+        fp8_module,
+        "torch_compile",
+        lambda fn, **_kwargs: lambda value, bias=None: fn(value, bias=bias),
+    )
+
+    kernel.optimize()
+    assert kernel._compiled_forward is not None
+    kernel._apply(lambda tensor: tensor)
+    assert kernel._compiled_forward is None
+    assert not kernel.optimized
+
+    kernel.optimize()
+    assert kernel._compiled_forward is not None
+    with torch.inference_mode():
+        kernel.load_state_dict(kernel.state_dict())
+    assert kernel._compiled_forward is None
+    assert not kernel.optimized
+
+
+def test_fp8_compiled_forward_falls_back_to_eager(monkeypatch):
+    kernel = _make_fp8_kernel()
+    x = torch.randn(7, 64)
+    with torch.inference_mode():
+        expected = kernel(x)
+
+    def fail(_value, bias=None):
+        del bias
+        raise RuntimeError("compiled graph failed")
+
+    kernel._compiled_forward = fail
+    kernel.optimized = True
+
+    with torch.inference_mode():
+        actual = kernel(x)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert kernel._compiled_forward is None
+    assert not kernel.optimized
+
+
+def test_fp8_compiled_forward_reads_live_weight_without_dense_cache(monkeypatch):
+    kernel = _make_fp8_kernel()
+    x = torch.randn(7, 64)
+    monkeypatch.setattr(fp8_module, "TORCH_HAS_COMPILE", True)
+    monkeypatch.setattr(
+        fp8_module,
+        "torch_compile",
+        lambda fn, **_kwargs: lambda value, bias=None: fn(value, bias=bias),
+    )
+    kernel.optimize()
+
+    with torch.inference_mode():
+        before = kernel(x)
+        kernel.weight.zero_()
+        after = kernel(x)
+        expected = torch.matmul(
+            x,
+            kernel.dequantize_weight(device=x.device, dtype=x.dtype),
+        ) + kernel.bias
+
+    assert not torch.equal(before, after)
+    torch.testing.assert_close(after, expected, rtol=0, atol=0)
+    assert not hasattr(kernel, "_dequant_weight_cache")
+
+
+def test_fp8_optimize_skips_non_cpu_weights(monkeypatch):
+    kernel = _make_fp8_kernel()
+    kernel = kernel.to("meta")
+    calls = []
+    monkeypatch.setattr(fp8_module, "TORCH_HAS_COMPILE", True)
+    monkeypatch.setattr(
+        fp8_module,
+        "torch_compile",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    kernel.optimize()
+
+    assert calls == []
+    assert not kernel.optimized
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("fmt", _available_fp8_quant_formats())
 @pytest.mark.parametrize("weight_scale_method", ["tensor", "row"])
@@ -120,7 +339,7 @@ def test_fp8_scaled_mm_matches_dense_reference(fmt: str, weight_scale_method: st
     torch.manual_seed(2)
     linear = nn.Linear(64, 64, bias=False).eval()
 
-    kernel = TorchFP8Linear(
+    kernel = fp8_module.TorchFP8Linear(
         bits=8,
         group_size=-1,
         desc_act=False,

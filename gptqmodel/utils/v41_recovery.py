@@ -27,7 +27,7 @@ class V41Recovery:
         self.rows = {(expert, rank): [] for expert in self.expert_ids
                      for rank in range(self.top_k + 1, self.rank_max + 1)}
         self.coordinates = {key: [] for key in self.rows}
-        self.observed = {expert: 0 for expert in self.expert_ids}
+        self.observed = dict.fromkeys(self.expert_ids, 0)
         self.offset = 0
         self.handle = None
         self.failed = False

@@ -18,7 +18,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .deepseek_v3 import DeepSeekV3QModel
 from ...utils.exl3_error_ledger import (
     ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
     ZERO_ROUTE_RECOVERY_MODE_MIXED,
@@ -26,6 +25,7 @@ from ...utils.exl3_error_ledger import (
     zero_route_recovery_recipe,
 )
 from ...utils.exl3_router_candidates import has_learned_router_recovery, learned_router_ranked_choices
+from .deepseek_v3 import DeepSeekV3QModel
 
 
 MTP_BLOCK_COUNT = 3
@@ -1437,20 +1437,33 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         "layers",
         "#",
         {
+            "attn_hc:!": ("input_norm:!",),
             "input_layernorm": ("input_layernorm:!",),
-            "self_attn": (
+            # `sinks` is a direct parameter on the attention container.
+            "self_attn:!": (
                 "q_a_norm:!",
-                "q_a_proj:0",
+                "q_a_proj:0:q",
                 "q_b_norm:!",
-                "q_b_proj:0:in=q_a",
+                "q_b_proj:0:q:in=q_a",
                 "o_a_proj:!",
-                "o_b_proj:1",
+                "o_b_proj:1:o",
                 "kv_norm:!",
-                "kv_proj:2",
+                "kv_proj:2:k:v",
+                "compressor:!",
+                "compressor.kv_norm:!",
+                "compressor.kv_proj:!",
+                "compressor.gate_proj:!",
+                "compressor.indexer:!",
+                "compressor.indexer.kv_norm:!",
+                "compressor.indexer.kv_proj:!",
+                "compressor.indexer.q_b_proj:!",
+                "compressor.indexer.gate_proj:!",
+                "compressor.indexer.scorer.weights_proj:!",
             ),
+            "ffn_hc:!": ("input_norm:!",),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
             "mlp:moe": {
-                "gate": ("gate:!",),
+                "gate": ("gate:!", "e_score_correction_bias:!", "tid2eid:!"),
                 "experts": {
                     "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
                 },
@@ -2576,10 +2589,10 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             for expert, ranks in candidate_rows.items()
         }
         retained_by_rank: dict[int, dict[int, int]] = {
-            expert: {rank: 0 for rank in ranks}
+            expert: dict.fromkeys(ranks, 0)
             for expert, ranks in candidate_rows.items()
         }
-        observed_by_expert = {expert: 0 for expert in targets}
+        observed_by_expert = dict.fromkeys(targets, 0)
         pending_ffn_input: torch.Tensor | None = None
         pending_keep_mask: torch.Tensor | None = None
 
@@ -3294,6 +3307,11 @@ class DeepSeekV4MTPQuantizationModel(DeepSeekV4QModel):
             layer_input_kwargs=_DeepSeekV4MTPInputView(provider, "layer_input_kwargs"),
             position_ids=_DeepSeekV4MTPInputView(provider, "position_ids"),
             attention_masks=_DeepSeekV4MTPInputView(provider, "attention_mask"),
+            # ``InputCache.__post_init__`` mirrors ``layer_inputs`` into
+            # ``src_inputs`` with ``list(...)``, which would expand the lazy
+            # view on construction. MTP replay has no input-embedding stage
+            # that consumes ``src_inputs``, so leave it empty.
+            src_inputs=[],
         )
 
     def run_input_capture(self, example, use_cache: bool, data_device):

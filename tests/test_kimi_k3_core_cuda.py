@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 import math
 import os
-from pathlib import Path
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -21,6 +21,7 @@ from torch.nn import functional as F
 
 from gptqmodel.nn_modules.exllamav3 import ExllamaV3Linear
 from gptqmodel.utils import kimi_k3_core_format as core
+
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires admitted CUDA GPU')
 
@@ -110,7 +111,7 @@ def captured_hessian(activations, *, device='cuda:0'):
         reference_sq += float(reference.square().sum())
     normalized = math.sqrt(error_sq / reference_sq)
     assert normalized < 1e-6 and bool(torch.isfinite(actual).all())
-    return dict(H=actual,count=len(activations),finalized=False),normalized
+    return {'H': actual,'count': len(activations),'finalized': False},normalized
 
 
 def direct_quantizer_baseline(weight, raw):
@@ -120,9 +121,9 @@ def direct_quantizer_baseline(weight, raw):
     outputs,inputs = weight.shape
     output_pad = math.ceil(outputs / 128) * 128 - outputs
     padded = F.pad(weight.float(),(0,0,0,output_pad)).T.contiguous()
-    args = dict(K=6,seed=787,sigma_reg=.025,devices=[torch.device('cuda:0')],
-                mcg=True,apply_out_scales=None)
-    h = dict(H=raw['H'].clone(),count=raw['count'],finalized=False)
+    args = {'K': 6,'seed': 787,'sigma_reg': .025,'devices': [torch.device('cuda:0')],
+                'mcg': True,'apply_out_scales': None}
+    h = {'H': raw['H'].clone(),'count': raw['count'],'finalized': False}
     _,_,packed = quantize_exl3(padded,h,args,return_weight_q=False)
     return {key:value.detach().cpu() for key,value in packed.items()}
 
@@ -136,9 +137,9 @@ def test_independent_bitstream_decoder_matches_clean_room_reference():
     for bits in (2,6):
         trellis = torch.randint(-32768,32768,(8,40,16 * bits),generator=gen,dtype=torch.int16)
         trellis.reshape(-1)[:8] = torch.tensor([0,1,32767,-32768,-1,0x5555,-21846,31],dtype=torch.int16)
-        packed = dict(trellis=trellis,suh=torch.ones(128,dtype=torch.float16),
-                      svh=torch.ones(640,dtype=torch.float16),
-                      mcg=torch.tensor(0xCBAC1FED,dtype=torch.uint32).view(torch.int32))
+        packed = {'trellis': trellis,'suh': torch.ones(128,dtype=torch.float16),
+                      'svh': torch.ones(640,dtype=torch.float16),
+                      'mcg': torch.tensor(0xCBAC1FED,dtype=torch.uint32).view(torch.int32)}
         reference = ExllamaV3TorchLinear.from_tensors(in_features=128,out_features=640,name='oracle',tensors=packed)
         assert torch.equal(oracle_states(trellis).long(),reference._unpack_indices())
         # This prior clean-room reference emits FP32 codebook sums. Account

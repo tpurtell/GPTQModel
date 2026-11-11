@@ -12,11 +12,15 @@ import json
 import math
 import operator
 import os
+import secrets
 import shutil
+import stat
 import struct
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -44,6 +48,7 @@ from ..models._const import (
 from ..nn_modules.qlinear import BaseQuantLinear, GPTQQuantLinear
 from ..nn_modules.qlinear.exllamav2 import ExllamaV2Linear
 from ..nn_modules.qlinear.exllamav2_awq import AwqExllamaV2Linear
+from ..nn_modules.qlinear.marlin import MarlinLinear
 from ..nn_modules.qlinear.torch import TorchQuantEmbeddings
 from ..quantization import FORMAT, QuantizeConfig
 from ..quantization.config import (
@@ -55,8 +60,10 @@ from ..quantization.config import (
     _normalize_fp8_scale_semantics,
     _normalize_fp8_weight_block_size,
     _normalize_fp8_weight_scale_method,
+    _normalize_gguf_config_spec,
     _normalize_quant_bits,
     dynamic_get,
+    dynamic_matching_pattern,
     quant_bits_width,
     resolve_quant_format,
 )
@@ -69,7 +76,9 @@ from .hub import hf_hub_download, model_info
 from .importer import select_quant_linear, validate_quant_linear
 from .logger import log_time_block, setup_logger
 from .model_dequant import _correct_gptq_v1_qzeros, _revert_gptq_v1_qzeros_correction
-from .torch import HAS_CUDA, torch_empty_cache
+from .p2p import safe_module_to, safe_move_to
+from .packing import _auto_pack_impl
+from .torch import HAS_CUDA, as_torch_device, torch_empty_cache
 
 
 log = setup_logger()
@@ -89,10 +98,37 @@ _DTYPE_SAFE_MAP = {
     torch.bool: ("BOOL", 1),
 }
 
+# TODO: keep the float8 entries below in sync with ``_FLOAT8_DTYPE_NAMES``.
+#
+# Gotcha 1 — the header identifier is NOT ``"F8_" + name.upper()``. The
+# safetensors JSON schema uses short names that drop the ``fn`` suffix and the
+# ``fnu`` marker: ``torch.float8_e4m3fn`` -> ``F8_E4M3``,
+# ``torch.float8_e5m2`` -> ``F8_E5M2``, ``torch.float8_e8m0fnu`` -> ``F8_E8M0``.
+# Guessing the identifier (e.g. emitting ``F8_E4M3FN``) makes the reader reject the
+# whole file with "unknown variant" while unpacking the header. Verified against
+# safetensors 0.8.0. Add new entries by checking the accepted spelling, never by
+# transforming the torch dtype name.
+#
+# Gotcha 2 — every supported float8 dtype needs an entry here as well as in
+# ``_FLOAT8_DTYPE_NAMES``. The FNUZ variants use the explicit safetensors IDs
+# ``F8_E4M3FNUZ`` and ``F8_E5M2FNUZ``; streaming export and reference offload
+# both use this map when writing their headers.
+#
+# The failure mode when a dtype is missing here is a hard ``NotImplementedError``
+# from ``_torch_dtype_to_safetensors`` at export time, not silent byte corruption.
+# A widened ``_FLOAT8_DTYPE_NAMES`` does NOT automatically become exportable: the
+# two tuples are intentionally separate (sizes vs. serializable identifiers), so
+# adding a name in one place without the other silently leaves the dtype
+# unexportable. This is a known wart; deriving both from a single
+# ``(torch_name, safetensors_id, num_bytes)`` table would remove it.
 if hasattr(torch, "float8_e4m3fn"):
     _DTYPE_SAFE_MAP[torch.float8_e4m3fn] = ("F8_E4M3", 1)
 if hasattr(torch, "float8_e5m2"):
     _DTYPE_SAFE_MAP[torch.float8_e5m2] = ("F8_E5M2", 1)
+if hasattr(torch, "float8_e4m3fnuz"):
+    _DTYPE_SAFE_MAP[torch.float8_e4m3fnuz] = ("F8_E4M3FNUZ", 1)
+if hasattr(torch, "float8_e5m2fnuz"):
+    _DTYPE_SAFE_MAP[torch.float8_e5m2fnuz] = ("F8_E5M2FNUZ", 1)
 if hasattr(torch, "float8_e8m0fnu"):
     _DTYPE_SAFE_MAP[torch.float8_e8m0fnu] = ("F8_E8M0", 1)
 
@@ -252,6 +288,7 @@ def _module_has_meta_tensors(module: nn.Module) -> bool:
 
 
 def move_to(obj: torch.Tensor | nn.Module, device: torch.device, dtype: torch.dtype = None):
+    device = as_torch_device(device)
     if isinstance(obj, nn.Module) and _module_has_meta_tensors(obj):
         if not accelerate.utils.has_offloaded_params(obj):
             raise NotImplementedError(
@@ -266,7 +303,12 @@ def move_to(obj: torch.Tensor | nn.Module, device: torch.device, dtype: torch.dt
         return undo_offload_to_disk(obj, device=device, dtype=dtype)
 
     if get_device(obj) != device or dtype is not None:
-        obj = obj.to(device=device, dtype=dtype, non_blocking=False)
+        # Cross-device moves must be direction-aware: on an asymmetric ROCm
+        # topology a direct peer copy segfaults instead of raising.
+        if isinstance(obj, nn.Module):
+            obj = safe_module_to(obj, device, dtype=dtype)
+        else:
+            obj = safe_move_to(obj, device, dtype=dtype)
 
     return obj
 
@@ -313,13 +355,79 @@ def get_module_by_name(module, child_name):
 
 
 def get_module_by_name_prefix(model, module_name: Union[List[str], str]):
+    """Resolve the first path that is exactly ``prefix`` or a dotted descendant.
+
+    A plain ``startswith`` test treats ``mlp_extra`` as ``mlp`` and can silently
+    select a sibling instead of the declared module. Prefer an exact path, then
+    reject ambiguous descendant matches instead of choosing among them.
+    """
     module_name_list = module_name if isinstance(module_name, list) else [module_name]
-    for name, module in model.named_modules():
-        for prefix in module_name_list:
-            if name.startswith(prefix):
-                return module, prefix
+    modules = dict(model.named_modules())
+    for prefix in module_name_list:
+        if isinstance(prefix, str) and prefix in modules:
+            return modules[prefix], prefix
+    for prefix in module_name_list:
+        if not isinstance(prefix, str) or not prefix:
+            continue
+        matches = [
+            (name, module)
+            for name, module in modules.items()
+            if name.startswith(f"{prefix}.")
+        ]
+        if len(matches) == 1:
+            return matches[0][1], prefix
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous module prefix {prefix!r}: matches {[name for name, _ in matches[:8]]}"
+            )
 
     return None, ""
+
+
+def thinker_text_model(model: nn.Module) -> nn.Module:
+    """Return the text decoder owned by a Qwen Omni ``thinker`` submodule.
+
+    transformers 5.22 moved the decoder from ``thinker.model`` to
+    ``thinker.model.language_model``; older releases keep ``embed_tokens``,
+    ``layers``, ``norm`` and ``rotary_emb`` directly on ``thinker.model``.
+    """
+
+    thinker = getattr(model, "thinker", model)
+    inner = getattr(thinker, "model", thinker)
+    return getattr(inner, "language_model", inner)
+
+
+def thinker_text_prefix(model: nn.Module) -> str:
+    """Return the module path of the Qwen Omni thinker text decoder.
+
+    The path is relative to ``model`` and mirrors what
+    :func:`thinker_text_model` resolves, so ``model.get_submodule(path)`` is
+    the decoder whether ``model`` is the outer Omni wrapper or a bare thinker.
+    An empty string means ``model`` is already the decoder.
+    """
+
+    parts = []
+    node = model
+    if hasattr(node, "thinker"):
+        parts.append("thinker")
+        node = node.thinker
+    if hasattr(node, "model"):
+        parts.append("model")
+        node = node.model
+    if getattr(node, "language_model", None) is not None:
+        parts.append("language_model")
+    return ".".join(parts)
+
+
+def thinker_multimodal_model(model: nn.Module) -> nn.Module:
+    """Return the module that owns the thinker's visual and audio encoders.
+
+    transformers 5.22 moved them from ``thinker`` to ``thinker.model``.
+    """
+
+    thinker = getattr(model, "thinker", model)
+    inner = getattr(thinker, "model", thinker)
+    return inner if hasattr(inner, "visual") else thinker
 
 
 def get_layers_with_prefixes(model, module_name: Union[List[str], str]):
@@ -385,9 +493,28 @@ def get_layer_name(layer_names: Union[List[str], str, None], layer_index: int) -
 
 
 def get_module_by_name_suffix(model, module_name: str):
-    for name, module in model.named_modules():
-        if name.endswith(module_name):
-            return module
+    """Resolve a path suffix at a dotted segment boundary.
+
+    Exact paths win. Multiple suffix matches are an error: returning the first
+    one makes device placement and quantization depend on module registration
+    order.
+    """
+    modules = dict(model.named_modules())
+    exact = modules.get(module_name)
+    if exact is not None:
+        return exact
+    matches = [
+        (name, module)
+        for name, module in modules.items()
+        if name.endswith(f".{module_name}")
+    ]
+    if len(matches) == 1:
+        return matches[0][1]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Ambiguous module suffix {module_name!r}: matches {[name for name, _ in matches[:8]]}"
+        )
+    return None
 
 def get_module(module, key):
     """Get module from model by key name.
@@ -515,9 +642,12 @@ def create_quant_module(
     else:
         ori_layer_device = submodule.list_buffers()[0].device
 
-    if ori_layer_device.type != CPU.type:
+    # Transformers builds quantized models on the meta device before assigning
+    # checkpoint tensors, so allow either CPU or meta here and keep the
+    # replacement layer on the device the original layer occupied.
+    if ori_layer_device.type not in {CPU.type, "meta"}:
         raise AssertionError(
-            f"Expected `{name}` to reside on CPU during quant module creation, "
+            f"Expected `{name}` to reside on CPU or meta during quant module creation, "
             f"but found tensors on `{ori_layer_device}`."
         )
 
@@ -607,6 +737,15 @@ def create_quant_module(
                     tmp_init_kwargs["compress_statistics"] = bool(
                         overrides.get("compress_statistics", overrides.get("bnb_compress_statistics"))
                     )
+            elif format == FORMAT.GGUF:
+                # Resolve width and subtype independently, matching the config
+                # used to quantize this module. Width-only overrides inherit the
+                # base subtype; format-only overrides inherit only its width.
+                base_width, base_format, _ = _normalize_gguf_config_spec(bits, None)
+                _, _, tmp_bits = _normalize_gguf_config_spec(
+                    overrides.get("bits", base_width),
+                    overrides.get(FORMAT_FIELD_CODE, base_format),
+                )
 
     validate_bits = quant_bits_width(tmp_bits)
     constructor_bits = tmp_bits if getattr(linear_cls, "QUANT_TYPE", None) == "gguf" else validate_bits
@@ -760,83 +899,51 @@ def convert_gptq_v1_to_v2_format_module(module: BaseQuantLinear, bits: int, pack
 
     log.info.once("Format: Converting GPTQ v1 to v2")
 
-    # v1 checkpoint format used to do `qzeros = qzeros -= 1` before serialization, thus the
-    # additions here do not overflow.
-    # v1 checkpoint format with sym=False saved via convert_gptq_v2_to_v1_format() will
-    # overflow ~<=13% based on testing
-    if bits == 2:
-        if pack_dtype == torch.int64:
-            module.qzeros.data += 0b0101010101010101010101010101010101010101010101010101010101010101
-        elif pack_dtype == torch.int32:
-            module.qzeros.data += 0b01010101010101010101010101010101
-        elif pack_dtype == torch.int16:
-            module.qzeros.data += 0b0101010101010101
-        elif pack_dtype == torch.int8:
-            module.qzeros.data += 0b01010101
+    # v1 stores a per-field (zero_point - 1): a packed-word `+= 1` carries
+    # across fields when a stored value is maxed (zp=0 -> stored maxq), so the
+    # correction must decode, shift in logical space, and repack.
+    if bits in (2, 4, 8) or (bits == 3 and pack_dtype == torch.int32):
+        module.qzeros.data.copy_(
+            _correct_gptq_v1_qzeros(module.qzeros.data, bits, planar=getattr(module, "planar", False))
+        )
     elif bits == 3:
-        if pack_dtype == torch.int32:
-            # GPTQ INT3 spills some zero-point bits across adjacent packed words.
-            # Reuse the logical field shift so module conversion matches the
-            # safetensor dequant path and the canonical INT3 pack layout.
-            module.qzeros.data.copy_(
-                _correct_gptq_v1_qzeros(module.qzeros.data, bits, planar=getattr(module, "planar", False))
-            )
-        else:
-            # Only int32 packing words are used for GPTQ INT3 in actual checkpoints.
-            # Keep the legacy constant-offset path for synthetic smaller word sizes.
-            # range 0 offset
-            if pack_dtype == torch.int64:
-                offset = 0b0010010010010010010010010010010000100100100100100100100100100100
-            elif pack_dtype == torch.int16:
-                offset = 0b0010010010010010
-            elif pack_dtype == torch.int8:
-                offset = 0b00100100
-
-            module.qzeros.data[:, range(0, module.qzeros.data.shape[1], 3)] += (
-                offset
-            )
-
-            # range 1 offset
-            if pack_dtype == torch.int64:
-                offset = 0b1001001001001001001001001001001010010010010010010010010010010010
-            elif pack_dtype == torch.int16:
-                offset = 0b1001001001001001
-            elif pack_dtype == torch.int8:
-                offset = 0b10010010
-
-            module.qzeros.data[:, range(1, module.qzeros.data.shape[1], 3)] += (
-                offset
-            )
-
-            # range 2 offset
-            if pack_dtype == torch.int64:
-                offset = 0b0100100100100100100100100100100101001001001001001001001001001001
-            elif pack_dtype == torch.int16:
-                offset = 0b0100100100100100
-            elif pack_dtype == torch.int8:
-                offset = 0b01001001
-
-            module.qzeros.data[:, range(2, module.qzeros.data.shape[1], 3)] += (
-                offset
-            )
-    elif bits == 4:
+        # Only int32 packing words are used for GPTQ INT3 in actual checkpoints.
+        # Keep the legacy constant-offset path for synthetic smaller word sizes.
+        # range 0 offset
         if pack_dtype == torch.int64:
-            module.qzeros.data += 0b0001000100010001000100010001000100010001000100010001000100010001
-        elif pack_dtype == torch.int32:
-            module.qzeros.data += 0b00010001000100010001000100010001
+            offset = 0b0010010010010010010010010010010000100100100100100100100100100100
         elif pack_dtype == torch.int16:
-            module.qzeros.data += 0b0001000100010001
+            offset = 0b0010010010010010
         elif pack_dtype == torch.int8:
-            module.qzeros.data += 0b00010001
-    elif bits == 8:
+            offset = 0b00100100
+
+        module.qzeros.data[:, range(0, module.qzeros.data.shape[1], 3)] += (
+            offset
+        )
+
+        # range 1 offset
         if pack_dtype == torch.int64:
-            module.qzeros.data += 0b0000000100000001000000010000000100000001000000010000000100000001
-        elif pack_dtype == torch.int32:
-            module.qzeros.data += 0b00000001000000010000000100000001
+            offset = 0b1001001001001001001001001001001010010010010010010010010010010010
         elif pack_dtype == torch.int16:
-            module.qzeros.data += 0b0000000100000001
+            offset = 0b1001001001001001
         elif pack_dtype == torch.int8:
-            module.qzeros.data += 0b00000001
+            offset = 0b10010010
+
+        module.qzeros.data[:, range(1, module.qzeros.data.shape[1], 3)] += (
+            offset
+        )
+
+        # range 2 offset
+        if pack_dtype == torch.int64:
+            offset = 0b0100100100100100100100100100100101001001001001001001001001001001
+        elif pack_dtype == torch.int16:
+            offset = 0b0100100100100100
+        elif pack_dtype == torch.int8:
+            offset = 0b01001001
+
+        module.qzeros.data[:, range(2, module.qzeros.data.shape[1], 3)] += (
+            offset
+        )
     elif bits in (5, 6, 7):
         if pack_dtype != torch.int32:
             raise NotImplementedError(
@@ -915,28 +1022,23 @@ def convert_gptq_v2_to_v1_format_module(
 
     bits = getattr(module, "bits", quantize_config.bits)
     pack_dtype = getattr(module, "pack_dtype", quantize_config.pack_dtype)
-    if bits == 2:
-        module.qzeros.data -= 0b01010101010101010101010101010101
+    # v1 stores a per-field (zero_point - 1): a packed-word `-= 1` borrows
+    # across fields when a logical zero point is 0, so the correction must
+    # decode, shift in logical space, and repack.
+    if bits in (2, 4, 8) or (bits == 3 and pack_dtype == torch.int32):
+        module.qzeros.data.copy_(
+            _revert_gptq_v1_qzeros_correction(module.qzeros.data, bits, planar=getattr(module, "planar", False))
+        )
     elif bits == 3:
-        if pack_dtype == torch.int32:
-            # Keep INT3 export symmetric with the load-side logical correction.
-            module.qzeros.data.copy_(
-                _revert_gptq_v1_qzeros_correction(module.qzeros.data, bits, planar=getattr(module, "planar", False))
-            )
-        else:
-            module.qzeros.data[:, range(0, module.qzeros.data.shape[1], 3)] -= (
-                0b00100100100100100100100100100100
-            )
-            module.qzeros.data[:, range(1, module.qzeros.data.shape[1], 3)] -= (
-                0b10010010010010010010010010010010
-            )
-            module.qzeros.data[:, range(2, module.qzeros.data.shape[1], 3)] -= (
-                0b01001001001001001001001001001001
-            )
-    elif bits == 4:
-        module.qzeros.data -= 0b00010001000100010001000100010001
-    elif bits == 8:
-        module.qzeros.data -= 0b00000001000000010000000100000001
+        module.qzeros.data[:, range(0, module.qzeros.data.shape[1], 3)] -= (
+            0b00100100100100100100100100100100
+        )
+        module.qzeros.data[:, range(1, module.qzeros.data.shape[1], 3)] -= (
+            0b10010010010010010010010010010010
+        )
+        module.qzeros.data[:, range(2, module.qzeros.data.shape[1], 3)] -= (
+            0b01001001001001001001001001001001
+        )
     elif bits in (5, 6, 7):
         if pack_dtype != torch.int32:
             raise NotImplementedError(
@@ -974,6 +1076,40 @@ def convert_gptq_v2_to_v1_format(
 
     return model
 
+
+def resolve_pack_device(
+    quantize_config: Optional[QuantizeConfig],
+    device: Optional[Union[str, torch.device, DEVICE]] = None,
+) -> Optional[torch.device]:
+    """Resolve the accelerator a module should be packed on.
+
+    ``QuantizeConfig.device`` is normalized to an index-less ``DEVICE`` enum by
+    the loader, so on a multi-GPU host it would silently pin GPU packing to
+    ``cuda:0`` even when the module was quantized on another GPU. Callers that
+    know the assigned device pass it here; a CPU assignment keeps the historical
+    auto-select behavior because ``pack_impl="auto"`` still prefers GPU packing
+    when one is available.
+    """
+
+    cfg_device = getattr(quantize_config, "device", None)
+    if device is not None:
+        assigned = device.to_torch_device() if isinstance(device, DEVICE) else torch.device(device)
+        if assigned.type != "cpu":
+            cfg_device = assigned
+
+    if isinstance(cfg_device, DEVICE):
+        return cfg_device.to_torch_device()
+    if isinstance(cfg_device, torch.device):
+        return cfg_device
+    if isinstance(cfg_device, str):
+        try:
+            return torch.device(cfg_device)
+        except (RuntimeError, ValueError):
+            log.warning(f"pack_module: unable to parse target device `{cfg_device}`; defaulting to CUDA auto-select.")
+            return None
+    return None
+
+
 @torch.inference_mode()
 def pack_module(
     name,
@@ -987,6 +1123,7 @@ def pack_module(
     q_scales_extra=None,
     quantize_config: Optional[QuantizeConfig] = None,
     quant_result: Optional[Dict[str, Any]] = None,
+    device: Optional[Union[str, torch.device]] = None,
 ):
     # Limit pack() thread usage to avoid auto-parallizataion regression
     # with ctx(tctl.threadpool_limits(limits=1), lock):
@@ -1011,16 +1148,7 @@ def pack_module(
     target_device = None
     if quantize_config is not None:
         pack_impl = getattr(quantize_config, "pack_impl", "original") or "original"
-        cfg_device = getattr(quantize_config, "device", None)
-        if isinstance(cfg_device, DEVICE):
-            target_device = cfg_device.to_torch_device()
-        elif isinstance(cfg_device, torch.device):
-            target_device = cfg_device
-        elif isinstance(cfg_device, str):
-            try:
-                target_device = torch.device(cfg_device)
-            except (RuntimeError, ValueError):
-                log.warning(f"pack_module: unable to parse target device `{cfg_device}`; defaulting to CUDA auto-select.")
+        target_device = resolve_pack_device(quantize_config, device)
 
     packer_label = None
 
@@ -1067,6 +1195,8 @@ def pack_module(
             effective_impl = "block"
         elif effective_impl in {"original", "pack_original"}:
             effective_impl = "original"
+        elif effective_impl in {"auto", "default"}:
+            effective_impl = _auto_pack_impl(module=module, linear=layer)
         elif effective_impl == "gpu":
             if not HAS_CUDA:
                 log.warning("pack_module: GPU packing requested but CUDA is unavailable; falling back to original pack.")
@@ -1103,7 +1233,7 @@ def pack_module(
                         g_idx=q_g_idx,
                         device=target_device,
                     )
-                except ValueError:
+                except (ValueError, NotImplementedError):
                     module.pack_original(linear=layer, scales=q_scales, zeros=q_zeros, g_idx=q_g_idx)
             elif effective_impl == "block":
                 try:
@@ -1387,6 +1517,87 @@ def hf_gptqmodel_post_init(model, use_act_order: bool, quantize_config: Quantize
     return gptqmodel_post_init(model, use_act_order, quantize_config, max_input_length)
 
 
+# public/stable api exposed to transformers/optimum: native load bridge.
+# Re-exported here so callers can keep importing from `gptqmodel.utils.model`.
+# These names are intentionally not referenced in this module: they exist only to
+# keep the `gptqmodel.utils.model` entry point stable for transformers/optimum,
+# so the unused-import exemption is deliberate rather than dead code.
+from .hf_load import (  # noqa: E402,F401
+    HFGPTQModelLoadContext,
+    hf_gptqmodel_post_init_for_load,
+    hf_gptqmodel_prepare_model_for_load,
+)
+
+
+def _post_init_cpu_offloaded_marlin(module: MarlinLinear) -> None:
+    """Refresh the writable CPU snapshot after Marlin changes its packed layout."""
+    # Resident weights have no Accelerate snapshot to refresh.
+    if not module.qweight.is_meta:
+        module.post_init()
+        return
+
+    from accelerate.hooks import AlignDevicesHook, SequentialHook
+    from accelerate.utils import PrefixedDataset
+
+    # An offload hook may be wrapped by other hooks, but it must own this layer.
+    attached = getattr(module, "_hf_hook", None)
+    hooks = attached.hooks if isinstance(attached, SequentialHook) else (attached,)
+    offload_hooks = [
+        hook for hook in hooks if isinstance(hook, AlignDevicesHook) and hook.offload
+    ]
+    if len(offload_hooks) != 1 or offload_hooks[0].place_submodules:
+        raise RuntimeError(
+            "CPU-offloaded Marlin requires a layer-level Accelerate offload hook."
+        )
+    hook = offload_hooks[0]
+    # CPU offload can keep layer entries in a shared dictionary under a prefix.
+    weights_map = hook.weights_map
+    if isinstance(weights_map, PrefixedDataset) and isinstance(
+        weights_map.dataset, dict
+    ):
+        storage, prefix = weights_map.dataset, weights_map.prefix
+    elif isinstance(weights_map, dict):
+        storage, prefix = weights_map, ""
+    else:
+        raise RuntimeError(
+            "CPU-offloaded Marlin requires a writable in-memory weights map."
+        )
+
+    # Save the original offloaded names before post_init changes tensor layouts.
+    names = [
+        name
+        for name, tensor in module.named_parameters(recurse=False)
+        if tensor.is_meta
+    ]
+    names.extend(
+        name
+        for name, tensor in module.named_buffers(recurse=False)
+        if tensor.is_meta and name not in module._non_persistent_buffers_set
+    )
+    missing = [name for name in names if f"{prefix}{name}" not in storage]
+    if missing:
+        raise RuntimeError(
+            f"CPU-offloaded Marlin is missing weights map entries: {missing}."
+        )
+
+    # Materialize the saved tensors, repack them, then return the layer to meta.
+    updated = {}
+    hook.pre_forward(module)
+    try:
+        module.post_init()
+        for name in names:
+            tensor = getattr(module, name, None)
+            if tensor is None or tensor.is_meta:
+                raise RuntimeError(
+                    f"Marlin did not materialize offloaded tensor `{name}`."
+                )
+            updated[f"{prefix}{name}"] = tensor.detach().to("cpu").clone()
+    finally:
+        hook.post_forward(module, None)
+    # Publish the packed snapshot only after post_forward has offloaded the layer.
+    storage.update(updated)
+
+
 def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeConfig = None,
                         max_input_length: Optional[int] = None):
     """
@@ -1445,6 +1656,8 @@ def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeCon
         if isinstance(submodule, (ExllamaV2Linear, AwqExllamaV2Linear)):
             device = submodule.qweight.device
             submodule.post_init(scratch_space=model.device_tensors[device])
+        elif isinstance(submodule, MarlinLinear):
+            _post_init_cpu_offloaded_marlin(submodule)
         elif isinstance(submodule, BaseQuantLinear):
             submodule.post_init()
 
@@ -1600,6 +1813,252 @@ def get_moe_layer_modules(layer_modules: List, num_experts: int) -> List:
     return new_inside_layer_modules
 
 
+# Marker separating the routed-expert container from the expert index, e.g.
+# `model.layers.0.mlp.experts.3.down_proj`. Shared experts (`shared_experts`)
+# are not part of the fused group and do not contain this marker.
+FUSED_EXPERT_GROUP_MARKER = ".experts."
+
+# Dense projections that inference engines merge into one module: fused module
+# suffix -> the GPT-QModel module suffixes it is built from.
+FUSED_PROJECTION_UNITS = {
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+}
+
+# `dynamic` fields that inference engines read when they resolve the single
+# config of a fused module. Every other field only affects GPT-QModel's
+# quantization step and is baked into the saved weights, so it may legitimately
+# differ between the modules of one fused module.
+FUSED_UNIT_ENGINE_FIELDS = ("bits", "group_size", "desc_act", "sym")
+
+
+def fused_expert_group_name(module_name: str) -> Optional[str]:
+    """Return the fused routed-expert group that `module_name` belongs to.
+
+    Inference engines (vLLM, SGLang) fuse every routed expert of one layer into
+    a single module (`<prefix>.experts`) with one precision and one
+    quantization config, so `<prefix>.experts.<expert_id>.<projection>` modules
+    must be quantized as a unit. Returns `None` for modules outside such a
+    group, including shared experts and already fused expert containers.
+    """
+
+    if not module_name:
+        return None
+
+    marker_index = module_name.find(FUSED_EXPERT_GROUP_MARKER)
+    if marker_index <= 0:
+        return None
+
+    expert_id, separator, _ = module_name[marker_index + len(FUSED_EXPERT_GROUP_MARKER):].partition(".")
+    if not expert_id or not separator:
+        return None
+
+    return module_name[:marker_index + len(FUSED_EXPERT_GROUP_MARKER) - 1]
+
+
+def fused_expert_group_members(module_names) -> Dict[str, List[str]]:
+    """Group `module_names` by the fused routed-expert group they belong to."""
+
+    groups: Dict[str, List[str]] = {}
+    for module_name in module_names:
+        group = fused_expert_group_name(module_name)
+        if group is not None:
+            groups.setdefault(group, []).append(module_name)
+    return groups
+
+
+def fused_unit_members(module_names) -> Dict[str, List[str]]:
+    """Map every engine-fused module to the GPT-QModel modules it merges.
+
+    Inference engines (vLLM, SGLang) merge the routed experts of one decoder
+    layer into one module (`<prefix>.experts`) and the dense `gate_proj`/`up_proj`
+    and `q_proj`/`k_proj`/`v_proj` shards into `gate_up_proj`/`qkv_proj`. They
+    resolve one `dynamic` override per merged module from the *fused* name, so
+    the modules that are merged must resolve the same engine-visible config.
+    Modules without a fused partner are not reported.
+    """
+
+    names = set(module_names)
+    units: Dict[str, List[str]] = {}
+    for group, members in fused_expert_group_members(module_names).items():
+        units[group] = list(members)
+
+    for module_name in module_names:
+        if fused_expert_group_name(module_name) is not None:
+            # Routed experts are covered by their fused group above.
+            continue
+        prefix, separator, suffix = module_name.rpartition(".")
+        if not separator:
+            continue
+        for fused_suffix, shard_suffixes in FUSED_PROJECTION_UNITS.items():
+            if suffix not in shard_suffixes:
+                continue
+            members = [
+                f"{prefix}.{shard_suffix}"
+                for shard_suffix in shard_suffixes
+                if f"{prefix}.{shard_suffix}" in names
+            ]
+            if len(members) > 1:
+                units.setdefault(f"{prefix}.{fused_suffix}", members)
+    return units
+
+
+def fused_unit_engine_config(override, qcfg) -> tuple:
+    """Return the config an inference engine resolves for one fused module.
+
+    Engines read `bits`, `group_size`, `desc_act` and `sym` from the `dynamic`
+    override and honor `-:` exclusions; the remaining fields only affect
+    GPT-QModel's quantization step and are baked into the saved weights.
+    """
+
+    if override is False:
+        return ("excluded",)
+    if not isinstance(override, dict):
+        override = {}
+    return tuple(
+        (field, override.get(field, getattr(qcfg, field, None)))
+        for field in FUSED_UNIT_ENGINE_FIELDS
+    )
+
+
+@dataclass(frozen=True)
+class FusedUnitDynamicConflict:
+    """One fused module whose `dynamic` config the inference engines cannot honor."""
+
+    unit: str
+    engine_config: tuple
+    member_configs: Tuple[Tuple[str, tuple], ...]
+
+    def suggested_pattern(self) -> str:
+        """Return a `dynamic` pattern that covers the fused module and its shards.
+
+        The engines match the fused module name while GPT-QModel matches the
+        unfused shards, so a rule must cover both. Routed experts live below
+        their container, so one prefix pattern is enough; dense shards are
+        siblings of the fused module and need an alternation.
+        """
+
+        nested = all(member.startswith(f"{self.unit}.") for member, _ in self.member_configs)
+        if nested:
+            return rf"{pcre.escape(self.unit)}(\.|$)"
+
+        prefix, separator, fused_suffix = self.unit.rpartition(".")
+        shards = [member.rsplit(".", 1)[-1] for member, _ in self.member_configs]
+        alternation = "|".join(pcre.escape(name) for name in [*shards, fused_suffix])
+        if not separator:
+            return f"({alternation})$"
+        return rf"{pcre.escape(prefix)}\.({alternation})$"
+
+
+def fused_unit_dynamic_conflicts(module_names, qcfg) -> List[FusedUnitDynamicConflict]:
+    """Report fused modules whose `dynamic` config the engines cannot honor.
+
+    Inference engines resolve one `dynamic` override per fused module from the
+    fused module name only, so a rule that matches just part of a fused module
+    makes the engine disagree with the checkpoint GPT-QModel saves: the engine
+    loads float shards into a quantized module (or quantized shards into a
+    float module) and the model fails to load (issue #1455).
+    """
+
+    if qcfg is None or not getattr(qcfg, "dynamic", None):
+        return []
+
+    conflicts = []
+    for unit, members in sorted(fused_unit_members(module_names).items()):
+        engine_config = fused_unit_engine_config(qcfg.dynamic_get(unit, default=None), qcfg)
+        member_configs = tuple(
+            (member, fused_unit_engine_config(qcfg.dynamic_get(member, default=None), qcfg))
+            for member in members
+        )
+        if all(config == engine_config for _, config in member_configs):
+            continue
+        conflicts.append(
+            FusedUnitDynamicConflict(
+                unit=unit,
+                engine_config=engine_config,
+                member_configs=member_configs,
+            )
+        )
+    return conflicts
+
+
+def _blamed_dynamic_patterns(dynamic, conflicts) -> List[str]:
+    """Return the `dynamic` rules responsible for the fused-module conflicts."""
+
+    blamed = set()
+    for conflict in conflicts:
+        member_names = [member for member, _ in conflict.member_configs]
+        unit_pattern = dynamic_matching_pattern(dynamic, conflict.unit)
+        for member, config in conflict.member_configs:
+            if config == conflict.engine_config:
+                continue
+            pattern = dynamic_matching_pattern(dynamic, member)
+            if pattern is not None:
+                blamed.add(pattern)
+        if unit_pattern is not None:
+            # A rule on the fused name only matters when it does not cover every
+            # shard of the fused module.
+            raw = unit_pattern[2:] if unit_pattern.startswith(("-:", "+:")) else unit_pattern
+            compiled = pcre.compile(raw)
+            if not all(compiled.match(member) for member in member_names):
+                blamed.add(unit_pattern)
+
+    order = {pattern: index for index, pattern in enumerate(dynamic.keys())}
+    return sorted(blamed, key=lambda pattern: order.get(pattern, len(order)))
+
+
+def warn_fused_unit_dynamic_conflicts(
+    module_names,
+    qcfg,
+    *,
+    max_rules: int = 3,
+) -> List[FusedUnitDynamicConflict]:
+    """Warn when `dynamic` gives fused modules a config the engines cannot honor.
+
+    Returns the detected conflicts so callers and tests can inspect them.
+    """
+
+    conflicts = fused_unit_dynamic_conflicts(module_names, qcfg)
+    if not conflicts:
+        return conflicts
+
+    dynamic = qcfg.dynamic
+    blamed = _blamed_dynamic_patterns(dynamic, conflicts)
+    if blamed:
+        rules = ", ".join(f"`{pattern}`" for pattern in blamed[:max_rules])
+        if len(blamed) > max_rules:
+            rules += f" (+{len(blamed) - max_rules} more)"
+    else:
+        rules = "a per-module `dynamic` rule"
+
+    example = conflicts[0]
+
+    log.warn(
+        f"Dynamic: {rules} may prevent the saved checkpoint from loading in vLLM/SGLang: "
+        f"fused modules such as `{example.unit}` resolve a different config than their shards, and those "
+        "engines read `dynamic` from the fused name only. Match the fused name too, e.g. "
+        f"`+:{example.suggested_pattern()}` or `-:` to skip it."
+    )
+    return conflicts
+
+
+def fused_unit_check_module_names(model, layers_node) -> List[str]:
+    """Return the module names to check for fused-module `dynamic` conflicts.
+
+    Only the decoder layers are quantized, so modules outside them (vision
+    towers, projectors, ...) cannot make the saved checkpoint disagree with the
+    fused inference engines. Module names are read without materializing or
+    type-filtering them, so the check also works on loaded quantized models.
+    """
+
+    names = [name for name, _ in model.named_modules() if name]
+    _, layer_names = get_layers_with_prefixes(model, layers_node)
+    prefixes = tuple(f"{layer_name}." for layer_name in layer_names if layer_name)
+    if not prefixes:
+        return names
+    return [name for name in names if name.startswith(prefixes)]
+
+
 def check_to_quantized(config):
     if isinstance(config, dict):
         if config["bits"] > 8 or "fp" in config["data_type"] or "float" in config["data_type"]:
@@ -1700,33 +2159,19 @@ def _generate_offload_search_paths(offload_root, module_path):
     return paths
 
 
-def _generate_entry_keys(module_path, leaf):
-    """
-        Generate fallback entry keys for lookup inside `index`.
-
-        Given:
-            module_path = "code2wav.upsample.0.1"
-            leaf = "gamma"
-
-        This function produces a list of possible lookup keys, ordered from
-        least specific to most specific, so that the caller can try them in order.
-
-        Example output:
-            [
-                "gamma",
-                "1.gamma",
-                "0.1.gamma",
-                "upsample.0.1.gamma",
-                "code2wav.upsample.0.1.gamma",
-            ]
-    """
-    keys = [leaf]
-    if module_path:
-        parts = module_path.split(".")
-        for i in range(len(parts)-1, -1, -1):
-            suffix = ".".join(parts[i:])
-            keys.append(f"{suffix}.{leaf}")
-    return keys
+def _generate_entry_keys(
+    module_path: str, leaf: str, index_dir: str, offload_root: str
+) -> tuple[str, ...]:
+    """Use the selected index's scope, then allow a fully qualified key."""
+    full_name = f"{module_path}.{leaf}" if module_path else leaf
+    index_scope = os.path.relpath(index_dir, offload_root)
+    if index_scope == ".":
+        return (full_name,)
+    index_scope = index_scope.replace(os.sep, ".")
+    if module_path != index_scope and not module_path.startswith(f"{index_scope}."):
+        raise ValueError(f"Offload index scope '{index_scope}' does not contain '{full_name}'")
+    relative_name = full_name[len(index_scope) + 1:]
+    return (relative_name, full_name) if relative_name != full_name else (relative_name,)
 
 
 def _resolve_offload_entry(
@@ -1762,14 +2207,22 @@ def _resolve_offload_entry(
     if not index:
         return None
 
-    keys = _generate_entry_keys(module_path, leaf)
-    entry = None
+    keys = _generate_entry_keys(module_path, leaf, module_dir, offload_root)
+    matches = []
     for key in keys:
         entry = index.get(key)
         if entry is not None:
-            break
-    if entry is None:
+            matches.append((key, entry))
+    if not matches:
         return None
+    if len(matches) > 1 and matches[0][1] != matches[1][1]:
+        name = f"{module_path}.{leaf}" if module_path else leaf
+        raise ValueError(
+            f"Ambiguous offload index entries for tensor '{name}' in "
+            f"'{os.path.join(module_dir, 'index.json')}': "
+            f"'{matches[0][0]}' and '{matches[1][0]}' differ."
+        )
+    entry = matches[0][1]
 
     resolved_dtype = _dtype_string_to_torch(entry.get("dtype"), dtype)
     if "shape" in entry:
@@ -1961,7 +2414,10 @@ def get_state_dict_for_save(
                 key = ("meta", id(tensor))
             else:
                 try:
-                    key = ("storage", id_tensor_storage(tensor))
+                    # Distinct checkpoint weights may be views into one fused
+                    # allocation. Only identical views are duplicate keys.
+                    key = ("storage", id_tensor_storage(tensor), tensor.dtype, tensor.storage_offset(),
+                           tuple(tensor.shape), tuple(tensor.stride()))
                 except Exception:
                     key = ("tensor", id(tensor))
         else:
@@ -2052,7 +2508,7 @@ def _checkpoint_tensor_keys(
 
 
 def validate_checkpoint_qweights(
-    model: nn.Module, checkpoint: str | os.PathLike, format: FORMAT,
+    model: nn.Module, checkpoint: str | os.PathLike, format: FORMAT, key_converter=None,
 ) -> None:
     if format not in (FORMAT.GPTQ, FORMAT.GPTQ_V2):
         return
@@ -2065,7 +2521,10 @@ def validate_checkpoint_qweights(
     module_keys = collections.defaultdict(set)
     for name, module in model.named_modules(remove_duplicate=False):
         if isinstance(module, GPTQQuantLinear):
-            module_keys[id(module)].add(f"{name}.qweight" if name else "qweight")
+            tensor_name = f"{name}.qweight" if name else "qweight"
+            module_keys[id(module)].add(tensor_name)
+            if callable(key_converter):
+                module_keys[id(module)].add(key_converter(tensor_name))
     missing = sorted(
         min(keys) for keys in module_keys.values() if not keys & checkpoint_keys
     )
@@ -2099,12 +2558,235 @@ def _tie_weights_after_checkpoint_load(model, checkpoint: str | os.PathLike | No
 
 
 # Call tied_weights() after load_checkpoint_in_model() to have the weights tied correctly.
+def _remap_safetensors_checkpoint_keys(checkpoint: str | os.PathLike, key_converter) -> Optional[str]:
+    checkpoint = os.fspath(checkpoint)
+    if not os.path.isfile(checkpoint) or not checkpoint.endswith(".safetensors"):
+        return None
+
+    with open(checkpoint, "rb") as source:
+        header_size_bytes = source.read(8)
+        if len(header_size_bytes) != 8:
+            return None
+        header_size = struct.unpack("<Q", header_size_bytes)[0]
+        header = json.loads(source.read(header_size))
+        data_offset = 8 + header_size
+
+    converted_header = {}
+    changed = False
+    for name, tensor_info in header.items():
+        if name == "__metadata__":
+            converted_header[name] = tensor_info
+            continue
+        converted_name = key_converter(name)
+        if converted_name in converted_header:
+            raise ValueError(f"Checkpoint key conversion produced duplicate tensor name: {converted_name}")
+        converted_header[converted_name] = tensor_info
+        changed |= converted_name != name
+
+    if not changed:
+        return None
+
+    encoded_header = json.dumps(converted_header, separators=(",", ":")).encode("utf-8")
+    encoded_header += b" " * ((-len(encoded_header)) % 8)
+    descriptor, converted_path = tempfile.mkstemp(prefix="gptqmodel-key-remap-", suffix=".safetensors")
+    try:
+        with os.fdopen(descriptor, "wb") as target, open(checkpoint, "rb") as source:
+            target.write(struct.pack("<Q", len(encoded_header)))
+            target.write(encoded_header)
+            source.seek(data_offset)
+            shutil.copyfileobj(source, target, length=32 * 1024 * 1024)
+    except BaseException:
+        try:
+            os.unlink(converted_path)
+        except OSError:
+            # Best-effort cleanup: do not mask the original exception if temp file removal fails.
+            pass
+        raise
+    return converted_path
+
+
+def _checkpoint_tensor_shapes(checkpoint) -> Dict[str, Tuple[int, ...]]:
+    """Read tensor shapes from a safetensors file, directory, or index.
+
+    NF12-AD stores a data-dependent escape table. The module cannot know its
+    row count from `in_features`/`out_features` alone, so the loader must size
+    that buffer before accelerate assigns checkpoint tensors.
+    """
+
+    if checkpoint is None:
+        return {}
+    path = os.fspath(checkpoint)
+    if isinstance(path, bytes):
+        path = path.decode()
+    files: List[str] = []
+    if os.path.isdir(path):
+        files = [
+            os.path.join(path, name)
+            for name in os.listdir(path)
+            if name.endswith(".safetensors")
+        ]
+    elif path.endswith(".index.json"):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                weight_map = json.load(handle).get("weight_map", {})
+        except (OSError, ValueError):
+            return {}
+        base = os.path.dirname(path)
+        files = sorted({os.path.join(base, name) for name in weight_map.values()})
+    elif path.endswith(".safetensors"):
+        files = [path]
+
+    shapes: Dict[str, Tuple[int, ...]] = {}
+    for file in files:
+        try:
+            with safe_open(file, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    shapes[key] = tuple(handle.get_slice(key).get_shape())
+        except Exception:
+            # A malformed or non-safetensors shard is accelerate's problem to
+            # report; shape discovery is best effort.
+            continue
+    return shapes
+
+
+def _prepare_variable_quant_buffers(model, checkpoint) -> None:
+    """Resize data-dependent quant buffers to the checkpoint's stored shapes."""
+
+    shapes = _checkpoint_tensor_shapes(checkpoint)
+    if not shapes:
+        return
+    # Only the escape table is data-dependent. `nf12_packed`,
+    # `nf12_exp_base`, and `bias` shapes follow from the module geometry.
+    suffixes = (".nf12_escapes", ".nf12_exp_base")
+    for key, shape in shapes.items():
+        suffix = next((item for item in suffixes if key.endswith(item)), None)
+        if suffix is None:
+            continue
+        module_name = key[: -len(suffix)]
+        try:
+            module = model.get_submodule(module_name)
+        except AttributeError:
+            continue
+        if getattr(module, "QUANT_TYPE", None) != "nf12_ad":
+            continue
+        buffer_name = suffix[1:]
+        current = getattr(module, buffer_name, None)
+        if not isinstance(current, torch.Tensor) or tuple(current.shape) == shape:
+            continue
+        dtype = current.dtype
+        module.register_buffer(buffer_name, torch.empty(shape, dtype=dtype, device=current.device))
+
+
+def _restore_checkpoint_buffers(
+    model, checkpoint, dtypes: dict[str, torch.dtype],
+    *, exact_source_names: set[str] | frozenset[str] = frozenset(),
+) -> None:
+    """Restore checkpoint buffers one tensor at a time after Accelerate casts."""
+    names = set(dtypes)
+    checkpoint = os.fspath(checkpoint)
+    if os.path.isdir(checkpoint):
+        # Match Accelerate's directory resolution so the second read comes
+        # from the same checkpoint that populated the rest of the model.
+        for filename in ("pytorch_model.bin", "model.safetensors"):
+            candidate = os.path.join(checkpoint, filename)
+            if os.path.isfile(candidate):
+                checkpoint = candidate
+                break
+        else:
+            indexes = [name for name in os.listdir(checkpoint) if name.endswith(".index.json")]
+            if len(indexes) != 1:
+                raise ValueError(f"Cannot resolve checkpoint for buffer restoration: {checkpoint}")
+            checkpoint = os.path.join(checkpoint, indexes[0])
+
+    if checkpoint.endswith(".index.json"):
+        with open(checkpoint, encoding="utf-8") as handle:
+            weight_map = json.load(handle)["weight_map"]
+        files: dict[str, set[str]] = {}
+        for name in names:
+            shard = weight_map.get(name)
+            if shard is not None:
+                files.setdefault(os.path.join(os.path.dirname(checkpoint), shard), set()).add(name)
+    else:
+        files = {checkpoint: names}
+
+    restored: set[str] = set()
+
+    def restore_one(name: str, value: torch.Tensor) -> None:
+        module_name, _, buffer_name = name.rpartition(".")
+        module = model.get_submodule(module_name) if module_name else model
+        current = module._buffers.get(buffer_name)
+        if not isinstance(current, torch.Tensor) or tuple(current.shape) != tuple(value.shape):
+            raise RuntimeError(f"Cannot restore checkpoint buffer {name!r}: missing or mismatched model slot")
+        if current.device.type == "meta":
+            raise RuntimeError(f"Cannot restore checkpoint buffer {name!r} on a meta device")
+        if name in exact_source_names and value.dtype != dtypes[name]:
+            raise RuntimeError(
+                f"Checkpoint buffer {name!r} must have packed dtype {dtypes[name]}, got {value.dtype}"
+            )
+        module._buffers[buffer_name] = value.to(device=current.device, dtype=dtypes[name])
+        restored.add(name)
+
+    for path, selected in files.items():
+        if path.endswith(".safetensors"):
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                for name in sorted(selected & set(handle.keys())):
+                    restore_one(name, handle.get_tensor(name))
+        else:
+            try:
+                state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+            except RuntimeError as error:
+                if "mmap" not in str(error):
+                    raise
+                state = torch.load(path, map_location="cpu", weights_only=True)
+            for name in sorted(selected & set(state)):
+                restore_one(name, state[name])
+
+    missing = names - restored
+    if missing:
+        raise RuntimeError(
+            "Cannot restore checkpoint buffers missing from checkpoint: "
+            + ", ".join(sorted(missing))
+        )
+
+
+def _restore_fp32_checkpoint_buffers(model, checkpoint, names: set[str]) -> None:
+    """Restore FP32 buffers narrowed by Accelerate's BF16 load path."""
+    _restore_checkpoint_buffers(model, checkpoint, dict.fromkeys(names, torch.float32))
+
+
 def load_checkpoint_in_model_then_tie_weights(model, *args, **kwargs):
     checkpoint = kwargs.get("checkpoint")
     if checkpoint is None and args:
         checkpoint = args[0]
-    accelerate.load_checkpoint_in_model(model, *args, **kwargs)
-    _tie_weights_after_checkpoint_load(model, checkpoint)
+    key_converter = kwargs.pop("key_converter", None)
+    fp32_bf16_buffer_names = set(kwargs.pop("fp32_bf16_buffer_names", ()))
+    packed_fp8_buffer_dtypes = dict(kwargs.pop("packed_fp8_buffer_dtypes", {}))
+    converted_checkpoint = None
+    if callable(key_converter) and checkpoint is not None:
+        converted_checkpoint = _remap_safetensors_checkpoint_keys(checkpoint, key_converter)
+        if converted_checkpoint is not None:
+            kwargs["checkpoint"] = converted_checkpoint
+    try:
+        _prepare_variable_quant_buffers(
+            model,
+            kwargs.get("checkpoint", checkpoint),
+        )
+        accelerate.load_checkpoint_in_model(model, *args, **kwargs)
+        restore_dtypes = dict(packed_fp8_buffer_dtypes)
+        if str(kwargs.get("dtype")) in {"torch.bfloat16", "bfloat16"}:
+            restore_dtypes.update(dict.fromkeys(fp32_bf16_buffer_names, torch.float32))
+        if restore_dtypes:
+            _restore_checkpoint_buffers(
+                model, kwargs.get("checkpoint", checkpoint), restore_dtypes,
+                exact_source_names=set(packed_fp8_buffer_dtypes),
+            )
+        _tie_weights_after_checkpoint_load(model, kwargs.get("checkpoint", checkpoint))
+    finally:
+        if converted_checkpoint is not None:
+            try:
+                os.unlink(converted_checkpoint)
+            except OSError:
+                pass
 
 
 # 32MB read/write i/o buffer
@@ -2272,10 +2954,59 @@ def _existing_shard_matches(
         return False
 
 
+@contextmanager
+def _atomic_shard_path(path: str):
+    """Stage a shard beside its destination and publish it only on success."""
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        existing_mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        existing_mode = None
+
+    # os.open applies the process umask to a new file without changing it.
+    # O_EXCL and a random name keep the temporary private to this export.
+    for _ in range(10):
+        temporary = os.path.join(
+            directory, f".{os.path.basename(path)}.{secrets.token_hex(16)}.tmp"
+        )
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o666 if existing_mode is None else 0o600,
+            )
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise FileExistsError(f"Could not create a temporary shard beside {path}")
+
+    try:
+        if existing_mode is not None:
+            os.chmod(temporary, existing_mode)
+        os.close(descriptor)
+        descriptor = None
+        yield temporary
+        os.replace(temporary, path)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@contextmanager
+def _atomic_shard_file(path: str):
+    """Keep the current shard and any mapped source tensors alive until commit."""
+    with _atomic_shard_path(path) as temporary:
+        with open(temporary, "wb") as handle:
+            yield handle
+
+
 def _write_shard_file(path: str, entries: List[TensorSource], metadata: Dict[str, str]) -> int:
     _, header_bytes, _ = _safetensors_header(entries, metadata)
 
-    with open(path, "wb") as out:
+    with _atomic_shard_file(path) as out:
         out.write(struct.pack("<Q", len(header_bytes)))
         out.write(header_bytes)
 
@@ -2350,6 +3081,31 @@ def _plan_shards(entries: List[TensorSource], max_shard_size: Optional[int]) -> 
     return shards
 
 
+def _validate_offload_sources_outside_save_dir(
+    state_dict: Dict[str, TensorSource], save_dir: str
+) -> None:
+    """Keep source artifacts out of the export directory we may rewrite or clean."""
+    save_roots = (os.path.abspath(save_dir), os.path.realpath(save_dir))
+    for entry in state_dict.values():
+        source = entry.source
+        if not isinstance(source, OffloadTensorRef):
+            continue
+        source_paths = (os.path.abspath(source.path), os.path.realpath(source.path))
+        for save_root, source_path in zip(save_roots, source_paths):
+            try:
+                if os.path.commonpath((save_root, source_path)) == save_root:
+                    break
+            except ValueError:  # Paths on different Windows drives cannot overlap.
+                continue
+        else:
+            continue
+        raise ValueError(
+            f"Offloaded tensor '{entry.name}' references '{source.path}' inside "
+            f"the export directory '{save_dir}'; choose a different save_dir "
+            "so shard writes and cleanup cannot destroy the source."
+        )
+
+
 def streaming_state_dict_to_shards(
     state_dict: Dict[str, TensorSource],
     save_dir: str,
@@ -2358,6 +3114,7 @@ def streaming_state_dict_to_shards(
     metadata: Dict[str, str],
     max_shard_size: Optional[int],
 ) -> Tuple[List[str], Dict[str, str], int]:
+    _validate_offload_sources_outside_save_dir(state_dict, save_dir)
     entries = list(state_dict.values())
     shards = _plan_shards(entries, max_shard_size)
     num_shards = len(shards)

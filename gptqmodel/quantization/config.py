@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
-# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2026 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2026 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
@@ -14,7 +14,7 @@ import weakref
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from enum import Enum
 from functools import total_ordering
 from os.path import join
@@ -26,6 +26,9 @@ from packaging import version
 
 from ..adapter.adapter import Lora, normalize_adapter
 from ..utils.logger import setup_logger
+from ..utils.p2p import P2PConfig
+from ..utils.vptq import vptq_index_bits
+from .gsq_training_config import GSQTrainingConfig
 
 
 log = setup_logger()
@@ -124,6 +127,10 @@ class FORMAT(str, Enum):
     BITBLAS = "bitblas"
     QQQ = "qqq"
     EXL3 = "exl3"
+    VPTQ = "vptq"
+    # Public name is `nf12`; the internal extension/loader symbols keep the
+    # `nf12_ad` suffix so they cannot collide with the upstream `nf12` package.
+    NF12_AD = "nf12"
 
     GEMM = "gemm"
     GEMV = "gemv"
@@ -144,6 +151,40 @@ class METHOD(str, Enum):
     AWQ = "awq"
     EXL3 = "exl3"
     PARO = "paroquant"
+    VPTQ = "vptq"
+    # Public name is `nf12`; see the FORMAT note above.
+    NF12_AD = "nf12"
+
+
+# Integer bit widths each method's packer and kernels can actually realize.
+# Fractional widths are never valid: every layout stores an integer number of
+# bits per weight, so accepting a fractional request would silently floor it
+# while the saved config still advertises the original value.
+METHOD_SUPPORTED_BITS: Dict[METHOD, Tuple[int, ...]] = {
+    # GPTQ/RTN pack 2-8 bit weights (5/6/7 use the planar layout).
+    METHOD.GPTQ: (2, 3, 4, 5, 6, 7, 8),
+    # AWQ native GEMM/GEMV kernels require 4 bits.
+    # RCO also allocates 2- and 3-bit modules, which only the portable torch
+    # kernel (`AwqTorchLinear`, 2-8 bits) can pack and run. Request GEMM plus
+    # AWQ_TORCH; the AWQ processor also selects it for non-4-bit GEMM modules.
+    METHOD.AWQ: (2, 3, 4, 8),
+    # QQQ and ParoQuant kernels are 4-bit only.
+    METHOD.QQQ: (4,),
+    METHOD.PARO: (4,),
+    # FP8 is a fixed 8-bit storage format.
+    METHOD.FP8: (8,),
+    METHOD.BITSANDBYTES: (4, 8),
+    # EXL3 stores one integer trellis depth per module.
+    METHOD.EXL3: (1, 2, 3, 4, 5, 6, 7, 8),
+    # GGUF subtypes cover q1/q2/q3/q4/q5/q6/q8 in the C++ and torch kernels.
+    METHOD.GGUF: (1, 2, 3, 4, 5, 6, 8),
+    # VPTQ's nominal bpw label is derived from codebook sizes and clamped to
+    # 1-8; the vector codebooks can realize any integer width in that range.
+    METHOD.VPTQ: (1, 2, 3, 4, 5, 6, 7, 8),
+    # NF12-AD is a lossless 12-bit encoding of BF16. The width is fixed by the
+    # format, so 12 is the only valid request.
+    METHOD.NF12_AD: (12,),
+}
 
 
 class VramStrategy(str, Enum):
@@ -163,6 +204,75 @@ class QuantizeEmbed(str, Enum):
 class QuantizeEmbedConfig:
     embed_quant_mode: QuantizeEmbed = QuantizeEmbed.OUTPUT
     embed_only: bool = True
+
+
+class NormType(str, Enum):
+    """Normalization families eligible for post-quantization tuning.
+
+    ``RMSNORM`` covers mean-free normalization with a gain (Llama/Qwen style),
+    including Gemma-style ``1 + weight`` gains. ``LAYERNORM`` covers
+    mean-centered normalization with an optional bias.
+    """
+
+    RMSNORM = "rmsnorm"
+    LAYERNORM = "layernorm"
+
+
+def normalize_norm_types(types: Any) -> Tuple[NormType, ...]:
+    """Coerce a ``NormType``/string iterable into a validated, deduplicated tuple."""
+    if types is None:
+        return (NormType.RMSNORM,)
+    if isinstance(types, (NormType, str)):
+        types = (types,)
+    normalized = []
+    for entry in types:
+        try:
+            norm_type = entry if isinstance(entry, NormType) else NormType(entry)
+        except ValueError as exc:
+            supported = ", ".join(f"`{member.value}`" for member in NormType)
+            raise ValueError(f"Unsupported norm type `{entry}`. Supported types: {supported}.") from exc
+        if norm_type not in normalized:
+            normalized.append(norm_type)
+    if not normalized:
+        raise ValueError("`types` must name at least one norm type.")
+    return tuple(normalized)
+
+
+@dataclass
+class NormConfig:
+    """Post-quantization normalization tuning target for ``requantize()``.
+
+    Only the parameters of modules tagged ``:norm`` in the
+    model definition, plus ``pre_lm_head_norm_module``, are trained by
+    distilling the next-token distribution of an unquantized ``teacher``.
+    Packed quantized tensors are never modified. ``types`` selects the
+    normalization families to tune and defaults to RMSNorm.
+    """
+
+    # Unquantized reference model: a local path / HF id, or an already loaded module.
+    teacher: Any = None
+    # Normalization families to tune: `NormType` members or their string values.
+    types: Tuple[NormType, ...] = (NormType.RMSNORM,)
+    steps: int = 400
+    lr: float = 1e-3
+    # Strength of the L2 pull of each parameter toward its quantized-checkpoint
+    # value, measured relative to that parameter's mean absolute effective value.
+    reg: float = 1e-3
+    seed: int = 0
+    # Tagged module names ending with any of these suffixes are left untouched.
+    skip: Tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if self.teacher is None:
+            raise ValueError("NormConfig requires an unquantized `teacher` model or path.")
+        self.types = normalize_norm_types(self.types)
+        if self.steps <= 0:
+            raise ValueError("NormConfig.steps must be positive.")
+        if not math.isfinite(self.lr) or self.lr <= 0:
+            raise ValueError("NormConfig.lr must be finite and positive.")
+        if not math.isfinite(self.reg) or self.reg < 0:
+            raise ValueError("NormConfig.reg must be finite and non-negative.")
+        self.skip = tuple(self.skip)
 
 
 class FallbackStrategy(str, Enum):
@@ -207,7 +317,18 @@ _GGUF_BITS_ALIAS_INFO = {
     "q1_0_g128": {"bits": 1, "version": "q", "variant": "0", "quality": "g128"},
     "q2_0": {"bits": 2, "version": "q", "variant": "0", "quality": None},
     "q4_0": {"bits": 4, "version": "q", "variant": "0", "quality": None},
+    "q4_1": {"bits": 4, "version": "q", "variant": "1", "quality": None},
+    "q5_0": {"bits": 5, "version": "q", "variant": "0", "quality": None},
+    "q5_1": {"bits": 5, "version": "q", "variant": "1", "quality": None},
     "q8_0": {"bits": 8, "version": "q", "variant": "0", "quality": None},
+    "q8_1": {"bits": 8, "version": "q", "variant": "1", "quality": None},
+    "q2_k": {"bits": 2, "version": "q", "variant": "k", "quality": None},
+    "q2_k_s": {"bits": 2, "version": "q", "variant": "k", "quality": "s"},
+    "q2_k_m": {"bits": 2, "version": "q", "variant": "k", "quality": "m"},
+    "q3_k": {"bits": 3, "version": "q", "variant": "k", "quality": None},
+    "q3_k_s": {"bits": 3, "version": "q", "variant": "k", "quality": "s"},
+    "q3_k_m": {"bits": 3, "version": "q", "variant": "k", "quality": "m"},
+    "q3_k_l": {"bits": 3, "version": "q", "variant": "k", "quality": "l"},
     "q4_k": {"bits": 4, "version": "q", "variant": "k", "quality": None},
     "q4_k_s": {"bits": 4, "version": "q", "variant": "k", "quality": "s"},
     "q4_k_m": {"bits": 4, "version": "q", "variant": "k", "quality": "m"},
@@ -215,10 +336,26 @@ _GGUF_BITS_ALIAS_INFO = {
     "q5_k_s": {"bits": 5, "version": "q", "variant": "k", "quality": "s"},
     "q5_k_m": {"bits": 5, "version": "q", "variant": "k", "quality": "m"},
     "q6_k": {"bits": 6, "version": "q", "variant": "k", "quality": None},
+    "q8_k": {"bits": 8, "version": "q", "variant": "k", "quality": None},
+    "iq1_s": {"bits": 1, "version": "iq", "variant": "s", "quality": None},
+    "iq1_m": {"bits": 1, "version": "iq", "variant": "m", "quality": None},
+    "iq2_xxs": {"bits": 2, "version": "iq", "variant": "xxs", "quality": None},
+    "iq2_xs": {"bits": 2, "version": "iq", "variant": "xs", "quality": None},
+    "iq2_s": {"bits": 2, "version": "iq", "variant": "s", "quality": None},
+    "iq3_xxs": {"bits": 3, "version": "iq", "variant": "xxs", "quality": None},
+    "iq3_s": {"bits": 3, "version": "iq", "variant": "s", "quality": None},
+    "iq4_nl": {"bits": 4, "version": "iq", "variant": "nl", "quality": None},
+    "iq4_xs": {"bits": 4, "version": "iq", "variant": "xs", "quality": None},
+    "tq1_0": {"bits": 1, "version": "tq", "variant": "0", "quality": None},
+    "tq2_0": {"bits": 2, "version": "tq", "variant": "0", "quality": None},
+    # Microscaling formats embed their width in the name (variant == "").
+    "mxfp4": {"bits": 4, "version": "mxfp", "variant": "", "quality": None},
+    "nvfp4": {"bits": 4, "version": "nvfp", "variant": "", "quality": None},
 }
 _GGUF_DEFAULT_BITS_ALIAS_BY_WIDTH = {
     1: "q1_0",
     2: "q2_0",
+    3: "q3_k",
     4: "q4_0",
     5: "q5_k_m",
     6: "q6_k",
@@ -229,7 +366,18 @@ _GGUF_APPROX_BITS_PER_WEIGHT_BY_ALIAS = {
     "q1_0_g128": 1.125,
     "q2_0": 2.25,
     "q4_0": 4.5,
+    "q4_1": 5.0,
+    "q5_0": 5.5,
+    "q5_1": 6.0,
     "q8_0": 8.5,
+    "q8_1": 9.0,
+    "q2_k": 2.625,
+    "q2_k_s": 2.625,
+    "q2_k_m": 2.625,
+    "q3_k": 3.4375,
+    "q3_k_s": 3.4375,
+    "q3_k_m": 3.4375,
+    "q3_k_l": 3.4375,
     "q4_k": 4.5,
     "q4_k_s": 4.5,
     "q4_k_m": 4.5,
@@ -237,6 +385,20 @@ _GGUF_APPROX_BITS_PER_WEIGHT_BY_ALIAS = {
     "q5_k_s": 5.0,
     "q5_k_m": 5.5,
     "q6_k": 6.0,
+    "q8_k": 9.125,
+    "iq1_s": 1.5625,
+    "iq1_m": 1.75,
+    "iq2_xxs": 2.0625,
+    "iq2_xs": 2.3125,
+    "iq2_s": 2.5625,
+    "iq3_xxs": 3.0625,
+    "iq3_s": 3.4375,
+    "iq4_nl": 4.5,
+    "iq4_xs": 4.25,
+    "tq1_0": 1.6875,
+    "tq2_0": 2.0625,
+    "mxfp4": 4.25,
+    "nvfp4": 4.5,
 }
 
 
@@ -446,12 +608,14 @@ class GGUFBits(BaseComplexBits):
     def __post_init__(self):
         """Validate the GGUF bit-spec components after construction."""
 
-        if self.bits <= 0:
+        if isinstance(self.bits, bool) or not isinstance(self.bits, int) or self.bits <= 0:
             raise ValueError("GGUFBits: `bits` must be a positive integer.")
-        if self.version not in {"q", "iq"}:
-            raise ValueError("GGUFBits: `version` must be `q` or `iq`.")
-        if self.variant not in {"0", "k"}:
-            raise ValueError("GGUFBits: `variant` must be `0` or `k`.")
+        if self.version not in {"q", "iq", "tq", "mxfp", "nvfp"}:
+            raise ValueError("GGUFBits: `version` must be one of `[q, iq, tq, mxfp, nvfp]`.")
+        if self.variant not in {"", "0", "1", "k", "xxs", "xs", "s", "m", "nl"}:
+            raise ValueError(
+                "GGUFBits: `variant` must be one of `['', 0, 1, k, xxs, xs, s, m, nl]`."
+            )
         if self.quality not in {None, "xs", "s", "m", "l", "g128"}:
             raise ValueError("GGUFBits: `quality` must be one of `[None, xs, s, m, l, g128]`.")
 
@@ -474,7 +638,9 @@ class GGUFBits(BaseComplexBits):
     def to_string(self) -> str:
         """Serialize this GGUF bit spec back to its alias form."""
 
-        alias = f"{self.version}{self.bits}_{self.variant}"
+        alias = f"{self.version}{self.bits}"
+        if self.variant:
+            alias = f"{alias}_{self.variant}"
         if self.quality is not None:
             alias = f"{alias}_{self.quality}"
         return alias
@@ -498,6 +664,9 @@ class GGUFBits(BaseComplexBits):
     def to_public_format(self) -> str:
         """Return the GGUF public subtype string without the width prefix."""
 
+        if not self.variant:
+            # Width-in-name formats (mxfp4, nvfp4) cannot strip the bit width.
+            return self.to_string()
         public_format = f"{self.version}_{self.variant}"
         if self.quality is not None:
             public_format = f"{public_format}_{self.quality}"
@@ -508,7 +677,7 @@ class GGUFBits(BaseComplexBits):
 QuantBits = GGUFBits
 
 
-_GGUF_PUBLIC_FORMAT_RE = pcre.compile(r"^(q|iq)_(0|k)(?:_(xs|s|m|l|g128))?$")
+_GGUF_PUBLIC_FORMAT_RE = pcre.compile(r"^(q|iq|tq)_(0|1|k|xxs|xs|s|m|nl)(?:_(xs|s|m|l|g128))?$")
 
 
 def _gguf_public_format_from_bits(bits: GGUFBits) -> str:
@@ -554,10 +723,21 @@ def _default_gguf_public_format(bits: int) -> str:
 def _gguf_bits_from_components(bits: int, public_format: str) -> GGUFBits:
     """Build a validated ``GGUFBits`` object from width and subtype parts."""
 
+    if public_format in _GGUF_BITS_ALIAS_INFO:
+        # Full-alias subtypes (e.g. ``mxfp4``, ``nvfp4``) do not fit the
+        # ``version_variant[_quality]`` grammar; resolve them directly.
+        bits_spec = GGUFBits.from_alias(public_format)
+        if bits_spec.bits != bits:
+            raise ValueError(
+                f"Unsupported GGUF combination: bits={bits}, format={public_format}."
+            )
+        return bits_spec
+
     match = _GGUF_PUBLIC_FORMAT_RE.fullmatch(public_format)
     if match is None:
         raise ValueError(
-            "GGUFConfig: `format` must be a GGUF subtype like `q_0`, `q_k`, `q_k_s`, or `q_k_m`."
+            "GGUFConfig: `format` must be a GGUF subtype like `q_0`, `q_k`, `q_k_s`, `q_k_m`, "
+            "`iq_xxs`, or `mxfp4`."
         )
 
     version_name, variant, quality = match.groups()
@@ -581,19 +761,51 @@ def _normalize_gguf_config_spec(
     if isinstance(bits, GGUFBits):
         bits_spec_from_bits = bits
         normalized_bits = bits.bits
+    elif isinstance(bits, bool):
+        raise ValueError(f"GGUFConfig: `bits` must be an integer bit width, not `{bits}`.")
+    elif isinstance(bits, float):
+        if not math.isfinite(bits):
+            raise ValueError("GGUFConfig: `bits` must be finite.")
+        if not bits.is_integer():
+            raise ValueError(
+                _fractional_bits_error(bits, field="bits", format_value=FORMAT.GGUF)
+            )
+        normalized_bits = int(bits)
     elif isinstance(bits, str):
         raw_bits = bits.strip().lower().replace("-", "_")
-        if raw_bits.isdigit():
-            normalized_bits = int(raw_bits)
+        try:
+            numeric_bits = float(raw_bits)
+        except ValueError:
+            numeric_bits = None
+
+        if numeric_bits is not None:
+            if not math.isfinite(numeric_bits):
+                raise ValueError("GGUFConfig: `bits` must be finite.")
+            if not numeric_bits.is_integer():
+                raise ValueError(
+                    _fractional_bits_error(
+                        numeric_bits, field="bits", format_value=FORMAT.GGUF
+                    )
+                )
+            normalized_bits = int(numeric_bits)
         else:
             bits_spec_from_bits = GGUFBits.from_alias(raw_bits)
             normalized_bits = bits_spec_from_bits.bits
     elif not isinstance(bits, int):
-        raise ValueError(f"GGUFConfig: unsupported bits specification `{bits}`.")
+        raise ValueError(
+            f"GGUFConfig: `bits` must be an integer bit width, got `{bits!r}`."
+        )
 
     normalized_bits = int(normalized_bits)
-    if normalized_bits not in [1, 2, 3, 4, 5, 6, 8]:
-        raise ValueError("GGUFConfig: `bits` must resolve to one of `[1, 2, 3, 4, 5, 6, 8]`.")
+    valid_bit_widths = METHOD_SUPPORTED_BITS[METHOD.GGUF]
+    if normalized_bits not in valid_bit_widths:
+        raise ValueError(
+            _unsupported_bits_error(
+                normalized_bits,
+                valid_bit_widths,
+                method=METHOD.GGUF,
+            )
+        )
 
     normalized_format = _normalize_gguf_public_format(format_value)
     if normalized_format is None:
@@ -613,33 +825,123 @@ def _normalize_gguf_config_spec(
     return normalized_bits, normalized_format, bits_spec
 
 
-def _normalize_quant_bits(bits: Union[int, float, str, GGUFBits], format_value: Optional[Union[str, FORMAT]] = None) -> Union[int, GGUFBits]:
-    """Normalize generic bit fields into ints or structured GGUF specs."""
+def _fractional_bits_error(
+    bits: float,
+    *,
+    field: str,
+    format_value: Optional[FORMAT] = None,
+) -> str:
+    """Build the rejection message for a fractional bit width."""
+
+    floored_width = max(1, int(math.floor(bits)))
+    if format_value == FORMAT.EXL3:
+        return (
+            f"EXL3Config: `{field}={bits:g}` is not an integer trellis width. EXL3 "
+            "packs one integer trellis depth (`K`) per module, so a fractional width "
+            f"cannot be realised and would silently quantize at {floored_width} bpw. "
+            "Pass an integer `bits` and express a fractional average with per-module "
+            "widths, e.g. `dynamic={'model.layers.0.mlp.down_proj': {'bits': 3}}`."
+        )
+    return (
+        f"QuantizeConfig: `{field}={bits:g}` is not an integer bit width. "
+        "Quantization packs an integer number of bits per weight, so a fractional "
+        f"width cannot be realised and would silently quantize at {floored_width} bits. "
+        "Pass an integer `bits` and express a fractional average with per-module "
+        "`dynamic` widths."
+    )
+
+
+def _unsupported_bits_error(
+    bits: int,
+    valid_bit_widths: Tuple[int, ...],
+    *,
+    field: str = "bits",
+    method: Optional[METHOD] = None,
+) -> str:
+    """Build the rejection message for an out-of-range bit width."""
+
+    scope = f" for method `{method.value}`" if method is not None else ""
+    return (
+        f"QuantizeConfig: `{field}={bits}` is not supported{scope}; "
+        f"supported bit widths are `{list(valid_bit_widths)}`."
+    )
+
+
+def _normalize_quant_bits(
+    bits: Union[int, float, str, GGUFBits],
+    format_value: Optional[Union[str, FORMAT]] = None,
+    *,
+    field: str = "bits",
+    valid_bit_widths: Optional[Tuple[int, ...]] = None,
+    method: Optional[METHOD] = None,
+) -> Union[int, GGUFBits]:
+    """Normalize and validate a generic quant bit field.
+
+    Bit widths are integers: every packed layout stores an integer number of
+    bits per weight, so a fractional request cannot be realised. ``method``
+    narrows the accepted widths to what that method's packer and kernels
+    support; without it the generic 1-8 range is used.
+    """
 
     if isinstance(format_value, str):
         format_value = _normalize_format(format_value)
 
+    if valid_bit_widths is None:
+        # 12 is NF12-AD's lossless width. `quant_bits_width` reaches this helper
+        # with no format or method hint, so the generic table has to admit it;
+        # format- and method-specific callers pass their own table instead.
+        valid_bit_widths = (*range(1, 9), 12)
+    valid_bit_widths = tuple(int(width) for width in valid_bit_widths)
+
+    if isinstance(bits, bool):
+        raise ValueError(
+            f"QuantizeConfig: `{field}` must be an integer bit width, not `{bits}`."
+        )
+
     if isinstance(bits, GGUFBits):
         normalized = bits
     elif isinstance(bits, float):
-        if format_value == FORMAT.EXL3:
-            normalized = bits
-        elif bits.is_integer():
-            normalized = int(bits)
-        else:
-            raise ValueError(f"QuantizeConfig: unsupported bits specification `{bits}`.")
+        if not math.isfinite(bits):
+            raise ValueError(f"QuantizeConfig: `{field}` must be finite.")
+        if not bits.is_integer():
+            raise ValueError(
+                _fractional_bits_error(bits, field=field, format_value=format_value)
+            )
+        normalized = int(bits)
     elif isinstance(bits, int):
         normalized = bits
     elif isinstance(bits, str):
         raw = bits.strip().lower().replace("-", "_")
-        normalized = int(raw) if raw.isdigit() else GGUFBits.from_alias(raw)
+        try:
+            numeric = float(raw)
+        except ValueError:
+            numeric = None
+
+        if numeric is not None:
+            if not math.isfinite(numeric):
+                raise ValueError(f"QuantizeConfig: `{field}` must be finite.")
+            if not numeric.is_integer():
+                raise ValueError(
+                    _fractional_bits_error(numeric, field=field, format_value=format_value)
+                )
+            normalized = int(numeric)
+        else:
+            normalized = GGUFBits.from_alias(raw)
     else:
-        raise ValueError(f"QuantizeConfig: unsupported bits specification `{bits}`.")
+        raise ValueError(
+            f"QuantizeConfig: `{field}` must be an integer bit width, got `{bits!r}`."
+        )
 
     normalized_width = normalized.bits if isinstance(normalized, GGUFBits) else normalized
-    valid_bit_widths = [1, 2, 3, 4, 5, 6, 7, 8]
     if normalized_width not in valid_bit_widths:
-        raise ValueError(f"QuantizeConfig: `bits` must resolve to one of `{valid_bit_widths}`.")
+        raise ValueError(
+            _unsupported_bits_error(
+                normalized_width,
+                valid_bit_widths,
+                field=field,
+                method=method,
+            )
+        )
 
     if format_value == FORMAT.GGUF and not isinstance(normalized, GGUFBits):
         default_alias = _GGUF_DEFAULT_BITS_ALIAS_BY_WIDTH.get(normalized_width)
@@ -678,6 +980,8 @@ def resolve_quant_format(
         return FORMAT.EXL3
     if method == METHOD.PARO:
         return FORMAT.PAROQUANT
+    if method == METHOD.NF12_AD:
+        return FORMAT.NF12_AD
 
     if isinstance(format_value, FORMAT):
         return format_value
@@ -730,14 +1034,22 @@ def serialize_quant_bits(bits: Union[int, str, GGUFBits]) -> Union[int, str]:
     return normalized.serialize() if isinstance(normalized, GGUFBits) else normalized
 
 
-def _normalize_exl3_bits(bits: Union[int, float, str]) -> float:
-    """Normalize an integer EXL3 Trellis width.
+def _normalize_exl3_bits(bits: Union[int, float, str], *, field: str = "bits") -> float:
+    """Normalize and validate an EXL3 integer trellis width.
 
-    ExLlamaV3 encodes each matrix with an integer K. A fractional value is an
-    artifact-level average that must be represented by explicit per-module
-    integer overrides; silently flooring it would produce the wrong artifact.
+    EXL3 stores exactly one integer trellis depth (``K``) per module: the packer
+    builds ``256 * K // 16`` entries per tile and the kernel takes ``K`` as an
+    ``int``. A fractional width therefore cannot be realised -- ``quant_bits_width``
+    floors it -- so accepting one would mislabel the checkpoint (a saved
+    ``bits: 2.5`` describing 2.0 bpw tensors). Reject it rather than silently
+    quantizing narrower. A fractional *average* is expressed with per-module
+    ``dynamic`` widths, each of which is an integer.
     """
 
+    if isinstance(bits, bool):
+        raise ValueError(
+            f"EXL3Config: `{field}` must be an integer trellis width, not `{bits}`."
+        )
     if isinstance(bits, str):
         bits = float(bits.strip())
     elif isinstance(bits, int):
@@ -746,14 +1058,16 @@ def _normalize_exl3_bits(bits: Union[int, float, str]) -> float:
         raise ValueError(f"EXL3Config: unsupported bits specification `{bits}`.")
 
     if not math.isfinite(bits):
-        raise ValueError("EXL3Config: `bits` must be finite.")
+        raise ValueError(f"EXL3Config: `{field}` must be finite.")
     if bits < 1.0 or bits > 8.0:
-        raise ValueError("EXL3Config: `bits` must be between 1.0 and 8.0.")
+        raise ValueError(f"EXL3Config: `{field}` must be between 1.0 and 8.0.")
     if not bits.is_integer():
         raise ValueError(
-            "EXL3Config: fractional `bits` is not a matrix encoding; use an "
-            "integer base width plus explicit per-module integer `dynamic` "
-            "overrides for a mixed-bitrate artifact."
+            f"EXL3Config: `{field}={bits:g}` is not an integer trellis width. EXL3 "
+            "packs one integer trellis depth (`K`) per module, so a fractional width "
+            f"cannot be realised and would silently quantize at {quant_bits_width(bits)} bpw. "
+            "Pass an integer `bits` and express a fractional average with per-module "
+            "widths, e.g. `dynamic={'model.layers.0.mlp.down_proj': {'bits': 3}}`."
         )
     return float(bits)
 
@@ -1300,6 +1614,91 @@ class HessianConfig:
             raise ValueError("HessianConfig: `staging_dtype` must be a torch.dtype or string.")
 
 
+_MSE_BUDGET_UNITS = {"K": 10, "M": 20, "G": 30}
+
+
+def _normalize_budget_bytes(value: Union[int, str, None], field_name: str) -> Optional[int]:
+    """Normalize a workspace budget to bytes.
+
+    ``int`` is a byte count; a string may carry a ``K``/``M``/``G`` postfix
+    (``"256M"``, ``"1G"``) with an optional trailing ``B``. ``None`` keeps the
+    device-derived default.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"MSEConfig: `{field_name}` must be bytes (int) or a '256M'/'1G' string.")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"MSEConfig: `{field_name}` must be a non-negative amount of bytes.")
+        return value
+    if isinstance(value, str):
+        text = value.strip().upper()
+        if text.endswith("B"):
+            text = text[:-1]
+        unit = _MSE_BUDGET_UNITS.get(text[-1:], 0)
+        if unit:
+            text = text[:-1]
+        if text.isdigit():
+            return int(text) << unit
+    raise ValueError(f"MSEConfig: `{field_name}` must be bytes (int) or a '256M'/'1G' string.")
+
+
+@dataclass
+class MSEConfig:
+    """MSE shrink-grid search controls used at calibration.
+
+    ``norm`` is the exponent of the ``|deq(x)-x|^norm`` objective; ``0``
+    disables the search. The GPTQ/QQQ MSE shrink grid and the AWQ clip grid
+    evaluate candidates in batched chunks; the budget fields bound each
+    chunk's workspace in bytes (ints) or postfixed strings (``"256M"``,
+    ``"1G"``). They are chunk-sizing targets, not limits on total process
+    memory: the AWQ path sizes several scratch buffers independently, and a
+    single candidate or minimum product tile can exceed the target.
+
+    ``None`` selects a device-derived default (16 MiB on CPU, 256 MiB on GPU);
+    ``0`` forces single-candidate chunking (and one-token product tiles for
+    AWQ). These settings only affect calibration-time scratch, never the
+    stored quantized weights.
+    """
+
+    norm: float = field(
+        default=0.0,
+        metadata={"help": "Exponent of the MSE objective; 0 disables the shrink-grid search"},
+    )
+    grid_budget: Optional[Union[int, str]] = field(
+        default=None,
+        metadata={"help": "Workspace budget per candidate chunk for the GPTQ/QQQ MSE shrink grid (bytes, or '256M'/'1G')"},
+    )
+    clip_grid_budget: Optional[Union[int, str]] = field(
+        default=None,
+        metadata={"help": "Workspace budget per scratch buffer for the AWQ clip grid (bytes, or '256M'/'1G')"},
+    )
+
+    def __post_init__(self):
+        if not isinstance(self.norm, (int, float)) or isinstance(self.norm, bool):
+            raise ValueError("MSEConfig: `norm` must be a number.")
+        self.norm = float(self.norm)
+        self.grid_budget = _normalize_budget_bytes(self.grid_budget, "grid_budget")
+        self.clip_grid_budget = _normalize_budget_bytes(self.clip_grid_budget, "clip_grid_budget")
+
+    def __bool__(self):
+        return self.norm > 0.0
+
+    @staticmethod
+    def resolve_budget_bytes(budget: Optional[int], device: torch.device) -> int:
+        """Resolve a byte budget; ``None`` uses the device default."""
+        if budget is None:
+            budget = (16 if device.type == "cpu" else 256) << 20
+        return budget
+
+    def grid_budget_bytes(self, device: torch.device) -> int:
+        return self.resolve_budget_bytes(self.grid_budget, device)
+
+    def clip_grid_budget_bytes(self, device: torch.device) -> int:
+        return self.resolve_budget_bytes(self.clip_grid_budget, device)
+
+
 # Activation operand formats accepted by the W4A stream. `w4afp8` carries E4M3
 # codes with one FP32 scale per token; `w4a_nvfp4` carries E2M1 codes with one
 # E4M3 scale per 16-element block plus one FP32 global scale per tensor.
@@ -1702,6 +2101,35 @@ class ExpertsRoutingOverride(BaseMoERouting):
 
 # MoE quantization: forward whole calibration dataset to each expert instead of only routed data
 # This ensures all experts receive sufficient calibration samples but increases quantization time
+_BYPASS_BATCH_SIZE_ERROR = "ExpertsRoutingBypass.batch_size must be a positive int or None"
+
+
+def normalize_bypass_batch_size(batch_size: Any) -> Optional[int]:
+    """Validate ``ExpertsRoutingBypass.batch_size`` and coerce numeric strings.
+
+    The batching runs behind a ``batch_size > 0`` guard in the staged executor,
+    so zero or a negative value silently degrades to "one chunk" - the VRAM
+    pressure this option exists to avoid. Numeric strings are coerced the same
+    way ``ExpertsRoutingOverride`` coerces ``num_experts_per_tok``, so a value
+    that came through JSON still works.
+    """
+
+    if batch_size is None:
+        return None
+    if isinstance(batch_size, bool):
+        raise ValueError(f"{_BYPASS_BATCH_SIZE_ERROR}, got bool: {batch_size!r}")
+    if isinstance(batch_size, str):
+        raw = batch_size.strip()
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+        raise ValueError(f"{_BYPASS_BATCH_SIZE_ERROR}, got str: {batch_size!r}")
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError(
+            f"{_BYPASS_BATCH_SIZE_ERROR}, got {type(batch_size).__name__}: {batch_size!r}"
+        )
+    return batch_size
+
+
 @dataclass
 class ExpertsRoutingBypass(BaseMoERouting):
     # Number of modules to process in a single batch to reduce VRAM pressure during quantization
@@ -1710,8 +2138,12 @@ class ExpertsRoutingBypass(BaseMoERouting):
     # - Second batch processes remaining 10 modules
     batch_size: Optional[int] = field(
         default=None,
-        metadata={"help": "Number of modules to process in a single batch during MoE quantization"}
+        metadata={"help": "Number of modules to process in a single batch during MoE quantization. "
+                          "Numeric strings are coerced; zero and negatives are rejected."}
     )
+
+    def __post_init__(self):
+        self.batch_size = normalize_bypass_batch_size(self.batch_size)
 
 
 @dataclass
@@ -1799,6 +2231,12 @@ QUANT_METHOD_FORMAT_MAPPING = {
     METHOD.PARO: {
         FORMAT.PAROQUANT,
     },
+    METHOD.VPTQ: {
+        FORMAT.VPTQ,
+    },
+    METHOD.NF12_AD: {
+        FORMAT.NF12_AD,
+    },
 }
 
 GPTQ_EXPORT_FORMATS: Tuple[FORMAT, ...] = (
@@ -1847,6 +2285,12 @@ RTN_EXPORT_FORMATS: Tuple[FORMAT, ...] = (
 GGUF_EXPORT_FORMATS: Tuple[FORMAT, ...] = (
     FORMAT.GGUF,
 )
+VPTQ_EXPORT_FORMATS: Tuple[FORMAT, ...] = (
+    FORMAT.VPTQ,
+)
+NF12_AD_EXPORT_FORMATS: Tuple[FORMAT, ...] = (
+    FORMAT.NF12_AD,
+)
 
 _UNAMBIGUOUS_EXPORT_METHOD_BY_FORMAT = {
     FORMAT.GPTQ: METHOD.GPTQ,
@@ -1863,6 +2307,8 @@ _UNAMBIGUOUS_EXPORT_METHOD_BY_FORMAT = {
     FORMAT.LLM_AWQ: METHOD.AWQ,
     FORMAT.PAROQUANT: METHOD.PARO,
     FORMAT.QQQ: METHOD.QQQ,
+    FORMAT.VPTQ: METHOD.VPTQ,
+    FORMAT.NF12_AD: METHOD.NF12_AD,
 }
 
 # inference only methods should go here
@@ -2764,6 +3210,36 @@ def dynamic_get(dynamic: Dict[str, Dict[str, Union[int, bool]]], module_name: st
 
     return sub_value
 
+
+def dynamic_matching_pattern(dynamic: Dict[str, Dict[str, Any]], module_name: str) -> Optional[str]:
+    """Return the `dynamic` pattern that decides `module_name`'s override.
+
+    Mirrors `_resolve_dynamic_override` first-match ordering. `None` means no
+    rule matched, so the base `QuantizeConfig` applies to the module.
+    """
+
+    if not dynamic:
+        return None
+
+    patterns = list(dynamic.keys())
+    exact_lookup, all_exact, regex_patterns = _get_dynamic_patterns(dynamic)
+
+    if all_exact:
+        entry = exact_lookup.get(module_name)
+        return patterns[entry[0]] if entry is not None else None
+
+    exact_entry = exact_lookup.get(module_name)
+    best_index = exact_entry[0] if exact_entry is not None else None
+    for index, _is_negative, compiled, _overrides in regex_patterns:
+        if best_index is not None and index > best_index:
+            break
+        if compiled.match(module_name):
+            return patterns[index]
+    if best_index is not None:
+        return patterns[best_index]
+    return None
+
+
 def _normalize_quant_method(value: Union[str, METHOD]) -> METHOD:
     if isinstance(value, str):
         value = value.lower()
@@ -2924,6 +3400,30 @@ def _normalize_hessian(hessian: Optional[Union[HessianConfig, Dict[str, Any]]]) 
     return hessian
 
 
+def _normalize_mse(
+    mse: Optional[Union[MSEConfig, Dict[str, Any], int, float]],
+    base: Optional[MSEConfig] = None,
+) -> MSEConfig:
+    """Normalize a ``mse`` config value into an ``MSEConfig``.
+
+    A bare number is the legacy ``mse`` exponent: it becomes ``norm`` and, when
+    ``base`` is given (e.g. a per-layer dynamic override), keeps the base's
+    workspace budgets. Dicts merge onto ``base`` field-wise.
+    """
+    if mse is None:
+        return base if base is not None else MSEConfig()
+    if isinstance(mse, MSEConfig):
+        return mse
+    if isinstance(mse, dict):
+        payload = asdict(base) if base is not None else {}
+        return MSEConfig(**{**payload, **mse})
+    if isinstance(mse, (int, float)) and not isinstance(mse, bool):
+        if base is not None:
+            return replace(base, norm=float(mse))
+        return MSEConfig(norm=float(mse))
+    raise ValueError("QuantizeConfig: `mse` must be a MSEConfig, dict, number, or None.")
+
+
 def _normalize_gptaq(gptaq: Optional[Union[GPTAQConfig, Dict[str, Any]]]) -> Optional[GPTAQConfig]:
     if gptaq is None:
         return None
@@ -3023,6 +3523,18 @@ def _normalize_gc_mode(value: Union[str, GcMode]) -> GcMode:
             f"QuantizeConfig: `gc_mode` must be one of {[v.value for v in GcMode]}."
         )
     return value
+
+
+def _normalize_p2p_config(
+    value: Optional[Union[P2PConfig, Dict[str, Any]]],
+) -> Optional[P2PConfig]:
+    if value is None:
+        return None
+    if isinstance(value, P2PConfig):
+        return value
+    if not isinstance(value, dict):
+        raise ValueError("QuantizeConfig: `p2p` must be a P2PConfig, dict, or None.")
+    return P2PConfig(**value)
 
 
 def _normalize_moe_config(value: Optional[Union[MoEConfig, Dict[str, Any]]]) -> Optional[MoEConfig]:
@@ -3180,9 +3692,16 @@ def _normalize_bitsandbytes_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
     legacy_block_size = normalized.pop("bnb_block_size", None)
     legacy_compress_statistics = normalized.pop("bnb_compress_statistics", None)
 
+    bits = _normalize_quant_bits(
+        normalized.get(BITS_FIELD_CODE, 4),
+        field="bits",
+        valid_bit_widths=METHOD_SUPPORTED_BITS[METHOD.BITSANDBYTES],
+        method=METHOD.BITSANDBYTES,
+    )
+    normalized[BITS_FIELD_CODE] = bits
     normalized[FORMAT_FIELD_CODE] = _normalize_bitsandbytes_format(
         normalized.get(FORMAT_FIELD_CODE, legacy_format),
-        bits=int(normalized.get(BITS_FIELD_CODE, 4)),
+        bits=bits,
     )
     normalized["block_size"] = _normalize_bitsandbytes_block_size(
         normalized.get("block_size", legacy_block_size)
@@ -3259,6 +3778,32 @@ def _normalize_quantize_config_payload_for_target_cls(target_cls, payload: Dict[
         if normalized_format is not None and normalized_format != FORMAT.QQQ:
             log.info(f"QuantizeConfig: Auto fix `format` to `{FORMAT.QQQ}`")
             normalized[FORMAT_FIELD_CODE] = FORMAT.QQQ
+    elif target_cls is VPTQConfig:
+        expected_method = METHOD.VPTQ
+        format_value = normalized.get(FORMAT_FIELD_CODE)
+        normalized_format = None
+        if format_value is not None:
+            try:
+                normalized_format = _normalize_format(format_value)
+                normalized[FORMAT_FIELD_CODE] = normalized_format
+            except ValueError:
+                normalized_format = None
+        if normalized_format is not None and normalized_format != FORMAT.VPTQ:
+            log.info(f"QuantizeConfig: Auto fix `format` to `{FORMAT.VPTQ}`")
+            normalized[FORMAT_FIELD_CODE] = FORMAT.VPTQ
+    elif target_cls is NF12ADConfig:
+        expected_method = METHOD.NF12_AD
+        format_value = normalized.get(FORMAT_FIELD_CODE)
+        normalized_format = None
+        if format_value is not None:
+            try:
+                normalized_format = _normalize_format(format_value)
+                normalized[FORMAT_FIELD_CODE] = normalized_format
+            except ValueError:
+                normalized_format = None
+        if normalized_format is not None and normalized_format != FORMAT.NF12_AD:
+            log.info(f"QuantizeConfig: Auto fix `format` to `{FORMAT.NF12_AD}`")
+            normalized[FORMAT_FIELD_CODE] = FORMAT.NF12_AD
     else:
         expected_method = METHOD.GPTQ
 
@@ -3381,13 +3926,22 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
 
     telemetry: Union[TelemetryConfig, Dict[str, Any]] = field(default_factory=TelemetryConfig)
 
+    # MSE shrink-grid search config: the `norm` exponent plus calibration-time
+    # workspace budgets for the vectorized MSE and AWQ clip grids. A bare
+    # number is the legacy exponent form (`mse=2.4` == `MSEConfig(norm=2.4)`).
+    mse: Union[MSEConfig, Dict[str, Any], int, float] = field(
+        default_factory=MSEConfig,
+        metadata={"help": "MSE shrink-grid search config (norm exponent, grid/clip workspace budgets)"},
+    )
+
     # gptq was originally designed to pack quantized weights inside INT32 dtypes
     # allowing using different dtypes used for packing quantized weights
     # affects [`qweights`, `qzeros`]
     pack_dtype: Optional[Union[str, torch.dtype]] = field(default=torch.int32)
 
-    # packing implementation hint (`original` = legacy CPU pack, `gpu` enables CUDA pack, `cpu` forces block CPU pack).
-    pack_impl: str = field(default="cpu")
+    # packing implementation hint (`auto` = accelerator pack when available,
+    # `original` = legacy CPU pack, `gpu` forces CUDA/ROCm pack, `cpu` forces block CPU pack).
+    pack_impl: str = field(default="auto")
 
     adapter: Optional[Union[Dict[str, Any], Lora]] = field(default=None)
 
@@ -3401,6 +3955,14 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
         metadata={"help": "Offload disk path. Only applicable if Offload to disk is enabled"},
     )
     _offload_temp_dir: Optional[_SharedTemporaryDirectory] = field(default=None, init=False, repr=False, compare=False)
+
+    # Keep the per-processor log file that a quantization run writes to `logs/`.
+    # Only a successful run is affected: a run that dies keeps its log either way,
+    # since that is when the file is worth reading.
+    keep_processor_logs: bool = field(
+        default=True,
+        metadata={"help": "Keep logs/<processor>_log_*.log after a successful quantization run"},
+    )
 
     rotation: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "random"]})
 
@@ -3425,6 +3987,17 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
         metadata={"help": "When multi-gpu is detected, we may data clone modules to each gpu for data parallelism "
         "to speed up quantization forwarding. This causes extra time spent (especially for MoE layers) and vram pressure, "
         "leading in some cases to slower forwarding or vram OOM"}
+    )
+
+    # Peer-to-peer policy for multi-GPU quantization and inference. Replaces the
+    # former GPTQMODEL_P2P* environment variables: `mode` ("auto"/"on"/"off"),
+    # `probe`, `probe_mib`, `min_gbps`, `min_ratio`, `use_torch_replicate`.
+    # `None` uses the P2PConfig defaults.
+    p2p: Optional[Union[P2PConfig, Dict[str, Any]]] = field(
+        default=None,
+        metadata={"help": "Peer-to-peer policy for multi-GPU quantization/inference. "
+                  "Pass P2PConfig(mode='auto'|'on'|'off', probe=..., min_gbps=..., min_ratio=..., "
+                  "use_torch_replicate=...) or an equivalent dict. None uses the defaults."},
     )
 
     # User-facing dense-pool strategy. The dense pool owns the serial path:
@@ -3544,8 +4117,25 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
         self.format = _normalize_format(self.format)
         return self.format
 
-    def _normalize_bits_field(self, bits_value, checkpoint_format: FORMAT):
-        return _normalize_quant_bits(bits_value, format_value=checkpoint_format)
+    def supported_bit_widths(self) -> Tuple[int, ...]:
+        """Return the integer bit widths this quantization method can realize."""
+
+        return METHOD_SUPPORTED_BITS.get(self.method, tuple(range(1, 9)))
+
+    def _normalize_bits_field(
+        self,
+        bits_value,
+        checkpoint_format: FORMAT,
+        *,
+        field: str = "bits",
+    ):
+        return _normalize_quant_bits(
+            bits_value,
+            format_value=checkpoint_format,
+            field=field,
+            valid_bit_widths=self.supported_bit_widths(),
+            method=self.method,
+        )
 
     def _normalize_dynamic_layer_config(
         self,
@@ -3557,7 +4147,11 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
     ) -> None:
         for key, value in layer_dict.items():
             if key == "bits":
-                normalized_bits = self._normalize_bits_field(value, checkpoint_format=checkpoint_format)
+                normalized_bits = self._normalize_bits_field(
+                    value,
+                    checkpoint_format=checkpoint_format,
+                    field=f"dynamic['{layer_name}'].bits",
+                )
                 layer_dict[key] = normalized_bits
                 if quant_bits_width(normalized_bits) not in valid_bit_widths:
                     raise ValueError(
@@ -3588,8 +4182,6 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             log.info(f"QuantizeConfig: offload_to_disk_path auto set to temporary dir `{self.offload_to_disk_path}`")
 
     def __post_init__(self):
-        fields_info = fields(self)
-
         self.method = _normalize_quant_method(self.method)
         format_family = self._resolve_checkpoint_format()
         self.pack_dtype = _normalize_pack_dtype(self.pack_dtype)
@@ -3615,9 +4207,15 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
 
         self.fallback = _normalize_fallback(self.fallback)
 
-        valid_bit_widths = fields_info[0].metadata["choices"]
+        valid_bit_widths = self.supported_bit_widths()
         if quant_bits_width(self.bits) not in valid_bit_widths:
-            raise ValueError(f"QuantizeConfig: `bits` must be in the set of `{fields_info[0].metadata['choices']}`.")
+            raise ValueError(
+                _unsupported_bits_error(
+                    quant_bits_width(self.bits),
+                    valid_bit_widths,
+                    method=self.method,
+                )
+            )
 
         # 5/6/7-bit GPTQ only exists in the planar (split-plane) layout, which is
         # a distinct checkpoint format from the continuous gptq/gptq_v2 layouts.
@@ -3694,6 +4292,8 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
         elif not isinstance(self.telemetry, TelemetryConfig):
             raise ValueError("telemetry must be a TelemetryConfig or dictionary")
 
+        self.mse = _normalize_mse(self.mse)
+
         # Rotation fuses orthogonal transforms into the weights and requires
         # materialized tensors; meta-device/shell loading cannot be used.
         if self.rotation and self.offload_to_disk:
@@ -3714,6 +4314,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
         )
         self.gc_mode = _normalize_gc_mode(self.gc_mode)
         self.moe = _normalize_moe_config(self.moe)
+        self.p2p = _normalize_p2p_config(self.p2p)
 
         # Normalize calibration_data_device to canonical form if it's a specific device (not "balanced")
         if self.calibration_data_device is not None:
@@ -3960,6 +4561,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             "opt_fused_rotation": "opt_fused_rotation",
             "opt_gradient_checkpointing": "opt_gradient_checkpointing",
             "opt_stage_cudagraph": "opt_stage_cudagraph",
+            "opt_amp": "opt_amp",
             "opt_best_state_dtype": "opt_best_state_dtype",
             "opt_train_on_noisy_inputs": "opt_train_on_noisy_inputs",
             "opt_scope": "opt_scope",
@@ -3974,6 +4576,25 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             for normalized_key, meta_key in meta_field_map.items():
                 if normalized_key not in normalized and meta_key in meta_payload:
                     normalized[normalized_key] = meta_payload.get(meta_key)
+
+        # `format` defaults to GPTQ above for legacy payloads. Weight-only
+        # methods have their own defaults, and forcing FORMAT.GPTQ would make
+        # e.g. a `method="gguf"` payload fail format validation instead of
+        # being normalized to its natural subtype.
+        effective_method = normalized.get(METHOD_FIELD_CODE)
+        weight_only_method = _peek_weight_only_method(normalized.get("weight_only"))
+        if weight_only_method == WeightOnlyMethod.GGUF:
+            effective_method = METHOD.GGUF
+        elif weight_only_method == WeightOnlyMethod.FP8:
+            effective_method = METHOD.FP8
+        elif weight_only_method == WeightOnlyMethod.BITSANDBYTES:
+            effective_method = METHOD.BITSANDBYTES
+        if format_auto_inferred and effective_method in {
+            METHOD.GGUF,
+            METHOD.FP8,
+            METHOD.BITSANDBYTES,
+        }:
+            normalized[FORMAT_FIELD_CODE] = None
 
         target_cls = cls if cls not in {BaseQuantizeConfig, QuantizeConfig} else _resolve_quantize_config_class(normalized)
         normalized = _normalize_quantize_config_payload_for_target_cls(target_cls, normalized)
@@ -4026,7 +4647,12 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             args_from_json = json.load(f)
             if transformers_config:
                 args_from_json = args_from_json["quantization_config"]
-            return cls.from_quant_config(args_from_json, format)
+            config = cls.from_quant_config(args_from_json, format)
+            if config.adapter is not None and config.adapter.path not in (None, ""):
+                config.adapter._gptqmodel_checkpoint_source = (
+                    os.path.abspath(save_dir), config.adapter.path,
+                )
+            return config
 
     def _update_meta_payload(self, meta_payload: Dict[str, Any]) -> None:
         return None
@@ -4056,6 +4682,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
 
         meta_payload["offload_to_disk"] = self.offload_to_disk
         meta_payload["telemetry"] = asdict(self.telemetry)
+        meta_payload["p2p"] = self.p2p.to_dict() if self.p2p is not None else None
         meta_payload["offload_to_disk_path"] = self.offload_to_disk_path
         meta_payload["pack_impl"] = self.pack_impl
         meta_payload["gc_mode"] = self.gc_mode.value if isinstance(self.gc_mode, GcMode) else self.gc_mode
@@ -4094,10 +4721,12 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
 
         dynamic = out["dynamic"]
         if dynamic:
+            dynamic = copy.deepcopy(dynamic)
             for _, v in dynamic.items():
                 v.pop("adapter", None)
                 if "bits" in v:
                     v["bits"] = serialize_quant_bits(v["bits"])
+            out["dynamic"] = dynamic
 
         out = {k: v for k, v in out.items() if v is not None and (v not in [None, {}])}
         dict_scale_dtype_to_str(out)
@@ -4187,14 +4816,62 @@ class QuantizeConfig(BaseQuantizeConfig, metaclass=QuantizeConfigMeta):
 
 
 @dataclass
+class GSQConfig:
+    """Optional Gumbel-Softmax refinement of an existing scalar GPTQ grid."""
+
+    enabled: bool = False
+    steps: int = 100
+    candidates: int = 33
+    seed: int = 7
+    learning_rate: float = 0.1
+    temperature_start: float = 1.0
+    temperature_end: float = 0.1
+    max_candidate_bytes: int = 64 * 1024**2
+    learn_scales: bool = False
+    modules: Optional[Tuple[str, ...]] = None
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool) or not isinstance(self.learn_scales, bool):
+            raise TypeError("GSQConfig: enabled and learn_scales must be boolean")
+        for name, minimum in (("steps", 1), ("candidates", 2), ("seed", 0), ("max_candidate_bytes", 1)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"GSQConfig: {name} must be an integer >= {minimum}")
+        for name in ("learning_rate", "temperature_start", "temperature_end"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"GSQConfig: {name} must be finite and positive")
+        if self.modules is not None:
+            if not isinstance(self.modules, (tuple, list)) or not self.modules:
+                raise ValueError("GSQConfig: modules must be a nonempty sequence of regular expressions")
+            for pattern in self.modules:
+                if not isinstance(pattern, str) or not pattern:
+                    raise ValueError("GSQConfig: module patterns must be nonempty strings")
+                pcre.compile(pattern)
+            self.modules = tuple(self.modules)
+
+
+def normalize_gsq_config(value) -> Optional[GSQConfig]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return GSQConfig(**value)
+    if not isinstance(value, GSQConfig):
+        raise TypeError("gsq must be a GSQConfig, dictionary or None")
+    value.__post_init__()
+    return value
+
+
+@dataclass
 class GPTQConfig(PreProcessorConfig):
     damp_percent: Optional[float] = field(default=None)
     damp_auto_increment: Optional[float] = field(default=None)
     act_group_aware: Optional[bool] = field(default=None)
     static_groups: bool = field(default=False)
-    mse: float = field(default=0.0)
     gptaq: Optional[GPTAQConfig] = field(default=None)
     foem: Optional[FOEMConfig] = field(default=None)
+    gsq: Optional[GSQConfig] = field(default=None)
+    gsq_training: Optional[GSQTrainingConfig] = field(default=None)
     mock_quantization: bool = field(
         default=False,
         metadata={"help": "Skip heavy computations for fast model loading validation"},
@@ -4227,6 +4904,12 @@ class GPTQConfig(PreProcessorConfig):
         self.hessian = _normalize_hessian(self.hessian)
         self.gptaq = _normalize_gptaq(self.gptaq)
         self.foem = _normalize_foem(self.foem)
+        self.gsq = normalize_gsq_config(self.gsq)
+        if isinstance(self.gsq_training, dict):
+            self.gsq_training = GSQTrainingConfig(**self.gsq_training)
+        elif self.gsq_training is not None and not isinstance(self.gsq_training, GSQTrainingConfig):
+            raise TypeError("GPTQConfig: gsq_training must be GSQTrainingConfig, a dictionary or None")
+        self.validate_gsq()
 
         if act_group_aware_user_value is None:
             self.act_group_aware = self.method == METHOD.GPTQ
@@ -4236,6 +4919,31 @@ class GPTQConfig(PreProcessorConfig):
         self._resolve_activation_ordering(desc_act_user_value, act_group_aware_user_value)
         if self.act_group_aware and self.desc_act:
             raise ValueError("QuantizeConfig:: `act_group_aware` == `True` requires `desc_act` == `False`.")
+
+    def validate_gsq(self) -> None:
+        if self.method == METHOD.QQQ:
+            if self.gsq_training is not None and self.gsq_training.enabled:
+                raise ValueError("QQQConfig: staged GSQ is unsupported for QQQ packing")
+            if self.gsq is not None and self.gsq.enabled:
+                if self.format != FORMAT.QQQ or self.gsq.learn_scales:
+                    raise ValueError("QQQConfig: GSQ requires QQQ export with fixed scales")
+            return
+        if self.gsq_training is not None and self.gsq_training.enabled:
+            if self.gsq_training.initializer not in ("gptq", "rtn"):
+                raise ValueError("GPTQConfig: staged GSQ requires a GPTQ or RTN initializer")
+            if self.gsq is not None and self.gsq.enabled:
+                raise ValueError("GPTQConfig: choose staged gsq_training or per-linear gsq")
+            if self.mock_quantization or self.gptaq is not None or self.foem is not None:
+                raise ValueError("GPTQConfig: staged GSQ requires plain GPTQ")
+            if self.format not in (FORMAT.GPTQ, FORMAT.GPTQ_V2):
+                raise ValueError("GPTQConfig: staged GSQ requires a GPTQ checkpoint format")
+        if self.gsq is not None and self.gsq.enabled:
+            if self.mock_quantization:
+                raise ValueError("GPTQConfig: GSQ is incompatible with mock quantization")
+            if self.gptaq is not None or self.foem is not None:
+                raise ValueError("GPTQConfig: GSQ currently supports plain GPTQ only")
+            if self.format not in (FORMAT.GPTQ, FORMAT.GPTQ_V2, FORMAT.GPTQ_P):
+                raise ValueError("GPTQConfig: GSQ requires a GPTQ scalar checkpoint format")
 
     def _resolve_activation_ordering(
         self,
@@ -4259,6 +4967,18 @@ class GPTQConfig(PreProcessorConfig):
             )
             self.act_group_aware = False
 
+        # act ordering is expressed as a permutation of the input channels within a
+        # quantization group, so it has nothing to act on when a single group spans
+        # the whole input (group_size <= 0). Older builds rejected this combination
+        # at quantization time, which made group_size=-1 unusable with the default
+        # config even though the flag is a no-op there.
+        if self.act_group_aware and int(self.group_size or -1) <= 0:
+            log.warn(
+                f"QuantizeConfig: `act_group_aware` has no effect with `group_size={self.group_size}`; "
+                "disabling it. Set `act_group_aware=False` explicitly to silence this warning."
+            )
+            self.act_group_aware = False
+
     def _update_meta_payload(self, meta_payload: Dict[str, Any]) -> None:
         if self.gptaq is None:
             meta_payload["gptaq"] = None
@@ -4276,7 +4996,7 @@ class GPTQConfig(PreProcessorConfig):
                 "device": device if isinstance(device, str) else str(device),
             }
 
-        meta_payload["mse"] = self.mse
+        meta_payload["mse"] = self.mse.norm
         meta_payload["mock_quantization"] = self.mock_quantization
         meta_payload["act_group_aware"] = self.act_group_aware
         meta_payload["hessian"] = {
@@ -4289,12 +5009,18 @@ class GPTQConfig(PreProcessorConfig):
     def _update_output_payload(self, out: Dict[str, Any]) -> None:
         out["sym"] = self.sym
         out[FORMAT_FIELD_CODE] = self.format
+        if self.gsq is not None:
+            out["gsq"] = asdict(self.gsq)
+        if self.gsq_training is not None:
+            out["gsq_training"] = self.gsq_training.to_dict()
 
 
 @dataclass
 class AWQConfig(PreProcessorConfig):
     method: METHOD = field(default=METHOD.AWQ)
     format: FORMAT = field(default=FORMAT.GEMM)
+    gsq: Optional[GSQConfig] = field(default=None)
+    gsq_training: Optional[GSQTrainingConfig] = field(default=None)
     scale_search_chunked_activations: bool = field(
         default=True,
         metadata={
@@ -4320,11 +5046,34 @@ class AWQConfig(PreProcessorConfig):
             log.info(f"QuantizeConfig: Auto fix `format` to `{FORMAT.GEMM}`")
             self.format = FORMAT.GEMM
         super().__post_init__()
+        self.gsq = normalize_gsq_config(self.gsq)
+        if self.gsq is not None and self.gsq.enabled:
+            if self.format not in (FORMAT.GEMM, FORMAT.GEMV, FORMAT.GEMV_FAST, FORMAT.LLM_AWQ):
+                raise ValueError("AWQConfig: GSQ requires GEMM or GEMV packing")
+            if self.bits != 4:
+                raise ValueError("AWQConfig: GSQ AWQ adapters require 4 bits")
+            if self.format != FORMAT.GEMM and self.group_size not in (-1, 32, 64, 128):
+                raise ValueError("AWQConfig: GSQ GEMV requires group size -1, 32, 64, or 128")
+        if isinstance(self.gsq_training, dict):
+            self.gsq_training = GSQTrainingConfig(**({"initializer": "awq"} | self.gsq_training))
+        elif self.gsq_training is not None and not isinstance(self.gsq_training, GSQTrainingConfig):
+            raise TypeError("AWQConfig: gsq_training must be GSQTrainingConfig, a dictionary or None")
+        if self.gsq_training is not None and self.gsq_training.enabled:
+            if self.gsq_training.initializer != "awq":
+                raise ValueError("AWQConfig: staged GSQ requires an AWQ initializer")
+            if self.bits != 4 or self.format != FORMAT.GEMM:
+                raise ValueError("AWQConfig: staged GSQ requires W4 GEMM export")
+            if self.gsq is not None and self.gsq.enabled:
+                raise ValueError("AWQConfig: choose staged gsq_training or per-linear gsq")
 
     def _update_output_payload(self, out: Dict[str, Any]) -> None:
         out["zero_point"] = not self.sym
         out["version"] = self.format
         out[FORMAT_FIELD_CODE] = self.format
+        if self.gsq is not None:
+            out["gsq"] = asdict(self.gsq)
+        if self.gsq_training is not None:
+            out["gsq_training"] = self.gsq_training.to_dict()
 
     def _update_meta_payload(self, meta_payload: Dict[str, Any]) -> None:
         super()._update_meta_payload(meta_payload)
@@ -4335,6 +5084,7 @@ class AWQConfig(PreProcessorConfig):
 class ParoConfig(PreProcessorConfig):
     method: METHOD = field(default=METHOD.PARO)
     format: FORMAT = field(default=FORMAT.PAROQUANT)
+    gsq: Optional[GSQConfig] = field(default=None)
     krot: int = field(default=8)
     opt_rotation_epochs: int = field(default=10)
     opt_finetune_epochs: int = field(default=10)
@@ -4357,6 +5107,10 @@ class ParoConfig(PreProcessorConfig):
     opt_fused_rotation: bool = field(default=True)
     opt_gradient_checkpointing: Optional[bool] = field(default=None)
     opt_stage_cudagraph: bool = field(default=True)
+    # `None` = auto: run the optimization stages without AMP on ROCm (measured
+    # faster and at-least-as-accurate on MI355X/gfx950) and keep the historical
+    # CUDA AMP default elsewhere.
+    opt_amp: Optional[bool] = field(default=None)
     opt_best_state_dtype: Union[str, torch.dtype] = field(default="fp32")
     opt_train_on_noisy_inputs: bool = field(default=False)
     opt_scope: str = field(default="module")
@@ -4384,6 +5138,10 @@ class ParoConfig(PreProcessorConfig):
             log.info(f"QuantizeConfig: Auto fix `format` to `{FORMAT.PAROQUANT}`")
             self.format = FORMAT.PAROQUANT
         super().__post_init__()
+        self.gsq = normalize_gsq_config(self.gsq)
+        if self.gsq is not None and self.gsq.enabled:
+            if self.bits != 4 or self.opt_scope != "module" or self.opt_train_on_noisy_inputs:
+                raise ValueError("ParoConfig: GSQ requires 4-bit module optimization with clean calibration inputs")
         self.krot = int(self.krot)
         if self.krot <= 0:
             raise ValueError("ParoConfig: `krot` must be a positive integer.")
@@ -4425,6 +5183,8 @@ class ParoConfig(PreProcessorConfig):
             checkpointing = self.default_opt_gradient_checkpointing_for_scope(self.opt_scope)
         self.opt_gradient_checkpointing = bool(checkpointing)
         self.opt_stage_cudagraph = bool(self.opt_stage_cudagraph)
+        if self.opt_amp is not None:
+            self.opt_amp = bool(self.opt_amp)
         self.opt_best_state_dtype = _normalize_paroquant_best_state_dtype(self.opt_best_state_dtype)
         self.opt_train_on_noisy_inputs = bool(self.opt_train_on_noisy_inputs)
         self.opt_stage_impl = str(self.opt_stage_impl).strip().lower()
@@ -4501,6 +5261,7 @@ class ParoConfig(PreProcessorConfig):
         meta_payload["opt_fused_rotation"] = self.opt_fused_rotation
         meta_payload["opt_gradient_checkpointing"] = self.opt_gradient_checkpointing
         meta_payload["opt_stage_cudagraph"] = self.opt_stage_cudagraph
+        meta_payload["opt_amp"] = self.opt_amp
         meta_payload["opt_best_state_dtype"] = self.opt_best_state_dtype
         meta_payload["opt_train_on_noisy_inputs"] = self.opt_train_on_noisy_inputs
         meta_payload["opt_scope"] = self.opt_scope
@@ -4514,6 +5275,8 @@ class ParoConfig(PreProcessorConfig):
         out["zero_point"] = not self.sym
         out["krot"] = self.krot
         out[FORMAT_FIELD_CODE] = self.format
+        if self.gsq is not None:
+            out["gsq"] = asdict(self.gsq)
 
 
 @dataclass
@@ -4527,12 +5290,278 @@ class QQQConfig(GPTQConfig):
     def supported_export_formats(self) -> Tuple[FORMAT, ...]:
         return QQQ_EXPORT_FORMATS
 
+    def _update_output_payload(self, out: Dict[str, Any]) -> None:
+        super()._update_output_payload(out)
+        # vLLM's QQQ config loader reads the weight width from ``wbits``.
+        # Keep ``bits`` as well for GPTQModel and other Hugging Face consumers.
+        out["wbits"] = serialize_quant_bits(self.bits)
+
     def default_desc_act(self) -> bool:
-        return True
+        # QQQ's packed runtime has contiguous 128-column group scales and no
+        # g_idx buffer, so GPTQ-style activation reordering cannot be
+        # represented in the checkpoint.
+        return False
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        if self.desc_act:
+            raise ValueError(
+                "QQQConfig: `desc_act=True` is not supported by the QQQ runtime; "
+                "use `desc_act=False`."
+            )
+
+        for layer, override in (self.dynamic or {}).items():
+            if isinstance(override, dict) and bool(override.get("desc_act")):
+                raise ValueError(
+                    f"QQQConfig: `desc_act=True` is not supported by the QQQ runtime; "
+                    f"layer `{layer}` must use `desc_act=False`."
+                )
+
+
+VPTQ_VALID_BITS: Tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8)
+
+
+def _normalize_vptq_vector_lens(value: Union[List[int], Tuple[int, int]]) -> List[int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("VPTQConfig: `vector_lens` must be a 2-item list/tuple `[outlier_vector_len, vector_len]`.")
+
+    vector_lens = [int(item) for item in value]
+    outlier_vector_len, vector_len = vector_lens
+    if vector_len <= 0:
+        raise ValueError("VPTQConfig: `vector_lens[1]` must be a positive integer.")
+    if outlier_vector_len == 0 or outlier_vector_len < -1:
+        raise ValueError("VPTQConfig: `vector_lens[0]` must be `-1` (disabled) or a positive integer.")
+    return vector_lens
+
+
+def _normalize_vptq_centroids(value: Union[List[int], Tuple[int, int]], name: str) -> List[int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"VPTQConfig: `{name}` must be a 2-item list/tuple `[outlier, main]`.")
+
+    centroids = [int(item) for item in value]
+    for index, item in enumerate(centroids):
+        if item == -1:
+            continue
+        if item < 1 or (item & (item - 1)) != 0:
+            raise ValueError(
+                f"VPTQConfig: `{name}[{index}]` must be `-1` (disabled) or a power-of-two positive integer, got `{item}`."
+            )
+    return centroids
+
+
+@dataclass
+class VPTQConfig(GPTQConfig):
+    """Configuration for VPTQ (Vector Post-Training Quantization).
+
+    VPTQ splits each weight matrix column (the `out_features` axis) into
+    sub-vectors of `vector_lens[1]` elements, quantizes every sub-vector with a
+    per-codebook nearest-centroid lookup, optionally refines the result with a
+    residual codebook, and finally applies the GPTQ error-propagation rule with
+    the module Hessian so quantization error is compensated across columns.
+
+    `bits` is derived from the codebook sizes and vector length; it is a
+    nominal bits-per-weight label used for logging and kernel selection, not a
+    storage parameter. Configure `vector_lens`, `num_centroids`, and
+    `num_res_centroids` instead of setting `bits` directly.
+    """
+
+    method: METHOD = field(default=METHOD.VPTQ)
+    format: FORMAT = field(default=FORMAT.VPTQ)
+    # `bits` is derived; the relaxed choices list keeps the nominal bpw label
+    # (e.g. 1.5 -> 2) valid for small vector codebooks.
+    bits: int = field(default=2, metadata={"choices": list(VPTQ_VALID_BITS)})
+    # [outlier_vector_len, vector_len]; -1 disables the outlier codebook
+    vector_lens: Union[List[int], Tuple[int, int]] = field(default_factory=lambda: [-1, 8])
+    # [outlier_num_centroids, num_centroids]; -1 disables the codebook
+    num_centroids: Union[List[int], Tuple[int, int]] = field(default_factory=lambda: [-1, 4096])
+    # [outlier_num_res_centroids, num_res_centroids]; -1 disables the residual codebook
+    num_res_centroids: Union[List[int], Tuple[int, int]] = field(default_factory=lambda: [-1, 16])
+    # percentage of input channels assigned to the outlier codebook
+    npercent: float = field(default=0.0)
+    # number of input channels per codebook; -1 lets group_num decide (single codebook)
+    group_size: int = field(default=-1)
+    # number of codebooks for the non-outlier channels; -1 lets group_size decide
+    group_num: int = field(default=-1)
+    # weighted k-means sample weighting: "" (uniform) or "hessian"
+    kmeans_mode: str = field(default="hessian")
+    kmeans_iters: int = field(default=100)
+    kmeans_tol: float = field(default=1e-5)
+    kmeans_seed: int = field(default=0)
+    # per-channel min/max normalization applied before vector quantization
+    enable_norm: bool = field(default=False)
+    norm_dim: int = field(default=0)
+    # reorder input channels by descending Hessian diagonal before quantization
+    enable_perm: bool = field(default=False)
+    # GPTQ error-propagation block size and damping
+    block_size: int = field(default=128)
+    percdamp: float = field(default=0.01)
+
+    def allowed_quant_methods(self) -> Tuple[METHOD, ...]:
+        return (METHOD.VPTQ,)
+
+    def supported_export_formats(self) -> Tuple[FORMAT, ...]:
+        return VPTQ_EXPORT_FORMATS
+
+    def default_desc_act(self) -> bool:
+        return False
+
+    def uses_weight_only_lifecycle(self) -> bool:
+        return False
+
+    def _derive_bits(self) -> int:
+        import math
+
+        vector_len = int(self.vector_lens[1])
+        num_centroids = int(self.num_centroids[1])
+        num_res_centroids = int(self.num_res_centroids[1])
+
+        index_bits = math.log2(num_centroids)
+        if num_res_centroids > 1:
+            index_bits += math.log2(num_res_centroids)
+        return max(VPTQ_VALID_BITS[0], min(VPTQ_VALID_BITS[-1], math.ceil(index_bits / vector_len)))
+
+    def _normalize_bits_field(
+        self,
+        bits_value,
+        checkpoint_format: FORMAT,
+        *,
+        field: str = "bits",
+    ):
+        del checkpoint_format
+        derived = self._derive_bits()
+        if bits_value is not None:
+            normalized = _normalize_quant_bits(
+                bits_value,
+                field=field,
+                valid_bit_widths=self.supported_bit_widths(),
+                method=self.method,
+            )
+            if quant_bits_width(normalized) != derived:
+                log.info(
+                    f"VPTQConfig: `bits` is derived from the codebook configuration; "
+                    f"ignoring `bits={bits_value}` and using `bits={derived}`."
+                )
+        return derived
+
+    def _normalize_dynamic_layer_config(
+        self,
+        layer_name: str,
+        layer_dict: Dict[str, Any],
+        *,
+        valid_bit_widths: List[int],
+        checkpoint_format: FORMAT,
+    ) -> None:
+        del valid_bit_widths, checkpoint_format
+        unsupported = sorted(key for key in layer_dict)
+        if unsupported:
+            raise ValueError(
+                f"VPTQConfig: dynamic overrides for layer `{layer_name}` are not supported; "
+                f"got `{unsupported}`. Configure `vector_lens`/`num_centroids`/`num_res_centroids` globally."
+            )
+
+    def quant_linear_init_kwargs(self) -> Dict[str, Any]:
+        return {
+            "vector_lens": list(self.vector_lens),
+            "num_centroids": list(self.num_centroids),
+            "num_res_centroids": list(self.num_res_centroids),
+            "npercent": self.npercent,
+            "group_num": self.group_num,
+            "kmeans_mode": self.kmeans_mode,
+            "kmeans_iters": self.kmeans_iters,
+            "kmeans_tol": self.kmeans_tol,
+            "kmeans_seed": self.kmeans_seed,
+            "enable_norm": self.enable_norm,
+            "norm_dim": self.norm_dim,
+            "enable_perm": self.enable_perm,
+            "block_size": self.block_size,
+            "percdamp": self.percdamp,
+        }
+
+    def _update_output_payload(self, out: Dict[str, Any]) -> None:
+        out["vector_lens"] = list(self.vector_lens)
+        out["num_centroids"] = list(self.num_centroids)
+        out["num_res_centroids"] = list(self.num_res_centroids)
+        out["npercent"] = self.npercent
+        out["group_size"] = self.group_size
+        out["group_num"] = self.group_num
+        out["kmeans_mode"] = self.kmeans_mode
+        out["kmeans_iters"] = self.kmeans_iters
+        out["kmeans_tol"] = self.kmeans_tol
+        out["kmeans_seed"] = self.kmeans_seed
+        out["enable_norm"] = self.enable_norm
+        out["norm_dim"] = self.norm_dim
+        out["enable_perm"] = self.enable_perm
+        out["block_size"] = self.block_size
+        out["percdamp"] = self.percdamp
+
+    def __post_init__(self):
+        self.vector_lens = _normalize_vptq_vector_lens(self.vector_lens)
+        self.num_centroids = _normalize_vptq_centroids(self.num_centroids, "num_centroids")
+        self.num_res_centroids = _normalize_vptq_centroids(self.num_res_centroids, "num_res_centroids")
+
+        if self.num_centroids[1] < 2:
+            raise ValueError(
+                "VPTQConfig: `num_centroids[1]` must be a power-of-two integer of at least 2, "
+                "so the main codebook needs at least one index bit."
+            )
+        if self.num_res_centroids[1] == 1:
+            raise ValueError(
+                "VPTQConfig: `num_res_centroids[1]` must be -1 (disabled) or a power-of-two "
+                "integer of at least 2; a one-entry residual codebook has no index bits and "
+                "cannot be packed."
+            )
+        if self.npercent < 0:
+            raise ValueError("VPTQConfig: `npercent` must be greater than or equal to 0.")
+        if self.npercent > 0 and self.vector_lens[0] <= 0:
+            raise ValueError("VPTQConfig: `npercent` > 0 requires `vector_lens[0]` > 0.")
+        if self.npercent > 0 and self.num_centroids[0] < 2:
+            raise ValueError("VPTQConfig: `npercent` > 0 requires `num_centroids[0]` of at least 2.")
+        if self.num_res_centroids[0] != -1:
+            raise ValueError(
+                "VPTQConfig: residual codebooks for the outlier group are not supported; "
+                "set `num_res_centroids[0]` to -1."
+            )
+        index_bits = vptq_index_bits(self.num_centroids[1])
+        if self.num_res_centroids[1] > 1:
+            index_bits += vptq_index_bits(self.num_res_centroids[1])
+        if index_bits > 32:
+            raise ValueError(
+                f"VPTQConfig: `num_centroids[1]`/`num_res_centroids[1]` need {index_bits} index bits; "
+                "the packed index stream supports at most 32."
+            )
+        if self.group_num != -1 and self.group_num < 1:
+            raise ValueError("VPTQConfig: `group_num` must be `-1` or a positive integer.")
+        if self.group_num != -1 and self.group_size != -1:
+            raise ValueError("VPTQConfig: `group_num` and `group_size` cannot both be set.")
+        if self.kmeans_mode not in ("", "hessian"):
+            raise ValueError(f"VPTQConfig: unsupported `kmeans_mode` `{self.kmeans_mode}`.")
+        if self.kmeans_iters < 1:
+            raise ValueError("VPTQConfig: `kmeans_iters` must be a positive integer.")
+        if not 0 < self.kmeans_tol < 1:
+            raise ValueError("VPTQConfig: `kmeans_tol` must be between 0 and 1.")
+        if self.norm_dim not in (0, 1):
+            raise ValueError("VPTQConfig: `norm_dim` must be `0` or `1`.")
+        if self.block_size < 1:
+            raise ValueError("VPTQConfig: `block_size` must be a positive integer.")
+        if not 0 <= self.percdamp < 1:
+            raise ValueError("VPTQConfig: `percdamp` must be between 0 and 1.")
+        if self.dynamic:
+            for layer, override in self.dynamic.items():
+                if override is False:
+                    continue
+                if not isinstance(override, dict):
+                    raise ValueError(
+                        f"VPTQConfig: dynamic entry for `{layer}` must be `False` or a dict of overrides."
+                    )
+
+        super().__post_init__()
 
 
 @dataclass
 class FP8Config(PreProcessorConfig):
+    gsq: Optional[GSQConfig] = field(default=None)
+    gsq_calibration: bool = field(default=False)
     bits: int = field(default=8, metadata={"choices": [8]})
     method: METHOD = field(default=METHOD.FP8)
     format: Optional[str] = field(default="float8_e4m3fn")
@@ -4570,6 +5599,14 @@ class FP8Config(PreProcessorConfig):
         self.desc_act = False
         self.sym = True
 
+        self.gsq = normalize_gsq_config(self.gsq)
+        if self.gsq is not None and self.gsq.enabled and self.gsq.learn_scales:
+            raise ValueError("FP8Config: GSQ currently requires fixed inverse scales")
+        if not isinstance(self.gsq_calibration, bool):
+            raise TypeError("FP8Config: gsq_calibration must be boolean")
+        if self.gsq_calibration and (self.gsq is None or not self.gsq.enabled):
+            raise ValueError("FP8Config: gsq_calibration requires enabled GSQ")
+
         self.format = _normalize_fp8_fmt(self.format)
         block_size = _normalize_fp8_weight_block_size(self.weight_block_size)
         self.weight_scale_method = _normalize_fp8_weight_scale_method(
@@ -4578,6 +5615,7 @@ class FP8Config(PreProcessorConfig):
         )
         self.weight_block_size = list(block_size) if block_size is not None else None
         self.weight_scale_semantics = _normalize_fp8_scale_semantics(self.weight_scale_semantics)
+        self._validate_gsq()
 
         if self.dynamic is not None:
             self.dynamic = {
@@ -4601,8 +5639,14 @@ class FP8Config(PreProcessorConfig):
         checkpoint_format: FORMAT,
     ) -> None:
         del valid_bit_widths, checkpoint_format
-        if "bits" in layer_dict and int(layer_dict["bits"]) != 8:
-            raise ValueError(f"FP8Config: layer `{layer_name}` only supports 8-bit FP8 weights.")
+        if "bits" in layer_dict:
+            layer_dict["bits"] = _normalize_quant_bits(
+                layer_dict["bits"],
+                format_value=FORMAT.FP8,
+                field=f"dynamic['{layer_name}'].bits",
+                valid_bit_widths=METHOD_SUPPORTED_BITS[METHOD.FP8],
+                method=METHOD.FP8,
+            )
         if "group_size" in layer_dict and layer_dict["group_size"] not in (-1, None):
             raise ValueError("FP8Config: `group_size` is not used; keep it at `-1`.")
 
@@ -4631,14 +5675,104 @@ class FP8Config(PreProcessorConfig):
             "weight_scale_semantics": self.weight_scale_semantics,
         }
 
+    def _validate_gsq(self) -> None:
+        if self.gsq is not None and self.gsq.enabled and self.format == "float8_e8m0fnu":
+            raise ValueError("FP8Config: GSQ requires finite E4M3/E5M2 weight storage")
+        if self.gsq_calibration and self.weight_scale_method == "tensor":
+            raise ValueError("FP8Config: calibrated GSQ requires row or block weight scales")
+
     def _update_output_payload(self, out: Dict[str, Any]) -> None:
         out[FORMAT_FIELD_CODE] = self.format
+        if self.gsq is not None:
+            out["gsq"] = asdict(self.gsq)
+        out["gsq_calibration"] = self.gsq_calibration
         out["weight_scale_method"] = self.weight_scale_method
         out["weight_block_size"] = self.weight_block_size
         out["weight_scale_semantics"] = self.weight_scale_semantics
 
     def uses_weight_only_lifecycle(self) -> bool:
+        return not self.gsq_calibration
+
+
+@dataclass
+class NF12ADConfig(PreProcessorConfig):
+    """Configuration for NF12-AD (NyoomFloat12, AlpinDale modified layout).
+
+    NF12 is a lossless 12-bit encoding of BF16 weights from Together AI's
+    NyoomFloat12 paper, implemented by AlpinDale at
+    https://github.com/dphnAI/nf12. The ``ad`` suffix denotes the tiled
+    bit/memory layout implemented by that library, which is not byte
+    compatible with the paper's layout.
+
+    Quantization casts weights to BF16 (the only lossy step) and then encodes
+    them exactly. Inference stores only the packed bytes and escape table.
+    """
+
+    bits: int = field(default=12, metadata={"choices": [12]})
+    method: METHOD = field(default=METHOD.NF12_AD)
+    format: FORMAT = field(default=FORMAT.NF12_AD)
+    group_size: int = field(default=-1)
+    desc_act: Optional[bool] = field(default=False)
+    sym: bool = field(default=True)
+    # Force one exponent base for every module (0..120). None searches for the
+    # base with the fewest escaped groups, as the format specifies.
+    exp_base: Optional[int] = field(default=None)
+
+    def _resolve_checkpoint_format(self) -> FORMAT:
+        return FORMAT.NF12_AD
+
+    def allowed_quant_methods(self) -> Tuple[METHOD, ...]:
+        return (METHOD.NF12_AD,)
+
+    def supported_export_formats(self) -> Tuple[FORMAT, ...]:
+        return NF12_AD_EXPORT_FORMATS
+
+    def default_desc_act(self) -> bool:
+        return False
+
+    def _normalize_dynamic_layer_config(
+        self,
+        layer_name: str,
+        layer_dict: Dict[str, Any],
+        *,
+        valid_bit_widths: List[int],
+        checkpoint_format: FORMAT,
+    ) -> None:
+        del valid_bit_widths, checkpoint_format
+        if not isinstance(layer_dict, dict):
+            return
+        if "bits" in layer_dict and int(layer_dict["bits"]) != 12:
+            raise ValueError(f"NF12ADConfig: layer `{layer_name}` only supports 12-bit weights.")
+        if "group_size" in layer_dict and layer_dict["group_size"] not in (-1, None):
+            raise ValueError("NF12ADConfig: `group_size` is not used; keep it at `-1`.")
+        if "exp_base" in layer_dict:
+            raise ValueError(
+                "NF12ADConfig: per-layer `exp_base` is not supported; set it globally."
+            )
+
+    def quant_linear_init_kwargs(self) -> Dict[str, Any]:
+        return {"exp_base": self.exp_base}
+
+    def _update_output_payload(self, out: Dict[str, Any]) -> None:
+        out["exp_base"] = self.exp_base
+        # NF12 is lossless, so symmetry is not a user-tunable choice.
+        out["sym"] = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.method != METHOD.NF12_AD:
+            raise ValueError("NF12ADConfig: `method` must be `nf12`.")
+        self.format = FORMAT.NF12_AD
+        self.group_size = -1
+        self.desc_act = False
+        self.sym = True
+        if self.exp_base is not None:
+            if not isinstance(self.exp_base, int) or not 0 <= self.exp_base <= 120:
+                raise ValueError("NF12ADConfig: `exp_base` must be None or an integer in [0, 120].")
+
+    def uses_weight_only_lifecycle(self) -> bool:
         return True
+
 
 @dataclass
 class BitsAndBytesConfig(PreProcessorConfig):
@@ -4652,7 +5786,13 @@ class BitsAndBytesConfig(PreProcessorConfig):
     compress_statistics: bool = field(default=True)
 
     def _resolve_checkpoint_format(self) -> FORMAT:
-        self.format = _normalize_bitsandbytes_format(self.format, bits=int(self.bits))
+        bits = _normalize_quant_bits(
+            self.bits,
+            field="bits",
+            valid_bit_widths=METHOD_SUPPORTED_BITS[METHOD.BITSANDBYTES],
+            method=METHOD.BITSANDBYTES,
+        )
+        self.format = _normalize_bitsandbytes_format(self.format, bits=bits)
         return FORMAT.BITSANDBYTES
 
     def allowed_quant_methods(self) -> Tuple[METHOD, ...]:
@@ -4703,15 +5843,27 @@ class BitsAndBytesConfig(PreProcessorConfig):
         checkpoint_format: FORMAT,
     ) -> None:
         del valid_bit_widths, checkpoint_format
-        if "bits" in layer_dict and int(layer_dict["bits"]) not in {4, 8}:
-            raise ValueError(f"BitsAndBytesConfig: layer `{layer_name}` only supports 4-bit or 8-bit weights.")
+        if "bits" in layer_dict:
+            layer_dict["bits"] = _normalize_quant_bits(
+                layer_dict["bits"],
+                format_value=FORMAT.BITSANDBYTES,
+                field=f"dynamic['{layer_name}'].bits",
+                valid_bit_widths=METHOD_SUPPORTED_BITS[METHOD.BITSANDBYTES],
+                method=METHOD.BITSANDBYTES,
+            )
         if "group_size" in layer_dict and layer_dict["group_size"] not in (-1, None):
             raise ValueError("BitsAndBytesConfig: `group_size` is not used; keep it at `-1`.")
         if "desc_act" in layer_dict and bool(layer_dict["desc_act"]):
             raise ValueError("BitsAndBytesConfig: `desc_act` is not supported.")
         if "sym" in layer_dict and layer_dict["sym"] is not True:
             raise ValueError("BitsAndBytesConfig: `sym` must stay `True`.")
-        dynamic_bits = int(layer_dict.get("bits", self.bits))
+        dynamic_bits = _normalize_quant_bits(
+            layer_dict.get("bits", self.bits),
+            format_value=FORMAT.BITSANDBYTES,
+            field=f"dynamic['{layer_name}'].bits",
+            valid_bit_widths=METHOD_SUPPORTED_BITS[METHOD.BITSANDBYTES],
+            method=METHOD.BITSANDBYTES,
+        )
         raw_format = layer_dict.get(FORMAT_FIELD_CODE, layer_dict.get("bnb_quant_type"))
         if raw_format is not None:
             layer_dict[FORMAT_FIELD_CODE] = _normalize_bitsandbytes_format(raw_format, bits=dynamic_bits)
@@ -4796,8 +5948,14 @@ class EXL3Config(PreProcessorConfig):
     def default_desc_act(self) -> bool:
         return False
 
-    def _normalize_bits_field(self, bits_value, checkpoint_format: FORMAT):
-        return _normalize_exl3_bits(bits_value)
+    def _normalize_bits_field(
+        self,
+        bits_value,
+        checkpoint_format: FORMAT,
+        *,
+        field: str = "bits",
+    ):
+        return _normalize_exl3_bits(bits_value, field=field)
 
     def _normalize_dynamic_layer_config(
         self,
@@ -4810,9 +5968,15 @@ class EXL3Config(PreProcessorConfig):
         del valid_bit_widths, checkpoint_format
         for key, value in layer_dict.items():
             if key == "bits":
-                layer_dict[key] = _normalize_exl3_bits(value)
+                layer_dict[key] = _normalize_exl3_bits(
+                    value, field=f"dynamic['{layer_name}'].bits"
+                )
             elif key == "head_bits":
-                layer_dict[key] = None if value is None else _normalize_exl3_bits(value)
+                layer_dict[key] = (
+                    None
+                    if value is None
+                    else _normalize_exl3_bits(value, field=f"dynamic['{layer_name}'].head_bits")
+                )
             elif key == "group_size" and value not in (-1, None):
                 raise ValueError("EXL3Config: `group_size` is not used; keep it at `-1`.")
 
@@ -4821,8 +5985,12 @@ class EXL3Config(PreProcessorConfig):
         self.method = _normalize_quant_method(self.method)
         self.format = _normalize_format(self.format)
         self.pack_dtype = _normalize_pack_dtype(self.pack_dtype)
-        self.bits = _normalize_exl3_bits(self.bits)
-        self.head_bits = None if self.head_bits is None else _normalize_exl3_bits(self.head_bits)
+        self.bits = _normalize_exl3_bits(self.bits, field="bits")
+        self.head_bits = (
+            None
+            if self.head_bits is None
+            else _normalize_exl3_bits(self.head_bits, field="head_bits")
+        )
 
         if self.method != METHOD.EXL3:
             raise ValueError("EXL3Config: `method` must be `exl3`.")
@@ -4918,6 +6086,7 @@ class EXL3Config(PreProcessorConfig):
         )
         self.gc_mode = _normalize_gc_mode(self.gc_mode)
         self.moe = _normalize_moe_config(self.moe)
+        self.p2p = _normalize_p2p_config(self.p2p)
 
     def _update_output_payload(self, out: Dict[str, Any]) -> None:
         # EXL3 matrices always have an integer trellis width. Keep that type in
@@ -4987,6 +6156,7 @@ class EXL3Config(PreProcessorConfig):
 class RTNConfig(PreProcessorConfig):
     method: METHOD = field(default=METHOD.GPTQ)
     format: FORMAT = field(default=FORMAT.GPTQ)
+    gsq: Optional[GSQConfig] = field(default=None)
 
     def allowed_quant_methods(self) -> Tuple[METHOD, ...]:
         return (METHOD.GPTQ,)
@@ -4999,10 +6169,19 @@ class RTNConfig(PreProcessorConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        self.gsq = normalize_gsq_config(self.gsq)
+        if self.gsq is not None and self.gsq.enabled:
+            if self.format not in (FORMAT.GPTQ, FORMAT.GPTQ_V2, FORMAT.GEMM, FORMAT.GEMV,
+                                   FORMAT.GEMV_FAST, FORMAT.LLM_AWQ):
+                raise ValueError("RTNConfig: GSQ requires scalar GPTQ or AWQ export")
+            if self.format in (FORMAT.GEMM, FORMAT.GEMV, FORMAT.GEMV_FAST, FORMAT.LLM_AWQ) and self.bits != 4:
+                raise ValueError("RTNConfig: AWQ GSQ requires 4 bits")
 
     def _update_output_payload(self, out: Dict[str, Any]) -> None:
         out["sym"] = self.sym
         out[FORMAT_FIELD_CODE] = self.format
+        if self.gsq is not None:
+            out["gsq"] = asdict(self.gsq)
 
     def _update_meta_payload(self, meta_payload: Dict[str, Any]) -> None:
         super()._update_meta_payload(meta_payload)
@@ -5041,8 +6220,20 @@ class GGUFConfig(PreProcessorConfig):
         self.bits, self.format, self._gguf_bits = _normalize_gguf_config_spec(self.bits, self.format)
         return FORMAT.GGUF
 
-    def _normalize_bits_field(self, bits_value, checkpoint_format: FORMAT):
-        normalized = _normalize_quant_bits(bits_value, format_value=FORMAT.GGUF)
+    def _normalize_bits_field(
+        self,
+        bits_value,
+        checkpoint_format: FORMAT,
+        *,
+        field: str = "bits",
+    ):
+        normalized = _normalize_quant_bits(
+            bits_value,
+            format_value=FORMAT.GGUF,
+            field=field,
+            valid_bit_widths=self.supported_bit_widths(),
+            method=self.method,
+        )
         return normalized.bits if isinstance(normalized, GGUFBits) else normalized
 
     def _normalize_dynamic_layer_config(
@@ -5063,10 +6254,12 @@ class GGUFConfig(PreProcessorConfig):
 
             layer_dict["bits"] = normalized_bits
 
-            bits_implied_format = (
-                isinstance(raw_bits, GGUFBits)
-                or (isinstance(raw_bits, str) and not raw_bits.strip().isdigit())
-            )
+            bits_implied_format = isinstance(raw_bits, GGUFBits)
+            if isinstance(raw_bits, str):
+                try:
+                    float(raw_bits.strip().lower().replace("-", "_"))
+                except ValueError:
+                    bits_implied_format = True
             if format_override_present or bits_implied_format:
                 layer_dict[FORMAT_FIELD_CODE] = normalized_format
 
@@ -5285,6 +6478,7 @@ def _resolve_quantize_config_class(payload: Dict[str, Any]) -> type[BaseQuantize
         )
     if (
         format_value == FORMAT.GGUF
+        or method == METHOD.GGUF
         or weight_only_method == WeightOnlyMethod.GGUF
         or _looks_like_gguf_bits(bits)
         or gguf_format_detected
@@ -5306,6 +6500,10 @@ def _resolve_quantize_config_class(payload: Dict[str, Any]) -> type[BaseQuantize
         return EXL3Config
     if method == METHOD.PARO or format_value == FORMAT.PAROQUANT:
         return ParoConfig
+    if method == METHOD.VPTQ or format_value == FORMAT.VPTQ:
+        return VPTQConfig
+    if method == METHOD.NF12_AD or format_value == FORMAT.NF12_AD:
+        return NF12ADConfig
     if method == METHOD.QQQ or format_value == FORMAT.QQQ:
         return QQQConfig
     if method == METHOD.AWQ:
@@ -5327,6 +6525,8 @@ def _known_quantize_config_field_names() -> set[str]:
         AWQConfig,
         ParoConfig,
         QQQConfig,
+        VPTQConfig,
+        NF12ADConfig,
         FP8Config,
         BitsAndBytesConfig,
         EXL3Config,

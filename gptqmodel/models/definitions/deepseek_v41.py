@@ -9,7 +9,7 @@ in the automatic quantization dispatcher.
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41RotaryEmbedding, DeepseekV41DecoderLayer
+from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41DecoderLayer, DeepseekV41RotaryEmbedding
 
 from ...utils.ple_mmap import MappedPLETable
 from ..base import BaseQModel

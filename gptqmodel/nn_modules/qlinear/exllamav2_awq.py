@@ -12,13 +12,17 @@ from ...quantization import FORMAT, METHOD
 from ...quantization.awq.utils.packing_utils import unpack_reorder_pack
 from ...utils.backend import BACKEND
 from ...utils.exllamav2 import (
+    EXLLAMAV2_AWQ_ROCM_UNSUPPORTED,
     ScratchSpace,
     exllamav2_awq_gemm_half_q_half,
     exllamav2_awq_make_q_matrix,
     exllamav2_awq_runtime_available,
     exllamav2_awq_runtime_error,
+    exllamav2_free_q_matrix,
 )
 from ...utils.logger import setup_logger
+from ...utils.rocm import IS_ROCM
+from ._runtime_cache import tensor_cache_key
 
 
 log = setup_logger()
@@ -45,7 +49,7 @@ class AwqExllamaV2Linear(AWQuantLinear):
     SUPPORTS_PACK_DTYPES = [torch.int32]
     SUPPORTS_ADAPTERS = [Lora]
 
-    SUPPORTS_DTYPES = [torch.float16, torch.bfloat16]
+    SUPPORTS_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
     REQUIRES_FORMAT_V2 = True
 
@@ -77,16 +81,24 @@ class AwqExllamaV2Linear(AWQuantLinear):
             backend=kwargs.pop("backend", BACKEND.AWQ_EXLLAMA_V2),
             adapter=adapter,
             **kwargs)
+        self.q_handle = None
+        self._awq_repacked = False
+        self._q_handle_key = None
 
     @classmethod
     def validate_once(cls):
+        # The native ExLlamaV2 AWQ extension is CUDA-only: hipcc cannot build it
+        # and the kernel had accuracy regressions on ROCm. Fail fast with an
+        # actionable error instead of attempting the JIT build.
+        if IS_ROCM:
+            return False, NotImplementedError(EXLLAMAV2_AWQ_ROCM_UNSUPPORTED)
         # Validate through the shared JIT loader so import-time checks match the
         # runtime build path used on first kernel access.
         if not exllamav2_awq_runtime_available():
             return False, ImportError(exllamav2_awq_runtime_error())
         return True, None
 
-    def ext_make_q_matrix_awq(self, qweight, qzeros, scales, temp_dq) -> int:
+    def ext_make_q_matrix_awq(self, qweight, qzeros, scales) -> int:
         runtime_scales = scales if scales.dtype == torch.float16 else scales.to(dtype=torch.float16)
         return exllamav2_awq_make_q_matrix(
             qweight,
@@ -98,7 +110,6 @@ class AwqExllamaV2Linear(AWQuantLinear):
             qzeros,
             runtime_scales,
             None,
-            temp_dq,
         )
 
     def post_init(self, scratch_space: ScratchSpace):
@@ -115,45 +126,79 @@ class AwqExllamaV2Linear(AWQuantLinear):
         if not exllamav2_awq_runtime_available():
             raise ModuleNotFoundError("ExLlamaV2 AWQ torch.ops kernels are not properly installed. Error: " + exllamav2_awq_runtime_error())
 
+        self._release_q_handle()
         # awq only accepts float16
         self.scales = self.scales.to(dtype=torch.float16)
 
         assert self.qweight.device.type == "cuda"
         assert self.qweight.device.index is not None
 
-        self.qweight, self.qzeros = unpack_reorder_pack(
-            self.qweight, self.qzeros, self.bits
-        )
-
-        temp_dq_size = self.temp_dq_size()
-        temp_dq = scratch_space.get_slice(temp_dq_size)
-        self.q_handle = self.ext_make_q_matrix_awq(self.qweight, self.qzeros, self.scales, temp_dq)
+        if not self._awq_repacked:
+            self.qweight, self.qzeros = unpack_reorder_pack(
+                self.qweight, self.qzeros, self.bits
+            )
+            self._awq_repacked = True
+        self._ensure_q_handle()
 
         super().post_init()
+
+    def _release_q_handle(self) -> None:
+        if self.q_handle is not None:
+            exllamav2_free_q_matrix(self.q_handle, awq=True)
+            self.q_handle = None
+        self._q_handle_key = None
+
+    def clear_weight_cache(self) -> None:
+        """Release native pointers derived from the current packed buffers."""
+
+        self._release_q_handle()
+
+    def _ensure_q_handle(self) -> int:
+        key = (
+            tensor_cache_key(self.qweight),
+            tensor_cache_key(self.qzeros),
+            tensor_cache_key(self.scales),
+        )
+        if self.q_handle is not None and self._q_handle_key != key:
+            self._release_q_handle()
+        if self.q_handle is None:
+            self.q_handle = self.ext_make_q_matrix_awq(
+                self.qweight,
+                self.qzeros,
+                self.scales,
+            )
+            self._q_handle_key = key
+        return self.q_handle
 
     def forward(self, x: torch.Tensor):
         if self.input_rows(x) == 0:
             return self.empty_linear_output(x)
-        assert self.q_handle is not None, (
-            "module.post_init() must be called before module.forward(). "
-        )
+        self._ensure_q_handle()
         if not exllamav2_awq_runtime_available():
             raise ModuleNotFoundError("ExLlamaV2 AWQ torch.ops kernels are not properly installed. Error: " + exllamav2_awq_runtime_error())
 
         input_dtype = x.dtype
         out_shape = x.shape[:-1] + (self.out_features,)
 
-        if input_dtype != torch.float16:
-            x = x.to(dtype=torch.float16)
-
-        x = x.view(-1, x.shape[-1])
+        x = x.reshape(-1, x.shape[-1]).contiguous()
 
         out = torch.empty(
             (x.shape[0], self.out_features),
-            dtype=torch.float16,
+            dtype=x.dtype,
             device=x.device,
         )
-        exllamav2_awq_gemm_half_q_half(x, self.q_handle, out, False)
+        handle, temporaries = self.q_handle, None
+        if getattr(self, "_fusion_native_view", False):
+            from ...utils.exllamav2 import exllamav2_clone_q_matrix
+
+            handle, temporaries = exllamav2_clone_q_matrix(self, awq=True, compact=True)
+        try:
+            exllamav2_awq_gemm_half_q_half(x, handle, out, False)
+        finally:
+            if temporaries is not None:
+                from ...utils.exllamav2 import exllamav2_free_q_matrix
+
+                exllamav2_free_q_matrix(handle, awq=True)
 
         if input_dtype != torch.float16:
             out = out.to(dtype=input_dtype)
@@ -167,10 +212,13 @@ class AwqExllamaV2Linear(AWQuantLinear):
         return out.view(out_shape)
 
     def temp_dq_size(self):
+        """Bytes of retained dense-weight scratch: zero by design.
+
+        The quantized kernel decodes inside its launch and the row-count
+        fallback allocates a transient tensor per call, so no dense weight
+        buffer is attached to the handle or the model.
         """
-        Returns the size of the temporary buffer required for the dq kernel.
-        """
-        return self.in_features * self.out_features * 2 + 128
+        return 0
 
     def temp_fwd_size(self, max_input_len, max_batch_size):
         """

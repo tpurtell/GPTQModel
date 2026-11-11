@@ -18,6 +18,7 @@ from .exl3_router_candidates import bind_sigmoid_grouped_router_recovery, learne
 from .kimi_k3_core_format import reconstruct_core_projection, validate_core_tensors
 from .kimi_k3_core_stream import DenseRawHessian, capture_linear_input
 
+
 _HESSIAN_CONTRACT = "signed-block-hadamard-congruence-fp64-v1"
 
 
@@ -66,13 +67,13 @@ def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, de
     working = torch.zeros((inputs, stored_outputs), device=weight.device, dtype=torch.float32)
     working[:, :outputs].copy_(weight.T)
     target = torch.device(device)
-    raw = dict(H=H.to(device=target, copy=True), count=raw_hessian["count"], finalized=False)
-    args = dict(K=bits, seed=seed, sigma_reg=float(sigma), devices=[target], mcg=True, apply_out_scales=None)
+    raw = {"H": H.to(device=target, copy=True), "count": raw_hessian["count"], "finalized": False}
+    args = {"K": bits, "seed": seed, "sigma_reg": float(sigma), "devices": [target], "mcg": True, "apply_out_scales": None}
     _, _, packed = _quantizer().quantize_exl3(working, raw, args, return_weight_q=False)
     metrics = args.get("error_metrics", {})
-    required = dict(quantizer_path="hessian_ldlq", hessian_metric_status="ok",
-        hessian_numerical_contract=_HESSIAN_CONTRACT, hessian_transform_compute_dtype="torch.float64",
-        hessian_storage_dtype="torch.float32", hessian_sample_count=raw_hessian["count"])
+    required = {"quantizer_path": "hessian_ldlq", "hessian_metric_status": "ok",
+        "hessian_numerical_contract": _HESSIAN_CONTRACT, "hessian_transform_compute_dtype": "torch.float64",
+        "hessian_storage_dtype": "torch.float32", "hessian_sample_count": raw_hessian["count"]}
     if any(metrics.get(key) != value for key, value in required.items()):
         raise ValueError("projection did not use calibrated FP64-congruence LDLQ")
     for key in ("reported_metric_value", "hessian_weighted_error_numerator",
@@ -274,8 +275,8 @@ def prepare_context(hidden, rotary, prev_topk=None, *, position_ids=None, attent
                 or prev_topk.dtype not in (torch.int32, torch.int64)):
             raise ValueError("invalid exact shared DSA top-k state")
         prev_topk = prev_topk.to(hidden.device)
-    return dict(attention_mask=attention_mask.to(hidden.device), position_ids=position_ids,
-                position_embeddings=rotary(hidden, position_ids), prev_topk_indices=prev_topk)
+    return {"attention_mask": attention_mask.to(hidden.device), "position_ids": position_ids,
+                "position_embeddings": rotary(hidden, position_ids), "prev_topk_indices": prev_topk}
 
 
 @torch.inference_mode()

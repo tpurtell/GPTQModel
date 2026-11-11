@@ -11,6 +11,7 @@ from typing import Any, Literal, Optional, Set, Union
 from ..adapter.remote import resolve_path
 from ..utils.logger import setup_logger
 
+
 log = setup_logger()
 
 @dataclass
@@ -393,10 +394,22 @@ class LoraConfig():
             raise ValueError("Adapter: RSLora is not supported")
 
     @classmethod
-    def from_pretrained(cls, path: str, filename: str):
+    def from_pretrained(
+        cls,
+        path: str,
+        filename: str,
+        *,
+        allow_remote: bool = False,
+        revision: Optional[str] = None,
+    ):
         """Loads a saved LoRA config and filters out unsupported empty fields."""
 
-        resolved_path = resolve_path(path=path, filename=filename)
+        resolved_path = resolve_path(
+            path=path,
+            filename=filename,
+            allow_remote=allow_remote,
+            revision=revision,
+        )
         with open(resolved_path, "r") as file:
             config_dict = json.load(file)
 

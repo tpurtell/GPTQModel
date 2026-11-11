@@ -3,8 +3,9 @@
 import pytest
 import torch
 
-from gptqmodel.utils import glm5_core as core
 from gptqmodel.nn_modules.exllamav3 import ExllamaV3Linear
+from gptqmodel.utils import glm5_core as core
+
 
 pytestmark=[pytest.mark.cuda,pytest.mark.skipif(not torch.cuda.is_available(),reason="admitted CUDA GPU required")]
 
@@ -13,7 +14,7 @@ pytestmark=[pytest.mark.cuda,pytest.mark.skipif(not torch.cuda.is_available(),re
 def test_real_glm_kv_a_geometry_owns_raw_hessian_and_repeats_exactly(bits):
     generator=torch.Generator(device="cuda").manual_seed(787)
     weight=(torch.randn(576,6144,device="cuda",generator=generator)*.01).bfloat16()
-    raw=dict(H=torch.eye(6144,device="cuda"),count=4096,finalized=False)
+    raw={"H": torch.eye(6144,device="cuda"),"count": 4096,"finalized": False}
     original=raw["H"].clone()
     first,_,evidence=core.quantize_projection(weight,raw,bits=bits)
     second,_,_=core.quantize_projection(weight,raw,bits=bits)
@@ -31,7 +32,7 @@ def test_real_glm_kv_a_geometry_owns_raw_hessian_and_repeats_exactly(bits):
 def test_native_mcg_wrapper_matches_serialized_bf16_linear(bits,dtype,batch):
     generator=torch.Generator(device="cuda").manual_seed(41)
     weight=(torch.randn(576,128,device="cuda",generator=generator)*.015).bfloat16()
-    packed,_,_=core.quantize_projection(weight,dict(H=torch.eye(128,device="cuda"),count=4096,finalized=False),bits=bits)
+    packed,_,_=core.quantize_projection(weight,{"H": torch.eye(128,device="cuda"),"count": 4096,"finalized": False},bits=bits)
     module=ExllamaV3Linear.from_tensors(in_features=128,out_features=576,name="glm.kv_a",tensors=packed).cuda()
     dense=core.reconstruct_projection(packed,weight.shape,device="cuda:0",dtype=torch.float16)
     x=(torch.randn(batch,128,device="cuda",generator=generator)*.02).to(dtype)

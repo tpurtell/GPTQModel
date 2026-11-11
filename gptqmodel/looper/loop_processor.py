@@ -34,12 +34,35 @@ from ..quantization.config import QuantizeConfig
 from ..utils.colors import ANSIColor, color_text
 from ..utils.logger import setup_logger
 from ..utils.random_str import get_random_string
-from ..utils.torch import CPU, DEVICE_0, DEVICE_1, HAS_NPU
+from ..utils.torch import CPU, DEVICE_0, DEVICE_1, HAS_NPU, memory_stats_for_device
 
 
 log = setup_logger()
 
+def remove_processor_log(log_path: Optional[str], *, keep: bool = True) -> bool:
+    """Delete a processor log file unless ``keep`` asks for it to stay.
+
+    Returns True when a file was removed.
+    """
+
+    if not log_path or keep:
+        return False
+    try:
+        path = Path(log_path)
+        if not path.is_file():
+            return False
+        path.unlink()
+        return True
+    except OSError:
+        log.debug("Failed to remove processor log file %s", log_path, exc_info=True)
+        return False
+
 _PROJECT_LOG_DIR = Path("logs")
+
+# Device-SMI handles are process-scoped diagnostic helpers. Once the vendor tool
+# has been proven unable to report for a device the verdict is remembered here so
+# later processors in the same process do not pay the (always failing) probe again.
+_DEVICE_SMI_UNUSABLE: Set[str] = set()
 
 MODULE_FEATURE_COLUMN = "feat: in, out"
 DTYPE_SIZE_COLUMN = "dtype: size"
@@ -259,6 +282,7 @@ class LoopProcessor:
         self._log_header_interval = 20
         current_time = datetime.now().strftime("%m_%d_%Y_%Hh_%Mm_%Ss")
         self.log_tmp_log_file_name = str(self._build_log_file_path(self.name(), current_time))
+        self._torch_rocm_memory_devices: List[str] = []
         self._device_smi_handles = self._init_device_smi_handles()
         self._cpu_device_smi = self._init_cpu_device_handle()
         self._device_metric_failures: Set[str] = set()
@@ -285,6 +309,14 @@ class LoopProcessor:
                 batch_size=batch_size,
                 calibration_concat_separator=calibration_concat_separator,
             )
+
+            if len(calibration) == 0:
+                raise ValueError(
+                    "Calibration dataset is empty after prepare_dataset_func removed "
+                    "all samples (for example, every input_ids was shorter than "
+                    "calibration_data_min_length). Lower calibration_data_min_length "
+                    "or provide longer calibration samples."
+                )
 
             # A disk-backed calibration sequence can provide exact scalar
             # accounting without being traversed merely for a warning.  This
@@ -655,15 +687,45 @@ class LoopProcessor:
         return dtype_alias.get(dtype_str, dtype_str)
 
     def _init_device_smi_handles(self) -> Dict[str, Device]:
-        """Creates Device-SMI handles for all discovered accelerator devices."""
+        """Create Device-SMI handles except where ROCm VFs use Torch metrics."""
 
         handles: Dict[str, Device] = {}
 
         for device_id in self._discover_accelerator_devices():
+            if device_id.startswith("rocm:"):
+                try:
+                    if torch.cuda.get_device_name(int(device_id[5:])).upper().endswith(" VF"):
+                        self._torch_rocm_memory_devices.append(device_id)
+                        continue
+                except Exception as exc:  # pragma: no cover - defensive, external runtime
+                    log.debug(f"Unable to determine ROCm device name for `{device_id}`: {exc}")
+
+            if device_id in _DEVICE_SMI_UNUSABLE:
+                continue
+
             try:
-                handles[device_id] = Device(device_id)
+                handle = Device(device_id)
             except Exception as exc:  # pragma: no cover - defensive, external tool
                 log.debug(f"Device-SMI initialisation failed for `{device_id}`: {exc}")
+                _DEVICE_SMI_UNUSABLE.add(device_id)
+                continue
+
+            # A live handle starts a background sampler that shells out to the
+            # vendor SMI tool for the whole run. Probe once and drop handles that
+            # cannot report so a broken SMI install does not keep spawning the
+            # tool (tens of ms per probe) during quantization.
+            try:
+                handle.metrics(fast=True)
+            except Exception as exc:  # pragma: no cover - defensive, external tool
+                log.debug(f"Device-SMI metrics unavailable for `{device_id}`: {exc}")
+                _DEVICE_SMI_UNUSABLE.add(device_id)
+                try:
+                    handle.close()
+                except Exception:
+                    log.debug("Failed to close an unusable device telemetry handle.", exc_info=True)
+                continue
+
+            handles[device_id] = handle
 
         return handles
 
@@ -712,12 +774,16 @@ class LoopProcessor:
         """Queries Device-SMI metrics once per device, suppressing repeated failures."""
 
         with self._device_smi_lock:
+            # A device that already failed is not probed again: each probe shells
+            # out to the vendor SMI tool (tens of milliseconds when it fails) and
+            # the snapshots run once per layer and per log row.
+            if device_key in self._device_metric_failures:
+                return None
             try:
                 return handle.metrics(fast=True)
             except Exception as exc:  # pragma: no cover - defensive, external tool
-                if device_key not in self._device_metric_failures:
-                    log.debug(f"Device-SMI metrics failed for `{device_key}`: {exc}")
-                    self._device_metric_failures.add(device_key)
+                log.debug(f"Device-SMI metrics failed for `{device_key}`: {exc}")
+                self._device_metric_failures.add(device_key)
                 return None
 
     def _snapshot_device_memory_gib(self) -> Dict[str, float]:
@@ -725,6 +791,16 @@ class LoopProcessor:
 
         with self._device_smi_lock:
             snapshot: Dict[str, float] = {}
+            for device_id in getattr(self, "_torch_rocm_memory_devices", ()):
+                if device_id in self._device_metric_failures:
+                    continue
+                try:
+                    free, total = torch.cuda.mem_get_info(int(device_id[5:]))
+                except Exception as exc:
+                    log.debug(f"Torch memory metrics unavailable for `{device_id}`: {exc}")
+                    self._device_metric_failures.add(device_id)
+                    continue
+                snapshot[device_id] = (total - free) / (1024 ** 3)
             for device_id, handle in self._device_smi_handles.items():
                 metrics = self._safe_query_metric(device_id, handle)
                 if metrics is None:
@@ -1075,10 +1151,11 @@ class LoopProcessor:
         del self.inputs_cache
         del self._results
 
-        # TODO make this file delete based on user toggle
-        # cleanup temp log file
-        # if os.path.exists(self.log_tmp_log_file_name):
-        #     os.remove(file_path)
+        # Keep the log when the run failed: ``finalize`` only runs after the
+        # loop completed, and a failed run is exactly when the log is useful.
+        config = getattr(model, "quantize_config", None)
+        keep = bool(getattr(config, "keep_processor_logs", True))
+        remove_processor_log(getattr(self, "log_tmp_log_file_name", None), keep=keep)
 
     def release_calibration_dataset(self):
         """Drops the retained calibration dataset to free host memory."""
@@ -1101,13 +1178,13 @@ class LoopProcessor:
         pass
 
 def get_max_memory() -> str:
-    """Returns current CUDA memory usage for the first one or two devices."""
+    """Returns current accelerator memory usage for the first one or two devices."""
 
-    stats_0 = torch.cuda.memory_stats(DEVICE_0)
+    stats_0 = memory_stats_for_device(DEVICE_0)
     active_0 = stats_0.get("active_bytes.all.current", 0) / 1024 ** 2
 
-    if torch.cuda.device_count() > 1:
-        stats_1 = torch.cuda.memory_stats(DEVICE_1)
+    if DEVICE_1 != DEVICE_0:
+        stats_1 = memory_stats_for_device(DEVICE_1)
         active_1 = stats_1.get("active_bytes.all.current", 0) / 1024 ** 2
 
         max_memory = f"{active_0:.2f}MB, {active_1:.2f}MB"

@@ -145,7 +145,7 @@ def test_git_commit_is_resolved_from_package_source_not_process_cwd(monkeypatch)
     def fake_check_output(command, **kwargs):
         captured["command"] = command
         captured["kwargs"] = kwargs
-        return b"abc1234\n"
+        return "abc1234\n"
 
     monkeypatch.setattr(subprocess, "check_output", fake_check_output)
 

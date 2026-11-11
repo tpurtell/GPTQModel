@@ -18,13 +18,31 @@ class BACKEND(str, Enum):
     GPTQ_TRITON = "gptq_triton"  # VERY GOOD: all-around kernel
     BITSANDBYTES = "bitsandbytes"  # bitsandbytes 4-bit/8-bit kernel with optional CPU/CUDA support
     GPTQ_EXLLAMA_V2 = "gptq_exllama_v2"  # FASTER: optimized for batching > 1
-    GPTQ_MACHETE = "gptq_machete"  # CUTLASS-based kernel optimized for Hopper (SM90+)
-    GPTQ_SWORDFISH = "gptq_swordfish"  # Blackwell (sm100/sm110) w4a16/w8a16 GEMM kernel
-    GPTQ_MARLIN = "gptq_marlin"  # marlin reduce ops, fp32 by default; controlled by GPTQMODEL_MARLIN_USE_FP32
     GPTQ_W4AFP8 = "gptq_w4afp8"  # INT4 GPTQ weights, token-scaled FP8 input on SM12x
     GPTQ_W4A_NVFP4 = "gptq_w4a_nvfp4"  # INT4 GPTQ weights, NVFP4 input on SM12x
     GPTQ_BITBLAS = "gptq_bitblas"  # BitBLAS AOT-compiled GPTQ kernel
     GPTQ_TORCH_ATEN = "gptq_torch_aten"  # CPU int4pack ATen kernel folded into GPT-QModel
+    GPTQ_TORCH_CPU_AVX512 = "gptq_torch_cpu_avx512"  # CPU AVX512-BF16 GPTQ kernel ported from HF kernels
+
+    # AllSpark kernels
+    # A single backend covers both AllSpark sub-kernels. The quantization method
+    # and the device select the concrete GPTQ or AWQ module (CUDA/HIP).
+    ALLSPARK = "allspark"  # W8A16 fused GEMM, decode-oriented
+
+    # Marlin kernels
+    # A single backend covers both Marlin sub-kernels. The quantization method
+    # and checkpoint format select the concrete GPTQ or AWQ implementation.
+    MARLIN = "marlin"  # marlin reduce ops, fp32 by default; controlled by GPTQMODEL_MARLIN_USE_FP32
+
+    # Machete kernels
+    # A single backend covers both Machete sub-kernels. The quantization method
+    # and checkpoint format select the concrete GPTQ or AWQ implementation.
+    MACHETE = "machete"  # CUTLASS-based kernel optimized for Hopper (SM90+)
+
+    # Swordfish kernels
+    # A single backend covers both Swordfish sub-kernels. The quantization
+    # method and checkpoint format select the concrete GPTQ or AWQ implementation.
+    SWORDFISH = "swordfish"  # Blackwell (sm100/sm110) w4a16/w8a16 GEMM kernel
 
     # QQQ kernels
     QQQ = "qqq"  # marlin-based qqq kernel
@@ -34,15 +52,14 @@ class BACKEND(str, Enum):
     AWQ_GEMM = "awq_gemm"
     AWQ_GEMM_TRITON = "awq_gemm_triton"
     AWQ_GEMV = "awq_gemv"
+    AWQ_GEMV_TRITON = "awq_gemv_triton"  # portable Triton GEMV (same packed layout)
     AWQ_GEMV_FAST = "awq_gemv_fast"
     AWQ_TORCH_INT8 = "awq_torch_int8"
     AWQ_TORCH_FUSED = "awq_torch_fused"
     AWQ_TORCH_ATEN = "awq_torch_aten"  # CPU int4pack ATen kernel folded into GPT-QModel
+    AWQ_TORCH_CPU_AVX512 = "awq_torch_cpu_avx512"  # CPU AVX512-BF16 kernel shared with GPTQ
     AWQ_TORCH = "awq_torch"
     AWQ_BITBLAS = "awq_bitblas"
-    AWQ_MACHETE = "awq_machete"
-    AWQ_MARLIN = "awq_marlin"
-    AWQ_SWORDFISH = "awq_swordfish"
     AWQ_EXLLAMA_V2 = "awq_exllama_v2"
 
     # ParoQuant kernels
@@ -51,6 +68,13 @@ class BACKEND(str, Enum):
 
     # FP8 kernels
     FP8_TORCH = "fp8_torch"
+
+    # VPTQ kernels
+    VPTQ_TORCH = "vptq_torch"
+    VPTQ_CUDA = "vptq_cuda"
+
+    # NF12-AD (NyoomFloat12) lossless 12-bit BF16 weights
+    NF12_AD = "nf12_ad"
 
     # GGUF kernels / engines
     GGUF_TORCH = "gguf_torch"
@@ -74,13 +98,11 @@ class BACKEND(str, Enum):
     TRITON = "triton"
     EXLLAMA_V2 = "exllama_v2"
     EXLLAMA_V3 = "exllama_v3"
-    MACHETE = "machete"
-    SWORDFISH = "swordfish"
-    MARLIN = "marlin"
     BITBLAS = "bitblas"
     GEMM = "gemm"
     GEMM_TRITON = "gemm_triton"
     GEMV = "gemv"
+    GEMV_TRITON = "gemv_triton"
     GEMV_FAST = "gemv_fast"
     TORCH_INT8_AWQ = "torch_int8_awq"
     TORCH_FUSED_AWQ = "torch_fused_awq"
@@ -103,15 +125,13 @@ _LEGACY_BACKEND_BY_METHOD = {
         BACKEND.TORCH: BACKEND.GPTQ_TORCH,
         BACKEND.TRITON: BACKEND.GPTQ_TRITON,
         BACKEND.EXLLAMA_V2: BACKEND.GPTQ_EXLLAMA_V2,
-        BACKEND.MACHETE: BACKEND.GPTQ_MACHETE,
-        BACKEND.SWORDFISH: BACKEND.GPTQ_SWORDFISH,
-        BACKEND.MARLIN: BACKEND.GPTQ_MARLIN,
         BACKEND.BITBLAS: BACKEND.GPTQ_BITBLAS,
     },
     "awq": {
         BACKEND.GEMM: BACKEND.AWQ_GEMM,
         BACKEND.GEMM_TRITON: BACKEND.AWQ_GEMM_TRITON,
         BACKEND.GEMV: BACKEND.AWQ_GEMV,
+        BACKEND.GEMV_TRITON: BACKEND.AWQ_GEMV_TRITON,
         BACKEND.GEMV_FAST: BACKEND.AWQ_GEMV_FAST,
         BACKEND.TORCH: BACKEND.AWQ_TORCH,
         BACKEND.TORCH_AWQ: BACKEND.AWQ_TORCH,
@@ -121,9 +141,6 @@ _LEGACY_BACKEND_BY_METHOD = {
         BACKEND.TORCH_FUSED_AWQ: BACKEND.AWQ_TORCH_FUSED,
         BACKEND.BITBLAS: BACKEND.AWQ_BITBLAS,
         BACKEND.BITBLAS_AWQ: BACKEND.AWQ_BITBLAS,
-        BACKEND.MACHETE: BACKEND.AWQ_MACHETE,
-        BACKEND.MARLIN: BACKEND.AWQ_MARLIN,
-        BACKEND.SWORDFISH: BACKEND.AWQ_SWORDFISH,
         BACKEND.EXLLAMA_V2: BACKEND.AWQ_EXLLAMA_V2,
     },
     "paroquant": {
@@ -136,6 +153,26 @@ _LEGACY_BACKEND_BY_METHOD = {
         BACKEND.EXLLAMA_V3: BACKEND.EXL3_EXLLAMA_V3,
         BACKEND.TORCH: BACKEND.EXL3_TORCH,
     },
+    "vptq": {
+        BACKEND.TORCH: BACKEND.VPTQ_TORCH,
+    },
+    "nf12": {
+        BACKEND.TORCH: BACKEND.NF12_AD,
+    },
+}
+
+# Method-qualified Marlin/Machete/Swordfish/AllSpark names from older releases.
+# These are accepted by the stable HF-facing selection/repacking APIs, but they
+# resolve to the single shared backend; method/format choose the sub-kernel later.
+_LEGACY_BACKEND_ALIASES = {
+    "gptq_allspark": BACKEND.ALLSPARK,
+    "awq_allspark": BACKEND.ALLSPARK,
+    "gptq_marlin": BACKEND.MARLIN,
+    "awq_marlin": BACKEND.MARLIN,
+    "gptq_machete": BACKEND.MACHETE,
+    "awq_machete": BACKEND.MACHETE,
+    "gptq_swordfish": BACKEND.SWORDFISH,
+    "awq_swordfish": BACKEND.SWORDFISH,
 }
 
 _PROFILE_BY_INDEX = {
@@ -168,6 +205,8 @@ def normalize_backend(
             return None
         resolved = BACKEND.__members__.get(normalized.upper())
         if resolved is None:
+            resolved = _LEGACY_BACKEND_ALIASES.get(normalized.lower())
+        if resolved is None:
             resolved = BACKEND(normalized.lower())
     else:
         raise TypeError(f"backend must be a string or BACKEND, got `{type(backend)}`")
@@ -176,6 +215,37 @@ def normalize_backend(
     if method is None:
         return resolved
     return _LEGACY_BACKEND_BY_METHOD.get(method, {}).get(resolved, resolved)
+
+
+def awq_gemm_pack_backend(
+    *,
+    device_type: str,
+    is_rocm: bool,
+    weight_only: bool,
+) -> BACKEND:
+    """Return the AWQ GEMM backend used to pack quantized weights.
+
+    The native AWQ GEMM extension is CUDA-only: its sources include
+    ``cusparse.h`` and CUDA-specific inline asm, so it cannot be built on
+    ROCm/XPU/NPU/CPU hosts.  Those hosts pack with the portable torch kernel
+    instead, which emits the identical AWQ GEMM layout for in-range codes.
+
+    Every ROCm host -- CDNA (gfx950/gfx942) as well as RDNA4 (gfx1200/gfx1201/
+    gfx1250) -- takes ``AWQ_TORCH``.  RDNA4's hipBLASLt Tensile libraries exist
+    but the AWQ GEMM extension itself is still CUDA-only, so this is a kernel
+    availability decision, not an RDNA4 library gap.
+
+    Args:
+        device_type: Runtime type of the quantization device (``"cuda"``,
+            ``"xpu"``, ``"npu"``, ``"cpu"``, ...).
+        is_rocm: Whether the CUDA namespace is backed by the HIP runtime.
+        weight_only: Whether the quantization lifecycle is weight-only
+            (RTN->AWQ export), which always stays on the portable kernel.
+    """
+
+    if weight_only or is_rocm or device_type != "cuda":
+        return BACKEND.AWQ_TORCH
+    return BACKEND.AWQ_GEMM
 
 
 def backend_for_activation(activation_mode: Optional[str], backend: Optional[BACKEND]) -> Optional[BACKEND]:

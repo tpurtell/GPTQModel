@@ -10,22 +10,18 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import torch
 from torch.nn import functional as F
 
-from .exl3_hessian import BoundedHessianAccumulator, HESSIAN_ACCUMULATION_CONTRACT
+from .exl3_hessian import HESSIAN_ACCUMULATION_CONTRACT, BoundedHessianAccumulator
 from .kimi_k3 import KimiK3Source, situ
 from .kimi_k3_core_format import (
-    KimiK3EXL3Source, quantize_core_projection, reconstruct_core_projection,
-    validate_core_tensors,
+    KimiK3EXL3Source,
 )
-from .kimi_k3_core_stream import (
-    attention_inputs, attention_finish, capture_linear_input, complete_moe,
-    final_head_input, routed_up_input, shared_down_input,
-)
+
 
 REVISION = "6d0a0202956796543364d666ab19c6ad1a494ee1"
 
@@ -103,7 +99,7 @@ class DenseRawHessian(BoundedHessianAccumulator):
         matrix = self.snapshot()
         if float(matrix.diagonal().sum()) <= 0:
             raise ValueError("invalid dense Hessian covariance")
-        return dict(H=matrix, count=self.count, finalized=False)
+        return {"H": matrix, "count": self.count, "finalized": False}
 
     as_dict = raw_dict
 
@@ -135,9 +131,9 @@ def capture_routed_hessian(spool, expert, *, projections=None, chunk_rows=2048, 
     count = len(natural) + len(recovery) + residual
     if not bool(torch.isfinite(matrix).all()) or float(matrix.diagonal().sum()) <= 0:
         raise ValueError("invalid captured routed Hessian")
-    evidence = dict(natural_rows=len(natural), augmented_rows=len(recovery), identity_rows=residual,
-                    effective_rows=count, candidate_selection_sha256=hashlib.sha256(recovery.tobytes()).hexdigest(),
-                    ranks=[17, 32], selection_policy="rank-major-then-corpus-row-v1",
-                    down_inputs="serialized-quantized-gate-up-situ-bf16" if down else None,
-                    hessian_accumulation=HESSIAN_ACCUMULATION_CONTRACT)
-    return dict(H=matrix, count=count, finalized=False), evidence
+    evidence = {"natural_rows": len(natural), "augmented_rows": len(recovery), "identity_rows": residual,
+                    "effective_rows": count, "candidate_selection_sha256": hashlib.sha256(recovery.tobytes()).hexdigest(),
+                    "ranks": [17, 32], "selection_policy": "rank-major-then-corpus-row-v1",
+                    "down_inputs": "serialized-quantized-gate-up-situ-bf16" if down else None,
+                    "hessian_accumulation": HESSIAN_ACCUMULATION_CONTRACT}
+    return {"H": matrix, "count": count, "finalized": False}, evidence

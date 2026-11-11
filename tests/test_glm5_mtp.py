@@ -9,7 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaRMSNorm
 
-from gptqmodel.utils.glm5_mtp import GlmMTP, MTP_CONTRACT, aligned_inputs, load_mtp
+from gptqmodel.utils.glm5_mtp import MTP_CONTRACT, GlmMTP, aligned_inputs, load_mtp
 
 
 def _norm(x, weight, eps):
@@ -235,7 +235,7 @@ def test_loader_extends_only_full_glm_schedule_and_loads_own_extra_weights():
         v_head_dim=128, n_routed_experts=4, num_experts_per_tok=2,
         index_n_heads=2, index_head_dim=128, first_k_dense_replace=3,
         indexer_types=["full", "full", "full"], num_nextn_predict_layers=1,
-        rope_parameters=dict(rope_theta=8000000., rope_type="default"))
+        rope_parameters={"rope_theta": 8000000., "rope_type": "default"})
     config._experts_implementation = "eager"
     source = ToySource(config)
     mtp = load_mtp(source, "cpu")

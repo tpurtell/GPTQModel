@@ -52,22 +52,28 @@ from ..quantization import QuantizeConfig
 from ..quantization.config import FORMAT, METHOD, EXL3Config, GPTQConfig
 from ..quantization.gptq import GPTQ
 from ..utils.device import get_device
+from ..utils.exl3_capture_batch_spool import (
+    CAPTURE_BATCH_CHECKPOINT_INTERVAL_ENV,
+    CAPTURE_BATCH_SPOOL_ENV,
+    EXL3CaptureBatchSpool,
+)
+from ..utils.exl3_capture_frontier import (
+    CAPTURE_FRONTIER_ENV,
+    EXL3CaptureDescriptor,
+    EXL3CaptureFrontierStore,
+    EXL3CaptureRecord,
+)
 from ..utils.exl3_error_ledger import (
     JOURNAL_ENV,
     ROUTE_EVIDENCE_SCHEMA,
     ROUTE_EVIDENCE_SCHEMA_VERSION,
-    ZERO_ROUTE_RECOVERY_CAPTURE_METHOD,
-    ZERO_ROUTE_RECOVERY_IDENTITY_POLICY,
+    ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA,
+    ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION,
     ZERO_ROUTE_RECOVERY_MODE_IDENTITY,
     ZERO_ROUTE_RECOVERY_MODE_MIXED,
     ZERO_ROUTE_RECOVERY_MODE_ROUTER_NEAR,
-    ZERO_ROUTE_RECOVERY_SELECTION_POLICY,
-    ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA,
-    ZERO_ROUTE_RECOVERY_AUTHORIZATION_SCHEMA_VERSION,
-    ZERO_ROUTE_RECOVERY_SAMPLE_SOURCE,
     ZERO_ROUTE_RECOVERY_SCHEMA,
     ZERO_ROUTE_RECOVERY_SCHEMA_VERSION,
-    ZERO_ROUTE_RECOVERY_TRIGGER,
     append_exl3_error_journal,
     build_projection_record,
     compact_projection_record,
@@ -79,16 +85,12 @@ from ..utils.exl3_error_ledger import (
     zero_route_recovery_enabled,
     zero_route_recovery_recipe,
 )
-from ..utils.exl3_capture_frontier import (
-    CAPTURE_FRONTIER_ENV,
-    EXL3CaptureDescriptor,
-    EXL3CaptureFrontierStore,
-    EXL3CaptureRecord,
-)
-from ..utils.exl3_capture_batch_spool import (
-    CAPTURE_BATCH_CHECKPOINT_INTERVAL_ENV,
-    CAPTURE_BATCH_SPOOL_ENV,
-    EXL3CaptureBatchSpool,
+from ..utils.exl3_inline_mixed import (
+    PROJECTION_ORDER,
+    InlineMixedTierPlanStore,
+    build_layer_tier_plan,
+    inline_mixed_policy,
+    projection_score,
 )
 from ..utils.exl3_projection_checkpoint import (
     EXL3ProjectionCheckpointStore,
@@ -97,16 +99,9 @@ from ..utils.exl3_projection_checkpoint import (
     checkpoint_root_from_provenance,
     sha256_bytes,
 )
-from ..utils.exl3_inline_mixed import (
-    InlineMixedTierPlanStore,
-    PROJECTION_ORDER,
-    build_layer_tier_plan,
-    inline_mixed_policy,
-    projection_score,
-)
 from ..utils.exl3_remote import (
-    CoordinatorSlot,
     EXL3_HESSIAN_CAPTURE_CONTRACT,
+    CoordinatorSlot,
     ExecutionSlotLease,
     RemoteEndpoint,
     exl3_quantization_failure_message,
@@ -123,6 +118,7 @@ from ..utils.logger import setup_logger
 from ..utils.model import recurse_setattr
 from ..utils.module_locks import parent_module_lock
 from ..utils.offload import offload_to_disk, offload_to_safetensors_reference
+
 
 HOST_RSS_LIMIT_ENV = "GPTQMODEL_EXL3_HOST_RSS_LIMIT_BYTES"
 CUDA_ALLOCATION_LIMIT_ENV = "GPTQMODEL_EXL3_CUDA_ALLOCATION_LIMIT_BYTES"
@@ -570,10 +566,10 @@ class _EXL3NaturalRouteCapture:
             if batch_index in self.spool.committed_indices:
                 return
             raise RuntimeError("EXL3 completed a batch without capture payload")
-        selected_experts = set(
+        selected_experts = {
             int(value)
             for value in payload["top_indices"].detach().unique().tolist()
-        )
+        }
         tensors = {
             "router_input": payload["router_input"],
             "top_weights": payload["top_weights"],
@@ -2290,9 +2286,7 @@ class EXL3Processor(LoopProcessor):
     def _is_lm_head(self, module: NamedModule) -> bool:
         """Returns whether the named module corresponds to the model lm_head."""
 
-        if module.full_name == self.lm_head_name:
-            return True
-        return module.full_name.endswith(f".{self.lm_head_name}")
+        return module.full_name == self.lm_head_name or module.name == self.lm_head_name
 
     def _target_bits(self, module: NamedModule, module_qcfg: EXL3Config) -> int:
         """Chooses lm_head-specific bitwidth overrides when configured."""
@@ -3008,6 +3002,7 @@ class EXL3Processor(LoopProcessor):
                     torch.cuda.synchronize(target_device)
                     h_data = {
                         "H": hessian,
+                        "single_use": True,
                         "count": capture.nsamples,
                         "finalized": False,
                     }

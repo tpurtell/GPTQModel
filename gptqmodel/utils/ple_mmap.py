@@ -8,8 +8,8 @@ The mapping is never registered as a Torch parameter or buffer.
 import json
 import mmap
 import operator
-from pathlib import Path
 import struct
+from pathlib import Path
 
 
 class MappedPLETable:

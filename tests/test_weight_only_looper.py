@@ -5,8 +5,8 @@ from concurrent.futures import Future
 from contextlib import nullcontext
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 from torch import nn
 
 import gptqmodel.looper.weight_only_looper as weight_only_looper_module
@@ -312,8 +312,8 @@ def test_weight_only_looper_quantizes_input_and_lm_head_embeddings_only(monkeypa
     assert total_log == {"fake_weight_only": []}
     assert processor.quantized == ["embed_tokens", "lm_head"]
     assert processor.memory_calls == []
-    assert model._embedding_replacement_prefixes == {"embed_tokens", "lm_head"}
-    assert model._model_free_weight_only_embeddings_only is True
+    assert model._module_replacement_prefixes == {"embed_tokens", "lm_head"}
+    assert model._model_free_weight_only_replacements_only is True
     assert qcfg.offload_to_disk is False
     assert qcfg.dynamic["embed_tokens"] == {"bits": 8, "group_size": 32}
     assert qcfg.dynamic["lm_head"] == {"bits": 8, "group_size": 32}
@@ -344,8 +344,8 @@ def test_weight_only_looper_rejects_tied_embedding_parameters_before_quantizatio
 
     assert processor.quantized == []
     assert processor.finalize_called is False
-    assert not hasattr(model, "_embedding_replacement_prefixes")
-    assert not hasattr(model, "_model_free_weight_only_embeddings_only")
+    assert not hasattr(model, "_module_replacement_prefixes")
+    assert not hasattr(model, "_model_free_weight_only_replacements_only")
     assert qcfg.dynamic is None
 
 
@@ -372,7 +372,7 @@ def test_weight_only_looper_deduplicates_same_embedding_parameter(monkeypatch):
     looper.loop()
 
     assert processor.quantized == ["embed_tokens"]
-    assert model._embedding_replacement_prefixes == {"embed_tokens"}
+    assert model._module_replacement_prefixes == {"embed_tokens"}
 
 
 @pytest.mark.parametrize(
@@ -447,8 +447,8 @@ def test_weight_only_looper_quantizes_embeddings_and_regular_modules(monkeypatch
     looper.loop()
 
     assert processor.quantized == ["embed_tokens", "layers.0.linear", "layers.1.linear"]
-    assert model._embedding_replacement_prefixes == {"embed_tokens"}
-    assert model._model_free_weight_only_embeddings_only is False
+    assert model._module_replacement_prefixes == {"embed_tokens"}
+    assert model._model_free_weight_only_replacements_only is False
 
 
 def test_weight_only_processor_reports_dynamic_exclusions():
@@ -505,8 +505,7 @@ def test_weight_only_looper_skips_dynamic_exclusions_before_device_scheduling(mo
     monkeypatch.setattr(weight_only_looper_module, "log", fake_logger)
     monkeypatch.setattr(weight_only_looper_module, "select_forward_devices", lambda _device: devices)
     monkeypatch.setattr(weight_only_looper_module, "device_ctx", lambda _device: nullcontext())
-    monkeypatch.setattr(weight_only_looper_module, "move_to", lambda obj, *, device, dtype=None: obj)
-    monkeypatch.setattr(weight_only_looper_module, "rehome_module_to_device", lambda *args, **kwargs: None)
+    monkeypatch.setattr(weight_only_looper_module, "move_module_to_device", lambda obj, *args, **kwargs: obj)
     monkeypatch.setattr(weight_only_looper_module.DEVICE_THREAD_POOL, "submit", fake_submit)
     monkeypatch.setattr(
         weight_only_looper_module,
@@ -589,8 +588,7 @@ def test_weight_only_looper_quantizes_subset_across_multiple_devices(monkeypatch
     monkeypatch.setattr(weight_only_looper_module, "log", fake_logger)
     monkeypatch.setattr(weight_only_looper_module, "select_forward_devices", lambda _device: devices)
     monkeypatch.setattr(weight_only_looper_module, "device_ctx", lambda _device: nullcontext())
-    monkeypatch.setattr(weight_only_looper_module, "move_to", lambda obj, *, device, dtype=None: obj)
-    monkeypatch.setattr(weight_only_looper_module, "rehome_module_to_device", lambda *args, **kwargs: None)
+    monkeypatch.setattr(weight_only_looper_module, "move_module_to_device", lambda obj, *args, **kwargs: obj)
     monkeypatch.setattr(weight_only_looper_module.DEVICE_THREAD_POOL, "submit", fake_submit)
     monkeypatch.setattr(
         weight_only_looper_module,
@@ -665,8 +663,7 @@ def test_weight_only_looper_respects_dense_and_moe_vram_strategy_devices(monkeyp
     monkeypatch.setattr(weight_only_looper_module, "log", fake_logger)
     monkeypatch.setattr(weight_only_looper_module, "select_forward_devices", lambda _device: devices)
     monkeypatch.setattr(weight_only_looper_module, "device_ctx", lambda _device: nullcontext())
-    monkeypatch.setattr(weight_only_looper_module, "move_to", lambda obj, *, device, dtype=None: obj)
-    monkeypatch.setattr(weight_only_looper_module, "rehome_module_to_device", lambda *args, **kwargs: None)
+    monkeypatch.setattr(weight_only_looper_module, "move_module_to_device", lambda obj, *args, **kwargs: obj)
     monkeypatch.setattr(weight_only_looper_module.DEVICE_THREAD_POOL, "submit", fake_submit)
     monkeypatch.setattr(
         weight_only_looper_module,

@@ -19,6 +19,7 @@ from ...utils.backend import BACKEND
 from ...utils.logger import setup_logger
 from ...utils.torch import TORCH_HAS_FUSED_OPS
 from . import AWQuantLinear
+from ._fused_train_state import capture_fused_train_state, restore_fused_train_state
 from .torch_fused import Int4PackedOp, TorchFusedLinear, pack_scales_and_zeros
 
 
@@ -136,7 +137,7 @@ class TorchFusedAwqLinear(AWQuantLinear):
 
         if need_zeros:
             zero_offset = 1 << (self.bits - 1)
-            zeros = (zero_offset - izeros.reshape_as(self.scales)) * self.scales
+            zeros = (zero_offset - izeros.reshape_as(self.scales).float()) * self.scales.float()
 
         gptq_qweight = self.pack_awq_qweight(iweight)
         gptq_qzeros = self.pack_awq_qzeros(izeros)
@@ -187,7 +188,10 @@ class TorchFusedAwqLinear(AWQuantLinear):
 
         # Compute zeros: (zero_offset - izeros) * scales
         zero_offset = 1 << (self.bits - 1)
-        zeros = (zero_offset - izeros.reshape_as(self.scales)) * self.scales
+
+        from .torch_aten_kernel import _cpu_int4pack_scale_dtype
+
+        dtype = _cpu_int4pack_scale_dtype(self.scales, izeros.reshape_as(self.scales), self.bits, dtype)
 
         # AWQ has no g_idx — weights are already in natural order, just transpose
         # iweight: (in_features, out_features) -> (out_features, in_features) for int4pack
@@ -195,6 +199,7 @@ class TorchFusedAwqLinear(AWQuantLinear):
         self.qweight = torch.ops.aten._convert_weight_to_int4pack_for_cpu(weight.int(), 1).contiguous()
 
         self.scales = self.scales.to(dtype=dtype).contiguous()
+        zeros = (zero_offset - izeros.reshape_as(self.scales).float()) * self.scales.float()
         self.qzeros = zeros.to(device=self.qweight.device, dtype=dtype).contiguous()
         self.scales_and_zeros = pack_scales_and_zeros(self.scales, self.qzeros)
 
@@ -217,7 +222,9 @@ class TorchFusedAwqLinear(AWQuantLinear):
                 packed_col = weight[:, col * self.pack_factor + i].to(torch.int32)
                 packed[:, col] |= packed_col << (i * self.bits)
         self.qweight = packed.contiguous()
-        self.qzeros = izeros.contiguous()
+        # unpack_awq() returns int64, but the XPU fused op
+        # `_weight_int4pack_mm_with_scales_and_zeros` requires int8 zero points.
+        self.qzeros = izeros.to(torch.int8).contiguous()
 
     def transform_cpu(self, dtype):
         self.transform_cpu_awq(dtype)
@@ -254,6 +261,23 @@ class TorchFusedAwqLinear(AWQuantLinear):
                 "TorchFusedAwqLinear only supports fused transforms on CPU or XPU devices."
             )
 
+    def clear_weight_cache(self) -> None:
+        if restore_fused_train_state(self):
+            self.linear_mode = None
+            self.torch_fused_op = None
+            self.scales_and_zeros = None
+
+    def train(self, mode: bool = True):
+        old_train = self.training
+        if mode == old_train:
+            return self
+        if mode and self.linear_mode == LinearMode.INFERENCE:
+            restore_fused_train_state(self)
+            self.linear_mode = None
+            self.torch_fused_op = None
+            self.scales_and_zeros = None
+        return super().train(mode=mode)
+
     def forward(self, x: torch.Tensor):
         out_shape = x.shape[:-1] + (self.out_features,)
         x_flat = x.reshape(-1, x.shape[-1])
@@ -267,15 +291,13 @@ class TorchFusedAwqLinear(AWQuantLinear):
             and self.linear_mode is None
             and TORCH_HAS_FUSED_OPS
         ):
+            capture_fused_train_state(self)
             self.transform(x_flat.dtype, x_flat.device.type)
             self.linear_mode = LinearMode.INFERENCE
             if x_flat.device.type == "cpu":
                 self.torch_fused_op = Int4PackedOp(
                     self.qweight, self.scales_and_zeros, self.group_size
                 ).eval()
-                import torch._inductor.config as config
-                config.freezing = True
-                config.max_autotune = True
         elif self.linear_mode is None:
             self.linear_mode = LinearMode.TRAIN
 

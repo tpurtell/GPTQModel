@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4ForCausalLM,
@@ -14,9 +14,14 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4RMSNorm,
 )
 
+from gptqmodel.looper.exllamav3_processor import EXL3Processor
+from gptqmodel.looper.named_module import NamedModule
+from gptqmodel.looper.stage_inputs_capture import StageInputsCapture
 from gptqmodel.models import auto
-from gptqmodel.nn_modules.hooked_linear import HookedLinear
 from gptqmodel.models.definitions.deepseek_v4 import (
+    MTP_CAPTURE_ATTENTION_MASK,
+    MTP_CAPTURE_DECODE_MASK,
+    MTP_CAPTURE_INPUT_IDS,
     DeepSeekV4MTPAuxiliary,
     DeepSeekV4MTPAuxiliaryShell,
     DeepSeekV4MTPPrefixRuntime,
@@ -26,18 +31,13 @@ from gptqmodel.models.definitions.deepseek_v4 import (
     DeepSeekV4MTPTargetTapEvent,
     DeepSeekV4QModel,
     DeepSeekV4TargetAnchorResolver,
-    MTP_CAPTURE_ATTENTION_MASK,
-    MTP_CAPTURE_DECODE_MASK,
-    MTP_CAPTURE_INPUT_IDS,
-    expected_deepseek_v4_mtp_checkpoint_keys,
     deepseek_v4_mtp_source_projection_prefix,
+    expected_deepseek_v4_mtp_checkpoint_keys,
     patch_deepseek_v4_router_precision,
     validate_deepseek_v4_mtp_checkpoint_keys,
 )
+from gptqmodel.nn_modules.hooked_linear import HookedLinear
 from gptqmodel.quantization.config import AutoModuleDecoderConfig, EXL3Config
-from gptqmodel.looper.exllamav3_processor import EXL3Processor
-from gptqmodel.looper.named_module import NamedModule
-from gptqmodel.looper.stage_inputs_capture import StageInputsCapture
 from gptqmodel.utils.exl3_capture_frontier import (
     EXL3CaptureFrontierStore,
     EXL3CaptureState,
@@ -202,6 +202,7 @@ def test_deepseek_v4_target_input_capture_keeps_first_layer_lazy() -> None:
 def test_deepseek_v4_pre_quantize_keeps_packed_target_layer_lazy(monkeypatch) -> None:
     first = nn.Linear(2, 2, device="meta")
     harness = object.__new__(DeepSeekV4QModel)
+    nn.Module.__init__(harness)
     harness.model = SimpleNamespace(
         model=SimpleNamespace(layers=nn.ModuleList([first]))
     )
@@ -442,7 +443,7 @@ def test_deepseek_v4_mtp_auxiliary_opens_without_target_shell(
     config = _tiny_v4_config()
     expected_keys = expected_deepseek_v4_mtp_checkpoint_keys(config)
     fake_turtle = SimpleNamespace(
-        _weight_map={name: "model.safetensors" for name in expected_keys}
+        _weight_map=dict.fromkeys(expected_keys, "model.safetensors")
     )
     captured = {}
 

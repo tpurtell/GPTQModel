@@ -8,8 +8,8 @@ import subprocess
 import sys
 import threading
 import time
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -260,6 +260,7 @@ def test_torch_ops_jit_extension_resolves_angle_bracket_local_includes(tmp_path)
 
 
 def test_swordfish_static_runtime_error_rejects_older_torch(monkeypatch):
+    monkeypatch.setattr(swordfish, "IS_ROCM", False)
     monkeypatch.setattr(swordfish.torch, "__version__", "2.9.1+cpu")
 
     error = swordfish._swordfish_static_runtime_error()
@@ -268,6 +269,7 @@ def test_swordfish_static_runtime_error_rejects_older_torch(monkeypatch):
 
 
 def test_swordfish_static_runtime_error_rejects_unparseable_torch(monkeypatch):
+    monkeypatch.setattr(swordfish, "IS_ROCM", False)
     monkeypatch.setattr(swordfish.torch, "__version__", "nightly")
 
     error = swordfish._swordfish_static_runtime_error()
@@ -293,6 +295,7 @@ def test_default_jit_cflags_allow_noopt(monkeypatch):
 def test_default_jit_cuda_cflags_respect_o2_override(monkeypatch):
     """Guard the global override so kernels can be forced onto one explicit optimization level."""
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     monkeypatch.setenv("GPTQMODEL_NVCC_COMPILE_LEVEL", "O2")
 
     flags = cpp_module.default_jit_cuda_cflags(
@@ -310,6 +313,7 @@ def test_default_jit_cuda_cflags_respect_o2_override(monkeypatch):
 def test_default_jit_cuda_cflags_respect_noopt_override(monkeypatch):
     """Guard the noopt override so users can disable every emitted `-O*` flag when needed."""
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     monkeypatch.setenv("GPTQMODEL_NVCC_COMPILE_LEVEL", "NONE")
 
     flags = cpp_module.default_jit_cuda_cflags(
@@ -326,6 +330,7 @@ def test_default_jit_cuda_cflags_respect_noopt_override(monkeypatch):
 def test_default_jit_cuda_cflags_allow_quiet_ptxas(monkeypatch):
     """Guard per-kernel PTXAS verbosity overrides so AWQ can suppress giant compile logs."""
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     monkeypatch.delenv("GPTQMODEL_NVCC_COMPILE_LEVEL", raising=False)
 
     flags = cpp_module.default_jit_cuda_cflags(
@@ -336,9 +341,46 @@ def test_default_jit_cuda_cflags_allow_quiet_ptxas(monkeypatch):
     assert flags[flags.index("-Xptxas") + 1] == "-O3,-dlcm=ca"
 
 
+def test_default_jit_cuda_cflags_use_hipcc_flags_on_rocm(monkeypatch):
+    monkeypatch.setattr(cpp_module, "IS_ROCM", True)
+    flags = cpp_module.default_jit_cuda_cflags(
+        include_lineinfo=True,
+        include_nvcc_threads=True,
+        include_ptxas_optimizations=True,
+        include_fatbin_compression=True,
+    )
+
+    assert "-O3" in flags
+    assert "-gline-tables-only" in flags
+    assert not any(flag.startswith(("--", "-Xptxas", "-lineinfo")) for flag in flags)
+    assert cpp_module.jit_disable_fma_contraction_flag() == "-ffp-contract=off"
+
+
+def test_rocm_sdk_devel_paths_are_compiler_and_linker_flags(monkeypatch, tmp_path):
+    from torch.utils import cpp_extension
+
+    core = tmp_path / "_rocm_sdk_core"
+    include = tmp_path / "_rocm_sdk_devel" / "include"
+    lib = tmp_path / "_rocm_sdk_devel" / "lib"
+    (include / "thrust").mkdir(parents=True)
+    lib.mkdir(parents=True)
+    (include / "thrust" / "complex.h").touch()
+    (lib / "libamdhip64.so").touch()
+    monkeypatch.setattr(cpp_extension, "ROCM_HOME", str(core))
+    monkeypatch.setattr(cpp_module, "IS_ROCM", True)
+
+    loader = _make_loader(
+        tmp_path, requires_cuda=True, extra_cflags=["-O2"], extra_ldflags=["-lm"]
+    )
+    assert loader._resolved_extra_cflags() == ["-O2", f"-I{include}"]
+    assert loader._resolved_extra_ldflags() == ["-lm", f"-L{lib}"]
+    assert str(include) not in loader._resolved_extra_include_paths()
+
+
 def test_detected_cuda_wheel_include_paths_discovers_merged_and_split_layouts(monkeypatch, tmp_path):
     """Guard CUDA wheel header discovery so JIT kernels can see NVIDIA pip headers."""
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     nvidia_root = tmp_path / "site-packages" / "nvidia"
     (nvidia_root / "cu13" / "include").mkdir(parents=True)
     (nvidia_root / "cusparse" / "include").mkdir(parents=True)
@@ -375,6 +417,7 @@ def test_cuda_include_paths_with_fallback_use_wheel_headers_when_local_cuda_is_i
     wheel_cuda_include.mkdir()
     (wheel_cuda_include / "cusparse.h").write_text("// stub", encoding="utf-8")
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     monkeypatch.setattr(cpp_module, "detected_local_cuda_include_paths", lambda: [str(local_cuda_include)])
     monkeypatch.setattr(cpp_module, "detected_cuda_wheel_include_paths", lambda: [str(wheel_cuda_include)])
 
@@ -384,6 +427,45 @@ def test_cuda_include_paths_with_fallback_use_wheel_headers_when_local_cuda_is_i
     )
 
     assert include_paths == ["/tmp/extension", str(wheel_cuda_include)]
+
+
+def test_cuda_include_paths_with_fallback_never_adds_nvidia_headers_on_rocm(monkeypatch, tmp_path):
+    """Guard hipcc builds so NVIDIA wheel headers cannot be mixed into a ROCm compile.
+
+    A ROCm host can still have the `nvidia` namespace package installed. Adding
+    its `vector_types.h`/`cuda_runtime.h` to a hipcc command line collides with
+    HIP's vector type aliases (`uint1`, `int2`, ...) and fails the build.
+    """
+
+    local_cuda_include = tmp_path / "local_cuda_include"
+    local_cuda_include.mkdir()
+    wheel_cuda_include = tmp_path / "wheel_cuda_include"
+    wheel_cuda_include.mkdir()
+    (wheel_cuda_include / "cusparse.h").write_text("// stub", encoding="utf-8")
+
+    monkeypatch.setattr(cpp_module, "IS_ROCM", True)
+    monkeypatch.setattr(cpp_module, "detected_local_cuda_include_paths", lambda: [str(local_cuda_include)])
+    monkeypatch.setattr(cpp_module, "detected_cuda_wheel_include_paths", lambda: [str(wheel_cuda_include)])
+
+    include_paths = cpp_module.cuda_include_paths_with_fallback(
+        ["/tmp/extension"],
+        required_header_names=("cusparse.h",),
+    )
+
+    assert include_paths == ["/tmp/extension"]
+
+
+def test_detected_cuda_wheel_include_paths_returns_nothing_on_rocm(monkeypatch, tmp_path):
+    """Guard the NVIDIA wheel header probe itself so ROCm never reports CUDA headers."""
+
+    nvidia_root = tmp_path / "site-packages" / "nvidia"
+    (nvidia_root / "cu13" / "include").mkdir(parents=True)
+
+    fake_nvidia = type("FakeNvidia", (), {"__path__": [str(nvidia_root)]})()
+    monkeypatch.setitem(sys.modules, "nvidia", fake_nvidia)
+    monkeypatch.setattr(cpp_module, "IS_ROCM", True)
+
+    assert cpp_module.detected_cuda_wheel_include_paths() == []
 
 
 def test_cuda_include_paths_with_fallback_skip_wheel_headers_when_local_cuda_has_required_headers(
@@ -701,6 +783,7 @@ def test_torch_ops_jit_extension_global_kernel_rebuild_clears_cache(monkeypatch,
 def test_torch_ops_jit_extension_emits_spinner_logs_around_compile(monkeypatch, tmp_path):
     """Guard compile UX so users get explicit progress feedback before and after JIT build stalls."""
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     loader = _make_loader(
         tmp_path,
         extra_cflags=["-O3"],
@@ -742,6 +825,7 @@ def test_torch_ops_jit_extension_emits_spinner_logs_around_compile(monkeypatch, 
 def test_torch_ops_jit_extension_appends_detected_cuda_include_paths(monkeypatch, tmp_path):
     """Guard CUDA JIT kwargs so detected NVIDIA wheel headers reach the compiler."""
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     loader = _make_loader(
         tmp_path,
         requires_cuda=True,
@@ -889,6 +973,7 @@ def test_torch_ops_jit_extension_skips_cuda_wheel_include_paths_when_local_heade
     compile_calls = []
     runtime = type("RuntimeNamespace", (), {"kernel": object()})()
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     monkeypatch.setattr(loader, "_ops_available", lambda: state["ready"])
     monkeypatch.setattr(cpp_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(cpp_module, "detected_local_cuda_include_paths", lambda: ["/usr/local/cuda/include"])
@@ -1086,6 +1171,7 @@ def test_torch_ops_jit_extension_cuda_fingerprint_tracks_detected_include_paths(
 
     loader = _make_loader(tmp_path, requires_cuda=True)
 
+    monkeypatch.setattr(cpp_module, "IS_ROCM", False)
     monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0")
     monkeypatch.setattr(cpp_module, "detected_local_cuda_include_paths", lambda: [])
     monkeypatch.setattr(cpp_module, "detected_cuda_wheel_include_paths", lambda: ["/tmp/nvidia/cu13/include"])
@@ -1296,3 +1382,65 @@ def test_torch_ops_jit_extension_build_lock_wait_is_bounded(monkeypatch, tmp_pat
     finally:
         holder.kill()
         holder.wait()
+
+
+def test_torch_ops_jit_extension_reports_ninja_on_path(monkeypatch, tmp_path):
+    """A JIT failure must name the build tools it actually found."""
+
+    loader = _make_loader(tmp_path)
+    monkeypatch.setattr(cpp_module.shutil, "which", lambda name: f"/opt/tools/{name}")
+    monkeypatch.setattr(
+        cpp_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="1.11.1\n", stderr="", returncode=0),
+    )
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+
+    lines = loader._toolchain_diagnostic_lines()
+
+    assert "ninja=/opt/tools/ninja (1.11.1)" in lines
+    assert "cmake=/opt/tools/cmake (1.11.1)" in lines
+    assert not any(line.startswith("hint=") for line in lines)
+
+
+def test_torch_ops_jit_extension_hints_at_conda_env_ninja(monkeypatch, tmp_path):
+    """The reported real-world case: ninja exists in $CONDA_PREFIX/bin, not PATH."""
+
+    loader = _make_loader(tmp_path)
+    env_bin = tmp_path / "conda_env" / "bin"
+    env_bin.mkdir(parents=True)
+    (env_bin / "ninja").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(cpp_module.shutil, "which", lambda name: None)
+    monkeypatch.setenv("CONDA_PREFIX", str(tmp_path / "conda_env"))
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+
+    lines = loader._toolchain_diagnostic_lines()
+
+    assert "ninja=<not on PATH>" in lines
+    hint = next(line for line in lines if line.startswith("PATH_hint="))
+    assert str(env_bin) in hint
+    assert str(env_bin / "ninja") in hint
+    assert any("needs `ninja` on PATH" in line for line in lines)
+
+
+def test_torch_ops_jit_extension_build_failure_includes_toolchain(monkeypatch, tmp_path):
+    """The diagnostics reach `last_error_message()`, which callers show on skip/failure."""
+
+    loader = _make_loader(tmp_path)
+    logger = _FakeLogger()
+
+    monkeypatch.setattr(loader, "_ops_available", lambda: False)
+    monkeypatch.setattr(cpp_module, "setup_logger", lambda: logger)
+    monkeypatch.setattr(cpp_module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        cpp_module,
+        "load",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Ninja is required to load C++ extensions")),
+    )
+
+    assert loader.load() is False
+    message = loader.last_error_message()
+    assert "Ninja is required" in message
+    assert "ninja=<not on PATH>" in message
+    assert "needs `ninja` on PATH" in message

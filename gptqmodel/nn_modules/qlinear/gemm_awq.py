@@ -13,9 +13,11 @@ from ...adapter.adapter import Adapter, Lora
 from ...models._const import DEVICE, PLATFORM
 from ...nn_modules.qlinear import AWQuantLinear, empty_linear_output, input_rows
 from ...quantization import FORMAT, METHOD
+from ...quantization.awq.utils.packing_utils import AWQ_ORDER, pack_awq_columns
 from ...utils.awq import awq_dequantize_weights, awq_gemm_forward, awq_runtime_available, awq_runtime_error
 from ...utils.backend import BACKEND
 from ...utils.env import env_flag
+from ...utils.rocm import IS_ROCM
 
 
 # Shared runtime default: prefer accuracy first unless the user explicitly opts out.
@@ -23,6 +25,17 @@ FP32_ACCUM = env_flag("GPTQMODEL_FP32_ACCUM", default=True)
 
 def _awq_cuda_gemm_forward(input, qweight, scales, qzeros, split_k_iters, fp32_accum: bool = FP32_ACCUM):
     return awq_gemm_forward(input, qweight, scales, qzeros, split_k_iters, fp32_accum)
+
+
+def _pack_awq_columns(codes: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack AWQ code columns with the classic shift/OR order.
+
+    Thin wrapper over the shared :func:`pack_awq_columns` helper that applies
+    the AWQ ``[0, 2, 4, 6, 1, 3, 5, 7]`` interleave. Each code is masked
+    before shifting to keep sign or excess bits out of adjacent fields.
+    """
+
+    return pack_awq_columns(codes, bits, order=AWQ_ORDER)
 
 
 class AwqGemmFn(torch.autograd.Function):
@@ -42,9 +55,12 @@ class AwqGemmFn(torch.autograd.Function):
     ):
         # Input and bias values are not needed for the input-gradient backward;
         # retain only input metadata and the quantized weight tensors.
+        qweight, qzeros, scales = qweight.contiguous(), qzeros.contiguous(), scales.contiguous()
         ctx.save_for_backward(qweight, qzeros, scales)
         ctx.input_shape = tuple(x.shape)
         ctx.out_features = out_features
+        ctx.bias_shape = None if bias is None else bias.shape
+        ctx.bias_dtype = None if bias is None else bias.dtype
 
         out_shape = x.shape[:-1] + (out_features,)
         rows = input_rows(x)
@@ -80,10 +96,14 @@ class AwqGemmFn(torch.autograd.Function):
         qweight, qzeros, scales = ctx.saved_tensors
 
         grad_input = None
+        grad_bias = None
+        if len(ctx.needs_input_grad) > 6 and ctx.needs_input_grad[6]:
+            grad_bias = grad_output.float().sum_to_size(ctx.bias_shape).to(ctx.bias_dtype)
         if ctx.needs_input_grad[0]:
             if ctx.input_rows == 0:
                 grad_input = grad_output.new_empty(ctx.input_shape)
-                return grad_input, None, None, None, None, None, None, None, None, None
+                gradients = (grad_input, None, None, None, None, None, grad_bias, None, None, None)
+                return gradients[:len(ctx.needs_input_grad)]
             weights = awq_dequantize_weights(
                 qweight, scales, qzeros, 1, 0, 0, False
             ).to(grad_output.dtype)
@@ -92,7 +112,8 @@ class AwqGemmFn(torch.autograd.Function):
             grad_input = torch.matmul(grad_output_2d, weights.transpose(-1, -2))
             grad_input = grad_input.reshape(ctx.input_shape)
 
-        return grad_input, None, None, None, None, None, None, None, None, None
+        gradients = (grad_input, None, None, None, None, None, grad_bias, None, None, None)
+        return gradients[:len(ctx.needs_input_grad)]
 
 
 class AwqGEMMLinear(AWQuantLinear):
@@ -100,16 +121,16 @@ class AwqGEMMLinear(AWQuantLinear):
     SUPPORTS_METHODS = [METHOD.AWQ]
     SUPPORTS_FORMATS = {FORMAT.GEMM: 60}
     SUPPORTS_BITS = [4]
-    SUPPORTS_GROUP_SIZE = [-1, 16, 32, 64, 128]
+    SUPPORTS_GROUP_SIZE = [-1, 32, 64, 128]
     SUPPORTS_DESC_ACT = [True, False]
     SUPPORTS_SYM = [True, False]
     SUPPORTS_SHARDS = True
     SUPPORTS_TRAINING = True
     SUPPORTS_AUTO_PADDING = False
     SUPPORTS_IN_FEATURES_DIVISIBLE_BY = [1]
-    SUPPORTS_OUT_FEATURES_DIVISIBLE_BY = [1]
+    SUPPORTS_OUT_FEATURES_DIVISIBLE_BY = [64]
 
-    SUPPORTS_DEVICES = [DEVICE.CUDA, DEVICE.ROCM]
+    SUPPORTS_DEVICES = [DEVICE.CUDA]
     SUPPORTS_PLATFORM = [PLATFORM.ALL]
     SUPPORTS_PACK_DTYPES = [torch.int32]
     SUPPORTS_ADAPTERS = [Lora]
@@ -123,10 +144,46 @@ class AwqGEMMLinear(AWQuantLinear):
 
     @classmethod
     def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
+        if IS_ROCM:
+            # The native AWQ GEMM extension is CUDA-only (cusparse.h + CUDA
+            # inline asm), so it never builds on ROCm. Fail fast with an
+            # actionable message instead of attempting a doomed JIT build.
+            return False, NotImplementedError(
+                "AwqGEMMLinear requires the native CUDA AWQ extension, which is not "
+                "available on ROCm. Use the portable AWQ GEMM kernel instead "
+                "(`backend=AUTO` or `BACKEND.AWQ_TORCH`)."
+            )
         if not awq_runtime_available():
             return False, ValueError(awq_runtime_error() or "CUDA AWQ extension not available; cannot select AwqGEMMLinear")
         else:
             return True, None
+
+    @classmethod
+    def _validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
+        ok, err = super()._validate(**args)
+        if not ok:
+            return ok, err
+
+        group_size = args.get("group_size")
+        in_features = args.get("in_features")
+        out_features = args.get("out_features")
+        effective_group_size = (
+            in_features if group_size == -1 and in_features is not None else group_size
+        )
+        if (
+            effective_group_size is not None
+            and out_features is not None
+            and (
+                effective_group_size % 32
+                or out_features % effective_group_size
+            )
+        ):
+            return False, NotImplementedError(
+                "AWQ GEMM requires a group size divisible by 32 and "
+                "out_features divisible by that group size: "
+                f"got out_features={out_features}, group_size={effective_group_size}"
+            )
+        return True, None
 
     def __init__(
         self,
@@ -160,7 +217,7 @@ class AwqGEMMLinear(AWQuantLinear):
         self.fp32_accum = bool(fp32_accum)
 
     def _ensure_runtime_dtype(self, dtype: torch.dtype):
-        if self.scales is not None and (self.scales.dtype != dtype or not self.scales.is_contiguous()):
+        if self.scales is not None and self.scales.dtype != dtype:
             self.scales = self.scales.to(dtype=dtype).contiguous()
         if self.bias is not None and (self.bias.dtype != dtype or not self.bias.is_contiguous()):
             self.bias = self.bias.to(dtype=dtype).contiguous()
@@ -195,7 +252,12 @@ class AwqGEMMLinear(AWQuantLinear):
 
         self._ensure_runtime_dtype(compute_dtype)
 
-        ctx = nullcontext() if self.training else torch.inference_mode()
+        # Keep eval-mode autograd and in-place adapter application viable;
+        # only ordinary no-grad inference needs an inference tensor here.
+        needs_grad = torch.is_grad_enabled() and (
+            x.requires_grad or (self.bias is not None and self.bias.requires_grad)
+        )
+        ctx = nullcontext() if self.training or needs_grad or self.adapter else torch.inference_mode()
         with ctx:
             out = AwqGemmFn.apply(
                 x,
@@ -223,7 +285,7 @@ class AwqGEMMLinear(AWQuantLinear):
         assert scales is not None and zeros is not None
         scales = scales.t().contiguous()
         zeros = zeros.t().contiguous()
-        scale_zeros = zeros * scales
+        scale_zeros = zeros.float() * scales.float()
 
         scale_dtype = scales.dtype if scales.dtype in (torch.float16, torch.bfloat16) else torch.float16
         self.register_buffer("scales", scales.clone().to(scale_dtype))
@@ -233,19 +295,17 @@ class AwqGEMMLinear(AWQuantLinear):
         else:
             self.bias = None
 
-        pack_num = 32 // self.bits
+        if self.bits != 4:
+            raise NotImplementedError("Only 4-bit are supported for now.")
 
-        intweight = []
-        for idx in range(self.in_features):
-            intweight.append(
-                torch.round(
-                    (linear.weight.data[:, idx] + scale_zeros[idx // self.group_size])
-                    / self.scales[idx // self.group_size]
-                ).to(torch.int)[:, None]
-            )
-        intweight = torch.cat(intweight, dim=1)
-        intweight = intweight.t().contiguous()
-        intweight = intweight.to(dtype=torch.int32)
+        # Gather each input column's group scale/zero in a single pass instead
+        # of launching one tiny kernel per input column.
+        weight = linear.weight.data
+        group_index = torch.arange(self.in_features, device=weight.device) // self.group_size
+        intweight = torch.round(
+            (weight.t().float() + scale_zeros.index_select(0, group_index))
+            / self.scales.index_select(0, group_index).float()
+        ).clamp_(0, (1 << self.bits) - 1).to(torch.int32).contiguous()
 
         best_device = str(linear.weight.device)
 
@@ -253,42 +313,14 @@ class AwqGEMMLinear(AWQuantLinear):
         if "mps" in best_device:
             intweight = intweight.to("cpu")
 
-        qweight = torch.zeros(
-            (intweight.shape[0], intweight.shape[1] // 32 * self.bits),
-            dtype=torch.int32,
-            device=intweight.device,
-        )
-
-        for col in range(intweight.shape[1] // pack_num):
-            if self.bits == 4:
-                order_map = [0, 2, 4, 6, 1, 3, 5, 7]
-            else:
-                raise NotImplementedError("Only 4-bit are supported for now.")
-            for i in range(pack_num):
-                qweight_col = intweight[:, col * pack_num + order_map[i]]
-                qweight[:, col] |= qweight_col << (i * self.bits)
-        self.register_buffer("qweight", qweight)
+        self.register_buffer("qweight", _pack_awq_columns(intweight, self.bits))
 
         zeros = zeros.to(dtype=torch.int32, device=best_device)
 
         if "mps" in best_device:
             zeros = zeros.to("cpu")
 
-        qzeros = torch.zeros(
-            (zeros.shape[0], zeros.shape[1] // 32 * self.bits),
-            dtype=torch.int32,
-            device=zeros.device,
-        )
-
-        for col in range(zeros.shape[1] // pack_num):
-            if self.bits == 4:
-                order_map = [0, 2, 4, 6, 1, 3, 5, 7]
-            else:
-                raise NotImplementedError("Only 4-bit are supported for now.")
-            for i in range(pack_num):
-                qzero_col = zeros[:, col * pack_num + order_map[i]]
-                qzeros[:, col] |= qzero_col << (i * self.bits)
-        self.register_buffer("qzeros", qzeros)
+        self.register_buffer("qzeros", _pack_awq_columns(zeros, self.bits))
 
 
 

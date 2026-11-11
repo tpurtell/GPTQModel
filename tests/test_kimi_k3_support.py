@@ -9,9 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional as F
-from safetensors.torch import save_file
 
 from gptqmodel.models import auto
 from gptqmodel.models.definitions.kimi_k3 import KimiK3QModel, KimiLinearQModel
@@ -131,7 +131,7 @@ def test_source_reads_dense_and_packed_tensors_without_loading_other_weights(uti
         "model_type": "kimi_k3", "text_config": {"num_hidden_layers": 2},
     }))
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
-        "weight_map": {name: "model.safetensors" for name in names},
+        "weight_map": dict.fromkeys(names, "model.safetensors"),
     }))
     monkeypatch.setattr(utils, "load_calibration_reference", lambda _: SimpleNamespace())
     source = utils.KimiK3Source(tmp_path)

@@ -141,6 +141,7 @@ def _sync_local_remote_code_cache(model_id_or_path: Optional[str]) -> None:
     try:
         from transformers.dynamic_module_utils import HF_MODULES_CACHE, _sanitize_module_name
     except Exception:
+        log.debug("remote-code cache probe skipped: transformers.dynamic_module_utils unavailable", exc_info=True)
         return
 
     repo_name = os.path.basename(os.path.normpath(model_id_or_path))
@@ -498,6 +499,7 @@ def _patch_transformers_prism_gguf_compat(*, api_name: str) -> None:
         import transformers.modeling_gguf_pytorch_utils as gguf_utils
         from transformers.utils import import_utils as hf_import_utils
     except Exception:
+        log.debug("prism GGUF compat skipped: transformers GGUF internals unavailable", exc_info=True)
         return
 
     with _MONKEY_PATCH_LOCK:
@@ -703,6 +705,7 @@ def _patch_transformers_remote_code_compat() -> None:
     try:
         from transformers.utils import import_utils
     except Exception:
+        log.debug("remote-code compat skipped: transformers.utils.import_utils unavailable", exc_info=True)
         return
 
     try:
@@ -725,6 +728,17 @@ def _patch_transformers_remote_code_compat() -> None:
     except Exception:
         rope_utils = None
 
+    try:
+        import transformers.tokenization_utils as tokenization_utils
+        from transformers.tokenization_utils_base import (
+            PaddingStrategy,
+            PreTokenizedInput,
+            TextInput,
+            TruncationStrategy,
+        )
+    except Exception:
+        tokenization_utils = None
+
     import transformers.utils.generic as generic
     with _MONKEY_PATCH_LOCK:
         if not hasattr(import_utils, "is_torch_fx_available"):
@@ -734,6 +748,19 @@ def _patch_transformers_remote_code_compat() -> None:
                 return hasattr(torch, "fx")
 
             import_utils.is_torch_fx_available = is_torch_fx_available
+
+        if tokenization_utils is not None:
+            # transformers 5.x moved these typing/enum helpers to
+            # `tokenization_utils_base`, but older remote processors still import
+            # them from `tokenization_utils`.
+            for name, value in (
+                ("PaddingStrategy", PaddingStrategy),
+                ("PreTokenizedInput", PreTokenizedInput),
+                ("TextInput", TextInput),
+                ("TruncationStrategy", TruncationStrategy),
+            ):
+                if not hasattr(tokenization_utils, name):
+                    setattr(tokenization_utils, name, value)
 
         if utils is not None and not hasattr(utils, "is_flash_attn_greater_or_equal_2_10"):
             legacy_flash_attn_probe = getattr(utils, "is_flash_attn_greater_or_equal", None)
@@ -1108,6 +1135,9 @@ def _is_deepseek_vl_v2_model_path(model_id_or_path: Optional[str]) -> bool:
         with open(config_path, encoding="utf-8") as f:
             config = json.load(f)
     except Exception:
+        # A broken local config.json is not "this is some other model"; record it
+        # so a failed DeepSeek-VL2 pre-config patch is diagnosable.
+        log.debug("DeepSeek-VL2 probe could not read %s", config_path, exc_info=True)
         return False
 
     return str(config.get("model_type", "")).lower() == "deepseek_vl_v2"
@@ -1124,6 +1154,7 @@ def patch_remote_code_before_config_load(model_id_or_path: Optional[str]) -> Non
         import transformers.modeling_utils as modeling_utils
         from transformers.utils import is_flash_attn_2_available
     except Exception:
+        log.debug("DeepSeek-VL2 pre-config patch skipped: transformers modeling utils unavailable", exc_info=True)
         return
 
     try:
@@ -1280,6 +1311,38 @@ def _is_glm5_next_nope_config(config: Any) -> bool:
     )
 
 
+def _rope_parameter_type_labels(config: Any) -> tuple:
+    """Layer/rope-type labels this config declares, in transformers' order."""
+    return (
+        getattr(config, "_rope_type_labels", None)
+        or getattr(config, "layer_types", None)
+        or ()
+    )
+
+
+def _rope_parameters_are_per_layer(config: Any, rope_parameters: Any) -> bool:
+    """True when ``rope_parameters`` is already nested per layer/rope type.
+
+    Must agree with Transformers' own resolution: ``RotaryEmbeddingConfigMixin``
+    reads ``_rope_type_labels`` before ``layer_types``
+    (``nested_rope_parameter_keys``). Keying only on ``layer_types`` misses
+    configs such as DeepSeek V4, whose ``rope_parameters`` are keyed by
+    ``("main", "compress")`` while ``layer_types`` names something else entirely,
+    and would then append flat ``rope_type``/``rope_theta`` scalars next to the
+    nested dictionaries.
+    """
+    if not isinstance(rope_parameters, dict) or not rope_parameters:
+        return False
+    labels = _rope_parameter_type_labels(config)
+    nested_keys = [key for key in rope_parameters if key in labels]
+    if not nested_keys:
+        return False
+    return all(
+        rope_parameters[key] is None or isinstance(rope_parameters[key], dict)
+        for key in nested_keys
+    )
+
+
 def _normalize_rope_parameters_config_compat(config: Any) -> None:
     # HunYuanVL is a composite config: RoPE belongs exclusively to its text
     # sub-config. Adding a synthetic top-level rope_parameters value is not
@@ -1316,14 +1379,7 @@ def _normalize_rope_parameters_config_compat(config: Any) -> None:
             return
 
     rope_parameters = getattr(config, "rope_parameters", None)
-    layer_types = getattr(config, "layer_types", None)
-    if (
-        isinstance(rope_parameters, dict)
-        and rope_parameters
-        and layer_types
-        and set(rope_parameters).issubset(set(layer_types))
-        and all(value is None or isinstance(value, dict) for value in rope_parameters.values())
-    ):
+    if _rope_parameters_are_per_layer(config, rope_parameters):
         # Hybrid attention configs (including Dots3) already hold one RoPE
         # dictionary per layer type. Flat legacy defaults would introduce
         # scalar entries that Transformers' per-type validator cannot read.
@@ -1389,7 +1445,7 @@ def _normalize_remote_code_config_compat(config: Any) -> None:
     model_type = getattr(config, "model_type", None)
     model_type_lower = model_type.lower() if isinstance(model_type, str) else None
 
-    if model_type_lower == "unlimited-ocr":
+    if model_type_lower in {"unlimited_ocr", "unlimited-ocr"}:
         # transformers 5 synthesizes an initializer for the remote empty
         # UnlimitedOCRConfig subclass and omits defaults declared by its
         # DeepseekV2Config parent. Restore only missing fields so serialized
@@ -1595,6 +1651,123 @@ def register_runtime_automodel_config(config, remote_module, config_attr: str, r
         )
 
 
+class _TimmVersionCompatProxy:
+    """Report a timm 0.9.x version while forwarding to the installed timm module.
+
+    Prismatic-based remote code (OpenVLA) hard-fails on `timm >= 1.0` even
+    though the `timm.create_model` / `get_intermediate_layers` APIs it relies
+    on still exist. The proxy only replaces the remote module's own `timm`
+    reference, so global timm metadata stays untouched.
+    """
+
+    __version__ = "0.9.16"
+
+    def __init__(self, module: Any) -> None:
+        object.__setattr__(self, "_module", module)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_module"), name)
+
+
+def _patch_prismatic_remote_code(remote_module: Any) -> None:
+    """Patch Prismatic/OpenVLA remote code for the installed timm version."""
+    timm = getattr(remote_module, "timm", None)
+    prismatic_cls = getattr(remote_module, "PrismaticForConditionalGeneration", None)
+
+    if (
+        timm is not None
+        and prismatic_cls is not None
+        and not isinstance(timm, _TimmVersionCompatProxy)
+        and not getattr(prismatic_cls, "_gptqmodel_timm_version_compat", False)
+    ):
+        remote_module.timm = _TimmVersionCompatProxy(timm)
+        prismatic_cls._gptqmodel_timm_version_compat = True
+
+    vision_backbone_cls = getattr(remote_module, "PrismaticVisionBackbone", None)
+    if vision_backbone_cls is not None and not getattr(
+        vision_backbone_cls, "_gptqmodel_timm_intermediate_layers_compat", False
+    ):
+        original_init = vision_backbone_cls.__init__
+
+        def vision_backbone_init_compat(self, *args, _original_init=original_init, **kwargs):
+            _original_init(self, *args, **kwargs)
+            for name in ("featurizer", "fused_featurizer"):
+                featurizer = getattr(self, name, None)
+                if featurizer is None:
+                    continue
+                original_forward = featurizer.forward
+
+                def forward(*fargs, _original_forward=original_forward, **fkwargs):
+                    # timm >= 1.0 returns a list even for a single requested layer,
+                    # while the remote `unpack_tuple()` helper only unwraps tuples.
+                    result = _original_forward(*fargs, **fkwargs)
+                    if isinstance(result, list) and len(result) == 1:
+                        return result[0]
+                    return result
+
+                featurizer.forward = forward
+
+        vision_backbone_cls.__init__ = vision_backbone_init_compat
+        vision_backbone_cls._gptqmodel_timm_intermediate_layers_compat = True
+
+
+def _bridge_legacy_vision2seq_remote_code(model_cls: Any, config: Any) -> Optional[type]:
+    """Bridge legacy `AutoModelForVision2Seq` remote classes onto transformers 5.x.
+
+    OpenVLA/Prismatic checkpoints declare their model under the
+    `AutoModelForVision2Seq` auto-map key, which transformers removed in 5.x.
+    Register the remote class with `AutoModelForImageTextToText` and restore the
+    generation API plus constructor assumptions that the legacy code expects.
+    """
+    if not isinstance(model_cls, type):
+        return None
+
+    with _MONKEY_PATCH_LOCK:
+        if not getattr(model_cls, "_gptqmodel_sdpa_flag_patch", False):
+            # The legacy `_supports_sdpa` property dereferences
+            # `self.language_model`, but transformers 5.x reads the flag inside
+            # `PreTrainedModel.__init__` before that attribute exists.
+            model_cls._supports_sdpa = property(
+                lambda self: getattr(getattr(self, "language_model", None), "_supports_sdpa", True)
+            )
+            model_cls._gptqmodel_sdpa_flag_patch = True
+
+        remote_module = sys.modules.get(model_cls.__module__)
+        if remote_module is not None:
+            _patch_prismatic_remote_code(remote_module)
+
+        bridged_cls = getattr(model_cls, "_gptqmodel_bridged_vision2seq_cls", None)
+        if bridged_cls is None:
+            from transformers.generation.utils import GenerationMixin
+
+            if not issubclass(model_cls, GenerationMixin):
+                # transformers 5.x dropped the implicit `GenerationMixin` base from
+                # `PreTrainedModel`, but `OpenVLAForActionPrediction.predict_action()`
+                # still calls `.generate()`.
+                bridged_cls = type(
+                    model_cls.__name__,
+                    (model_cls, GenerationMixin),
+                    {"__module__": model_cls.__module__, "__qualname__": model_cls.__qualname__},
+                )
+            else:
+                bridged_cls = model_cls
+            model_cls._gptqmodel_bridged_vision2seq_cls = bridged_cls
+        model_cls = bridged_cls
+
+        from transformers import AutoModelForImageTextToText
+
+        try:
+            AutoModelForImageTextToText.register(type(config), model_cls, exist_ok=True)
+        except Exception as exc:
+            log.debug(
+                "HF: failed to register legacy vision2seq remote class `%s`: %s",
+                getattr(model_cls, "__name__", "unknown"),
+                exc,
+            )
+
+        return model_cls
+
+
 def prepare_remote_model_init_compat(model_id_or_path: Optional[str], config: Any) -> None:
     if not model_id_or_path:
         return
@@ -1606,6 +1779,12 @@ def prepare_remote_model_init_compat(model_id_or_path: Optional[str], config: An
     class_ref = auto_map.get("AutoModelForCausalLM")
     if not isinstance(class_ref, str) and getattr(config, "model_type", None) == "locateanything":
         class_ref = auto_map.get("AutoModel")
+    legacy_vision2seq = False
+    if not isinstance(class_ref, str):
+        # OpenVLA/Prismatic checkpoints predate the transformers 5.x rename of
+        # `AutoModelForVision2Seq` to `AutoModelForImageTextToText`.
+        class_ref = auto_map.get("AutoModelForVision2Seq")
+        legacy_vision2seq = isinstance(class_ref, str)
     if not isinstance(class_ref, str):
         return
 
@@ -1616,6 +1795,11 @@ def prepare_remote_model_init_compat(model_id_or_path: Optional[str], config: An
     except Exception as exc:
         log.debug("HF: remote model init compat pre-import failed for `%s`: %s", model_id_or_path, exc)
         return
+
+    if legacy_vision2seq:
+        model_cls = _bridge_legacy_vision2seq_remote_code(model_cls, config)
+        if model_cls is None:
+            return
 
     module_root = model_cls.__module__.rsplit(".", maxsplit=1)[0]
     speech_module = sys.modules.get(f"{module_root}.speech_conformer_encoder")
@@ -1899,7 +2083,7 @@ def prepare_remote_model_init_compat(model_id_or_path: Optional[str], config: An
             import peft.import_utils as peft_import_utils
             import peft.tuners.lora.awq as peft_awq
         except Exception:
-            pass
+            log.debug("PEFT AWQ probe patch skipped: peft AWQ internals unavailable", exc_info=True)
         else:
             if not getattr(peft_awq, "_gptqmodel_awq_probe_patch", False):
                 # PEFT later imports `awq.modules.linear`, so the availability
@@ -2058,15 +2242,20 @@ def _sanitize_generation_config(cfg: GenerationConfig, *, drop_sampling_fields: 
 
 def _load_sanitized_generation_config(path: str) -> Optional[GenerationConfig]:
     try:
-        config_dict, kwargs = GenerationConfig.get_config_dict(path)
+        # transformers >= 5 exposes generation configs through from_pretrained
+        # only; the old `get_config_dict` helper no longer exists. Calling it
+        # raised AttributeError on every model, so this branch was dead and the
+        # caller always fell back to a defaults-only config.
+        #
+        # `do_sample=True` is passed here rather than forced afterwards: the
+        # loader validates sampling fields (temperature/top_p/top_k) against the
+        # file's own `do_sample`, so a `do_sample: false` config would warn that
+        # those flags "are not valid and may be ignored" before we flip the bit.
+        cfg = GenerationConfig.from_pretrained(pretrained_model_name=path, do_sample=True)
     except Exception:
+        log.debug("generation config %s could not be loaded; falling back to defaults", path, exc_info=True)
         return None
 
-    cleaned = dict(config_dict)
-    if cleaned.get("do_sample") is not True:
-        cleaned["do_sample"] = True
-
-    cfg = GenerationConfig.from_dict(cleaned, **kwargs)
     _sanitize_generation_config(cfg, drop_sampling_fields=False)
     return cfg
 

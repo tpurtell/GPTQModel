@@ -9,21 +9,21 @@ from safetensors.torch import save_file
 from torch import nn
 
 from gptqmodel.nn_modules.exllamav3 import ExllamaV3Linear
-from gptqmodel.utils import kimi_k3_core_format as core
 from gptqmodel.utils import kimi_k3
+from gptqmodel.utils import kimi_k3_core_format as core
 
 
 def packed(outputs=640, inputs=128, bits=6, logical_outputs=576):
     scales = torch.ones(outputs, dtype=torch.float16)
     scales[logical_outputs:] = 0
-    return dict(trellis=torch.zeros((inputs // 16, outputs // 16, bits * 16), dtype=torch.int16),
-                suh=torch.ones(inputs, dtype=torch.float16), svh=scales,
-                mcg=torch.tensor(0xCBAC1FED, dtype=torch.uint32).view(torch.int32))
+    return {"trellis": torch.zeros((inputs // 16, outputs // 16, bits * 16), dtype=torch.int16),
+                "suh": torch.ones(inputs, dtype=torch.float16), "svh": scales,
+                "mcg": torch.tensor(0xCBAC1FED, dtype=torch.uint32).view(torch.int32)}
 
 
 def test_padded_geometry_keeps_ordinary_exl3_storage():
     evidence = core.validate_core_tensors(packed(), (576, 128))
-    assert evidence == dict(native_shape=[576, 128], stored_shape=[640, 128], bits=6, output_padding=64)
+    assert evidence == {"native_shape": [576, 128], "stored_shape": [640, 128], "bits": 6, "output_padding": 64}
 
 
 @pytest.mark.parametrize("mutation", [
@@ -55,18 +55,18 @@ def test_reconstruct_crops_after_full_inverse_transform(monkeypatch):
 
 
 def valid_metrics(count):
-    return dict(quantizer_path='hessian_ldlq', hessian_metric_status='ok',
-                hessian_numerical_contract=core._HESSIAN_CONTRACT,
-                hessian_transform_compute_dtype='torch.float64', hessian_storage_dtype='torch.float32',
-                hessian_sample_count=count, reported_metric_value=.001,
-                hessian_weighted_error_numerator=1., hessian_weighted_reference_denominator=1000.,
-                hessian_weighted_relative_error=.001)
+    return {"quantizer_path": 'hessian_ldlq', "hessian_metric_status": 'ok',
+                "hessian_numerical_contract": core._HESSIAN_CONTRACT,
+                "hessian_transform_compute_dtype": 'torch.float64', "hessian_storage_dtype": 'torch.float32',
+                "hessian_sample_count": count, "reported_metric_value": .001,
+                "hessian_weighted_error_numerator": 1., "hessian_weighted_reference_denominator": 1000.,
+                "hessian_weighted_relative_error": .001}
 
 
 def test_quantizer_zero_pads_and_does_not_mutate_raw_hessian_or_weight(monkeypatch):
     weight = torch.arange(576 * 128, dtype=torch.float32).reshape(576, 128) / 1024
     original = weight.clone()
-    raw = dict(H=torch.eye(128), count=1201086, finalized=False)
+    raw = {"H": torch.eye(128), "count": 1201086, "finalized": False}
     calls = []
     def quantize(w, h, args, *, return_weight_q):
         torch.testing.assert_close(w[:, :576], original.T, rtol=0, atol=0)
@@ -105,7 +105,7 @@ def test_core_quantizer_fails_closed_on_uncalibrated_metrics(monkeypatch, bad_me
         return None, .001, packed()
     monkeypatch.setattr(core, '_quantizer', lambda: SimpleNamespace(quantize_exl3=quantize))
     with pytest.raises(ValueError):
-        core.quantize_core_projection(torch.ones(576,128), dict(H=torch.eye(128), count=3, finalized=False), device='cpu')
+        core.quantize_core_projection(torch.ones(576,128), {"H": torch.eye(128), "count": 3, "finalized": False}, device='cpu')
 
 
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32])
@@ -139,10 +139,10 @@ def write_source(tmp_path, monkeypatch):
     prefix='language_model.model.layers.1.block_sparse_moe.experts.0.w1'
     tensors.update({prefix+'.'+k:v for k,v in packed(outputs=128,logical_outputs=128,bits=2).items()})
     save_file(tensors,tmp_path/'model.safetensors')
-    config=dict(model_type='kimi_k3',text_config=dict(num_hidden_layers=3,num_experts=1,
-                hidden_size=128,routed_expert_hidden_size=128,moe_intermediate_size=128))
+    config={"model_type": 'kimi_k3',"text_config": {"num_hidden_layers": 3,"num_experts": 1,
+                "hidden_size": 128,"routed_expert_hidden_size": 128,"moe_intermediate_size": 128}}
     (tmp_path/'config.json').write_text(json.dumps(config))
-    (tmp_path/'model.safetensors.index.json').write_text(json.dumps(dict(weight_map={k:'model.safetensors' for k in tensors})))
+    (tmp_path/'model.safetensors.index.json').write_text(json.dumps({"weight_map": dict.fromkeys(tensors, 'model.safetensors')}))
     monkeypatch.setattr(kimi_k3,'load_calibration_reference',lambda _:SimpleNamespace())
     return prefix
 
@@ -172,14 +172,16 @@ def test_lazy_source_materializes_routed_weights_only_on_request(monkeypatch):
         def from_dict(value): return SimpleNamespace()
     class Block(nn.Module):
         def __init__(self,config,layer):
-            super().__init__();self.layer_idx=layer
+            super().__init__()
+            self.layer_idx=layer
             self.self_attn=nn.Linear(128,128,bias=False)
             self.block_sparse_moe=nn.Module()
             self.block_sparse_moe.experts=nn.ModuleList([nn.Linear(128,128,bias=False)])
     source.reference=SimpleNamespace(KimiLinearConfig=Config,KimiDecoderLayer=Block)
     names=[]
     def decoded(name,device):
-        names.append(name);return torch.ones(128,128,dtype=torch.bfloat16,device=device)
+        names.append(name)
+        return torch.ones(128,128,dtype=torch.bfloat16,device=device)
     monkeypatch.setattr(source,'decoded',decoded)
     block=source.load_block(1,device='cpu')
     assert not block.self_attn.weight.is_meta and block.block_sparse_moe.experts[0].weight.is_meta
@@ -192,8 +194,9 @@ def test_lazy_source_materializes_routed_weights_only_on_request(monkeypatch):
 
 
 def test_source_reuses_only_one_reader_and_returns_owned_tensors(tmp_path, monkeypatch):
-    import safetensors
     from pathlib import Path
+
+    import safetensors
     original_open = safetensors.safe_open
     opened, active = [], set()
     class Reader:
