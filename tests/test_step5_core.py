@@ -177,8 +177,8 @@ def test_router_preserves_native_topk_and_recovers_only_unselected_experts():
     assert torch.equal(recovery,torch.tensor([[0,1],[1,3]]))
 
 
-@pytest.mark.parametrize("bits",[4,5,6])
-def test_all_pilot_bits_use_calibrated_contract_without_mutating_raw_hessian(monkeypatch,bits):
+@pytest.mark.parametrize("bits",range(1,9))
+def test_all_core_bits_use_calibrated_contract_without_mutating_raw_hessian(monkeypatch,bits):
     original=torch.eye(128,dtype=torch.float32)
     hessian={"H": original,"count": 17,"finalized": False}
     class Quantizer:

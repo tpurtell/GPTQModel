@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save, save_file
 from torch import nn
 
 from gptqmodel.nn_modules.exllamav3 import ExllamaV3Linear
@@ -63,6 +63,97 @@ def valid_metrics(count):
                 "hessian_weighted_relative_error": .001}
 
 
+@pytest.fixture(params=["kimi", "glm", "step5"])
+def projection_adapter(request):
+    if request.param == "kimi":
+        return core.quantize_core_projection, core.reconstruct_core_projection, core
+    from gptqmodel.utils import glm5_core, step5_core
+    adapter = glm5_core if request.param == "glm" else step5_core
+    return adapter.quantize_projection, adapter.reconstruct_projection, glm5_core
+
+
+def mock_core_encoder(monkeypatch, quantizer_owner):
+    calls = []
+
+    def quantize(weight, raw, args, *, return_weight_q):
+        assert not return_weight_q
+        assert args == {"K": args["K"], "seed": 787, "sigma_reg": .025,
+                       "devices": [torch.device("cpu")], "mcg": True, "apply_out_scales": None}
+        calls.append((args.copy(), weight.clone(), raw["H"].clone()))
+        args["error_metrics"] = valid_metrics(raw["count"])
+        outputs = weight.shape[1]
+        tensors = packed(outputs=outputs, inputs=weight.shape[0], bits=args["K"], logical_outputs=576)
+        tensors["trellis"].copy_(torch.arange(tensors["trellis"].numel()).reshape_as(tensors["trellis"]))
+        tensors["suh"].copy_(torch.linspace(.5, 1.5, weight.shape[0]))
+        tensors["svh"][:576].copy_(torch.linspace(.25, 1., 576))
+        return None, .001, tensors
+
+    monkeypatch.setattr(quantizer_owner, "_quantizer", lambda: SimpleNamespace(quantize_exl3=quantize))
+    return calls
+
+
+@pytest.mark.parametrize("bits", range(1, 9))
+def test_all_core_bits_reach_encoder_and_preserve_storage(monkeypatch, projection_adapter, bits):
+    encode, _, quantizer_owner = projection_adapter
+    calls = mock_core_encoder(monkeypatch, quantizer_owner)
+    tensors, _, evidence = encode(torch.ones(576, 128),
+        {"H": torch.eye(128), "count": 17, "finalized": False}, bits=bits, device="cpu")
+    assert calls[0][0]["K"] == bits
+    assert tensors["trellis"].shape == (8, 40, bits * 16)
+    assert evidence["bits"] == bits and evidence["output_padding"] == 64
+
+
+@pytest.mark.parametrize("bits", [False, True, 0, -1, 9, 6., "6", None])
+def test_core_bits_reject_invalid_values_before_encoder(monkeypatch, projection_adapter, bits):
+    encode, _, quantizer_owner = projection_adapter
+    calls = mock_core_encoder(monkeypatch, quantizer_owner)
+    with pytest.raises(ValueError, match="integer bits in 1..8"):
+        encode(torch.ones(576, 128), {"H": torch.eye(128), "count": 17, "finalized": False},
+               bits=bits, device="cpu")
+    assert not calls
+
+
+def test_default_k6_matches_explicit_k6_serialized_bytes(monkeypatch, projection_adapter):
+    encode, _, quantizer_owner = projection_adapter
+    calls = mock_core_encoder(monkeypatch, quantizer_owner)
+    weight = torch.arange(576 * 128, dtype=torch.float32).reshape(576, 128) / 1024
+    raw = {"H": torch.eye(128), "count": 17, "finalized": False}
+    default, default_metrics, default_evidence = encode(weight, raw, device="cpu")
+    explicit, explicit_metrics, explicit_evidence = encode(weight, raw, bits=6, device="cpu")
+    assert len(calls) == 2 and calls[0][0] == calls[1][0] and calls[0][0]["K"] == 6
+    for left, right in zip(calls[0][1:], calls[1][1:]):
+        assert torch.equal(left, right)
+    assert save(default) == save(explicit)
+    assert default_metrics == explicit_metrics and default_evidence == explicit_evidence
+
+
+def test_mocked_k8_encode_serialization_reconstruction_roundtrip(monkeypatch, tmp_path, projection_adapter):
+    encode, reconstruct, quantizer_owner = projection_adapter
+    calls = mock_core_encoder(monkeypatch, quantizer_owner)
+    tensors, _, evidence = encode(torch.ones(576, 128),
+        {"H": torch.eye(128), "count": 17, "finalized": False}, bits=8, device="cpu")
+    assert calls[0][0]["K"] == 8 and evidence["bits"] == 8
+    path = tmp_path / "core-k8.safetensors"
+    save_file(tensors, path)
+    restored = load_file(path)
+    for key, value in tensors.items():
+        assert torch.equal(value, restored[key])
+
+    def decode(serialized, *, device, dtype):
+        assert device == "cpu" and dtype == torch.float32
+        assert serialized["trellis"].shape == (8, 40, 128)
+        for key, value in tensors.items():
+            assert torch.equal(value, serialized[key])
+        # A deterministic stand-in for the CUDA decoder, not a trellis math oracle.
+        return serialized["suh"].float()[:, None] * serialized["svh"].float()[None, :]
+
+    monkeypatch.setattr(core, "_quantizer", lambda: SimpleNamespace(reconstruct_exl3_tensors=decode))
+    actual = reconstruct(restored, (576, 128), device="cpu", dtype=torch.float32)
+    expected = tensors["svh"][:576].float()[:, None] * tensors["suh"].float()[None, :]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.shape == (576, 128) and actual.is_contiguous()
+
+
 def test_quantizer_zero_pads_and_does_not_mutate_raw_hessian_or_weight(monkeypatch):
     weight = torch.arange(576 * 128, dtype=torch.float32).reshape(576, 128) / 1024
     original = weight.clone()
@@ -110,19 +201,27 @@ def test_core_quantizer_fails_closed_on_uncalibrated_metrics(monkeypatch, bad_me
 
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32])
 def test_generic_wrapper_crops_padded_output_and_preserves_input_dtype(monkeypatch, dtype):
-    # Independent Torch linear oracle. The padded inner sees all640 channels;
-    # outer cropping preserves exactly the native576 output and input dtype.
+    # The native FP16 inner returns padded rows; the wide-dtype inner owns
+    # its crop. Both paths must preserve the caller's dtype and native width.
     generator = torch.Generator().manual_seed(5)
     weight = torch.randn(640,128,generator=generator,dtype=torch.float16) * .01
     x = torch.randn(3,128,generator=generator).to(dtype)
     module = ExllamaV3Linear.from_tensors(in_features=128, out_features=576, name='kv_a', tensors=packed())
     assert module._stored_features() == (128,640)
     class Inner:
-        def forward(self, actual, params):
+        def forward(self, actual, params, *, out_dtype):
+            assert actual.dtype == out_dtype == torch.float16
             return actual @ weight.T
+    class WideInner:
+        def forward(self, actual):
+            return (actual.float() @ weight[:576].float().T).to(actual.dtype)
     monkeypatch.setattr(module, '_ensure_inner', lambda: Inner())
+    monkeypatch.setattr(module, '_ensure_torch_inner', lambda: WideInner())
     actual = module(x)
-    expected = torch.nn.functional.linear(x.half(),weight[:576]).to(dtype)
+    if dtype == torch.float16:
+        expected = torch.nn.functional.linear(x, weight[:576])
+    else:
+        expected = torch.nn.functional.linear(x.float(), weight[:576].float()).to(dtype)
     assert actual.dtype == dtype and actual.shape == (3,576)
     torch.testing.assert_close(actual,expected,rtol=0,atol=0)
 

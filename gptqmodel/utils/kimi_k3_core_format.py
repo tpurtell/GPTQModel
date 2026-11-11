@@ -69,11 +69,11 @@ def quantize_core_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.02
     is required: no identity augmentation or uncalibrated fallback is accepted.
     The caller owns raw_hessian and weight; neither is mutated.
     """
-    if (isinstance(bits, bool) or not isinstance(bits, int) or bits != 6
+    if (isinstance(bits, bool) or not isinstance(bits, int) or not 1 <= bits <= 8
             or isinstance(seed, bool) or not isinstance(seed, int)
             or isinstance(sigma, bool) or not isinstance(sigma, (int, float))
             or not math.isfinite(sigma) or sigma <= 0):
-        raise ValueError("Kimi core requires K6, an integer seed, and positive finite sigma")
+        raise ValueError("Kimi core requires integer bits in 1..8, an integer seed, and positive finite sigma")
     if (weight.ndim != 2 or weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
             or weight.shape[0] <= 0 or weight.shape[1] % 128):
         raise ValueError("invalid dense Kimi core projection geometry/dtype")
