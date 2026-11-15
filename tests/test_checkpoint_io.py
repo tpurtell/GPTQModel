@@ -86,3 +86,45 @@ def test_failed_writer_preserves_prior_publication(tmp_path, monkeypatch):
 def test_unresolved_logical_views_fail_closed(view):
     with pytest.raises(ValueError, match="unresolved"):
         checkpoint_io.append_safetensors(io.BytesIO(), {"view": view()})
+
+
+def test_non_posix_directory_sync_does_not_open_directory(tmp_path, monkeypatch):
+    # Patch this module's capability, not global os.name (which changes
+    # pathlib's platform selection throughout pytest).
+    monkeypatch.setattr(checkpoint_io, "_DIRECTORY_FSYNC", False)
+
+    def fail_open(*args, **kwargs):
+        pytest.fail("unsupported directory handle was opened")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(checkpoint_io.os, "open", fail_open)
+        checkpoint_io.sync_directory(tmp_path)
+
+
+def test_non_posix_writer_without_fchmod_still_syncs_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(checkpoint_io, "_DIRECTORY_FSYNC", False)
+    monkeypatch.setattr(checkpoint_io, "_FCHMOD", None)
+    original_sync = checkpoint_io.os.fsync
+    synced = []
+
+    def sync(fd):
+        synced.append(fd)
+        return original_sync(fd)
+
+    monkeypatch.setattr(checkpoint_io.os, "fsync", sync)
+    path = tmp_path / "portable.safetensors"
+    checkpoint_io.write_safetensors(path, {"value": torch.arange(3)})
+    assert len(synced) == 1
+    assert torch.equal(checkpoint_io.read_safetensors(path)["value"], torch.arange(3))
+
+
+@pytest.mark.skipif(not checkpoint_io._DIRECTORY_FSYNC, reason="POSIX directory fsync contract")
+def test_posix_directory_sync_failures_propagate(tmp_path, monkeypatch):
+    monkeypatch.setattr(checkpoint_io, "_DIRECTORY_FSYNC", True)
+
+    def fail(fd):
+        raise OSError("directory sync failed")
+
+    monkeypatch.setattr(checkpoint_io.os, "fsync", fail)
+    with pytest.raises(OSError, match="directory sync failed"):
+        checkpoint_io.sync_directory(tmp_path)

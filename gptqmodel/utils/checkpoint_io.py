@@ -25,6 +25,11 @@ BUFFER_BYTES = 8 * 1024 * 1024
 # Use the installed format's dtype inventory, including native FP8 scales.
 _DTYPES = {str(dtype): name for name, dtype in _TYPES.items()}
 _WRITER_LOCK = threading.RLock()
+# Directory handles/fsync are a POSIX durability contract. Other platforms
+# retain atomic file replacement and file fsync without pretending that their
+# directory entries can be synced through the POSIX API.
+_DIRECTORY_FSYNC = os.name == "posix"
+_FCHMOD = getattr(os, "fchmod", None)
 
 
 def _validate_range(offset, length):
@@ -34,7 +39,10 @@ def _validate_range(offset, length):
 
 
 def sync_directory(path):
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    """Sync directory entries on POSIX; unsupported platforms skip this step."""
+    if not _DIRECTORY_FSYNC:
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(fd)
     finally:
@@ -155,7 +163,8 @@ def write_safetensors(path, tensors, metadata=None, *, sync=True, hash_algorithm
         with os.fdopen(fd, "wb") as target:
             receipt = append_safetensors(target, tensors, metadata, hash_algorithm=hash_algorithm)
             target.flush()
-            os.fchmod(target.fileno(), 0o644)
+            if _FCHMOD is not None:
+                _FCHMOD(target.fileno(), 0o644)
             if sync:
                 os.fsync(target.fileno())
         os.replace(temporary, path)
