@@ -946,7 +946,7 @@ class EXL3Processor(LoopProcessor):
         phase, identities = self._subset_capture_phase(subset)
         try:
             checkpoint_interval = int(
-                os.getenv(CAPTURE_BATCH_CHECKPOINT_INTERVAL_ENV, "1")
+                os.getenv(CAPTURE_BATCH_CHECKPOINT_INTERVAL_ENV, "32")
             )
         except ValueError as error:
             raise RuntimeError(

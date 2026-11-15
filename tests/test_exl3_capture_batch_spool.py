@@ -180,3 +180,90 @@ def test_capture_batch_spool_retries_after_checkpoint_failure(
     assert record["batch_index"] == 0
     assert (spool.directory / record["file"]).exists()
     assert spool.committed_indices == frozenset({0})
+
+
+def test_capture_group_uses_one_payload_sync_before_manifest(tmp_path, monkeypatch):
+    import os
+    import gptqmodel.utils.exl3_capture_batch_spool as module
+
+    spool = _open(tmp_path, checkpoint_interval=2)
+    events = []
+    original_sync = os.fsync
+    original_json = module._atomic_json
+
+    def sync(fd):
+        name = os.readlink(f"/proc/self/fd/{fd}")
+        if name.endswith(".bin"):
+            events.append("payload")
+        return original_sync(fd)
+
+    def manifest(path, body):
+        events.append("manifest")
+        return original_json(path, body)
+
+    monkeypatch.setattr(os, "fsync", sync)
+    monkeypatch.setattr(module, "_atomic_json", manifest)
+    monkeypatch.setattr(module, "hash_file", lambda *a, **k: pytest.fail("write-time reread"))
+    records = [spool.commit(i, tensors={"hidden": torch.full((2, 4), i)}, metadata={}) for i in (0, 1)]
+    assert records[0]["file"] == records[1]["file"]
+    assert records[1]["offset"] == records[0]["bytes"]
+    assert events == ["payload", "manifest"]
+
+
+def test_direct_checkpoint_reconciles_failure_after_manifest_rename(tmp_path, monkeypatch):
+    import gptqmodel.utils.exl3_capture_batch_spool as module
+
+    spool = _open(tmp_path, checkpoint_interval=3)
+    first = spool.commit(0, tensors={"hidden": torch.zeros(1)}, metadata={})
+    original = module._atomic_json
+
+    def after_rename(path, body):
+        original(path, body)
+        raise OSError("directory sync failed after rename")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "_atomic_json", after_rename)
+        with pytest.raises(OSError, match="after rename"):
+            spool.checkpoint()
+    assert spool.committed_indices == frozenset({0})
+    second = spool.commit(1, tensors={"hidden": torch.ones(1)}, metadata={})
+    assert first["file"] != second["file"]
+    spool.commit(2, tensors={"hidden": torch.ones(1)}, metadata={})
+    assert _open(tmp_path).committed_indices == frozenset({0, 1, 2})
+
+
+@pytest.mark.parametrize("mutation", ["overlap", "tail"])
+def test_segment_restore_rejects_overlapping_ranges_and_unbound_tail(tmp_path, mutation):
+    spool = _open(tmp_path, checkpoint_interval=2)
+    first = spool.commit(0, tensors={"hidden": torch.zeros(1)}, metadata={})
+    spool.commit(1, tensors={"hidden": torch.zeros(1)}, metadata={})
+    if mutation == "tail":
+        with (spool.directory / first["file"]).open("ab") as stream:
+            stream.write(b"orphan tail")
+    else:
+        path = spool.directory / "progress.json"
+        body = json.loads(path.read_text())
+        body["records"][1]["offset"] = 0
+        path.write_text(json.dumps(body))
+    with pytest.raises(EXL3CaptureBatchSpoolError):
+        _open(tmp_path)
+
+
+def test_legacy_v1_capture_standalone_payload_is_still_readable(tmp_path):
+    import gptqmodel.utils.exl3_capture_batch_spool as module
+
+    spool = _open(tmp_path)
+    tensor = torch.arange(4, dtype=torch.bfloat16)
+    path = spool.directory / "batch-000000000.safetensors"
+    save_safetensors_file({"hidden": tensor}, path)
+    body = json.loads((spool.directory / "progress.json").read_text())
+    body["schema_version"] = 1
+    body["records"] = [{"batch_index": 0, "file": path.name, "bytes": path.stat().st_size,
+                        "xxh3_128": module.hash_file(path), "tensors": {"hidden": module._tensor_spec(tensor)}, "metadata": {}}]
+    (spool.directory / "progress.json").write_text(json.dumps(body))
+    restored = _open(tmp_path)
+    assert torch.equal(restored.load(0)[0]["hidden"], tensor)
+    with path.open("ab") as stream:
+        stream.write(b"x")
+    with pytest.raises(EXL3CaptureBatchSpoolError, match="payload differs"):
+        _open(tmp_path)

@@ -34,6 +34,49 @@ def _request(scale: float = 1.0) -> dict:
     )
 
 
+def test_projection_v2_write_is_streamed_without_payload_reread(tmp_path, monkeypatch):
+    import gptqmodel.utils.exl3_projection_checkpoint as module
+
+    store = EXL3ProjectionCheckpointStore(tmp_path)
+    request = _request()
+    monkeypatch.setattr(module, "hash_file", lambda *a, **k: pytest.fail("write-time reread"))
+    store.commit(request, {"packed": torch.arange(8, dtype=torch.int32)}, {"bits": 4})
+    manifest, _ = store._paths(request["request_sha256"])
+    body = json.loads(manifest.read_text())
+    assert body["schema_version"] == 2
+    assert body["tensor_hash_algorithm"] == "xxh3-128"
+    assert "tensor_sha256" not in body
+    assert request["hessian"]["hash_algorithm"] == "xxh3-128"
+
+
+def test_projection_legacy_sha_payload_restores_and_temps_are_not_commits(tmp_path):
+    from safetensors.torch import save
+    from gptqmodel.utils.exl3_projection_checkpoint import canonical_json_bytes, sha256_bytes, tensor_identity
+
+    store = EXL3ProjectionCheckpointStore(tmp_path)
+    request = _request()
+    request["schema_version"] = 1
+    request["input_weight"] = tensor_identity(torch.arange(32, dtype=torch.float32).reshape(8, 4), hash_algorithm="sha256")
+    request["hessian"] = tensor_identity(torch.eye(8), hash_algorithm="sha256")
+    request.pop("request_sha256")
+    request["request_sha256"] = sha256_bytes(canonical_json_bytes(request))
+    manifest_path, tensor_path = store._paths(request["request_sha256"])
+    manifest_path.parent.mkdir(parents=True)
+    tensor = torch.arange(8, dtype=torch.int32)
+    payload = save({"packed": tensor})
+    tensor_path.write_bytes(payload)
+    body = {"schema": "ds4rt.exl3-projection-checkpoint", "schema_version": 1,
+            "request": request, "request_sha256": request["request_sha256"],
+            "tensor_file": tensor_path.name, "tensor_sha256": sha256_bytes(payload),
+            "tensors": {"packed": tensor_identity(tensor, hash_algorithm="sha256")}, "result": {"bits": 4}}
+    body["manifest_sha256"] = sha256_bytes(canonical_json_bytes(body))
+    manifest_path.write_text(json.dumps(body))
+    for suffix in ("safetensors.dead1234.tmp", "json.dead1234", "safetensors.dead5678"):
+        (manifest_path.parent / f".{request['request_sha256']}.{suffix}").write_bytes(b"uncommitted")
+    assert list(store.inspect_committed_manifests()) == [(request, {"bits": 4})]
+    assert torch.equal(store.load(request)[0]["packed"], tensor)
+
+
 def _inline_request(
     role: str,
     *,

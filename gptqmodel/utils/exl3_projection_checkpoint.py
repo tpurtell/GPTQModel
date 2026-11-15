@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 import threading
 from copy import deepcopy
@@ -17,12 +18,15 @@ from typing import Any, Iterable, Iterator
 
 import torch
 from safetensors.torch import load as load_safetensors
-from safetensors.torch import save as save_safetensors
+import xxhash
+
+from .checkpoint_io import hash_file, read_safetensors, write_safetensors
 
 
 CHECKPOINT_SCHEMA = "ds4rt.exl3-projection-checkpoint"
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 CHECKPOINT_CONTRACT = f"{CHECKPOINT_SCHEMA}-v{CHECKPOINT_SCHEMA_VERSION}"
+_PAYLOAD_TEMP = re.compile(r"\.[0-9a-f]{64}\.(?:safetensors|json)\.[a-z0-9_]{8}(?:\.tmp)?\Z")
 
 
 def _finite_json_value(value: Any, path: str = "value") -> Any:
@@ -86,20 +90,23 @@ def _request_sha256(request: dict[str, Any]) -> str:
     return digest
 
 
-def tensor_identity(tensor: torch.Tensor) -> dict[str, Any]:
+def tensor_identity(tensor: torch.Tensor, *, hash_algorithm="xxh3-128") -> dict[str, Any]:
     """Hash logical tensor bytes together with their exact shape and dtype."""
 
     if not isinstance(tensor, torch.Tensor):
         raise TypeError("EXL3 checkpoint identities require torch tensors")
+    if hash_algorithm not in {"sha256", "xxh3-128"}:
+        raise ValueError("unsupported EXL3 tensor identity hash algorithm")
     host = tensor.detach().contiguous().to(device="cpu")
     byte_view = host.reshape(-1).view(torch.uint8).numpy()
-    digest = hashlib.sha256(memoryview(byte_view)).hexdigest()
+    digest = (hashlib.sha256(memoryview(byte_view)).hexdigest()
+              if hash_algorithm == "sha256" else xxhash.xxh3_128_hexdigest(memoryview(byte_view)))
     return {
         "shape": list(host.shape),
         "dtype": str(host.dtype),
         "numel": host.numel(),
         "bytes": host.numel() * host.element_size(),
-        "sha256": digest,
+        **({"sha256": digest} if hash_algorithm == "sha256" else {"hash_algorithm": "xxh3-128", "xxh3_128": digest}),
     }
 
 
@@ -154,7 +161,7 @@ def checkpoint_root_from_provenance(
         return None
     if (
         not isinstance(checkpoint, dict)
-        or checkpoint.get("contract") != CHECKPOINT_CONTRACT
+        or checkpoint.get("contract") not in {CHECKPOINT_CONTRACT, f"{CHECKPOINT_SCHEMA}-v1"}
         or not isinstance(checkpoint.get("root"), str)
         or not checkpoint["root"]
     ):
@@ -386,6 +393,11 @@ class EXL3ProjectionCheckpointStore:
                 for path in second.iterdir():
                     if not path.is_file() or path.is_symlink():
                         raise ValueError("EXL3 checkpoint contains a non-regular file")
+                    if _PAYLOAD_TEMP.fullmatch(path.name):
+                        # A killed writer did not publish this payload. Do not
+                        # mistake it for a committed checkpoint or delete an
+                        # active concurrent writer's temporary.
+                        continue
                     if path.suffix not in {".json", ".safetensors"}:
                         raise ValueError("EXL3 checkpoint contains an unexpected file")
                     request_sha256 = path.name.removesuffix(path.suffix)
@@ -438,12 +450,12 @@ class EXL3ProjectionCheckpointStore:
                 if isinstance(request, dict)
                 else None
             )
-            tensor_sha256 = manifest.get("tensor_sha256")
+            tensor_sha256 = manifest.get("tensor_sha256") if manifest.get("schema_version") == 1 else manifest.get("tensor_xxh3_128")
             tensor_specs = manifest.get("tensors")
             result = manifest.get("result")
             if (
                 manifest.get("schema") != CHECKPOINT_SCHEMA
-                or manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
+                or manifest.get("schema_version") not in {1, CHECKPOINT_SCHEMA_VERSION}
                 or manifest.get("request_sha256") != request_sha256
                 or not isinstance(request, dict)
                 or request.get("request_sha256") != request_sha256
@@ -451,7 +463,8 @@ class EXL3ProjectionCheckpointStore:
                 != request_sha256
                 or manifest.get("tensor_file") != tensor_path.name
                 or not isinstance(tensor_sha256, str)
-                or len(tensor_sha256) != 64
+                or len(tensor_sha256) != (64 if manifest.get("schema_version") == 1 else 32)
+                or (manifest.get("schema_version") == 2 and manifest.get("tensor_hash_algorithm") != "xxh3-128")
                 or any(char not in hex_chars for char in tensor_sha256)
                 or not isinstance(tensor_specs, dict)
                 or not tensor_specs
@@ -508,7 +521,7 @@ class EXL3ProjectionCheckpointStore:
         )
         if (
             manifest.get("schema") != CHECKPOINT_SCHEMA
-            or manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
+            or manifest.get("schema_version") not in {1, CHECKPOINT_SCHEMA_VERSION}
             or manifest.get("request_sha256") != request_sha256
             or not isinstance(stored_request, dict)
             or stored_request.get("request_sha256") != request_sha256
@@ -516,12 +529,12 @@ class EXL3ProjectionCheckpointStore:
             != request_sha256
             or manifest.get("tensor_file") != tensor_path.name
             or manifest_digest != sha256_bytes(canonical_json_bytes(manifest_body))
-            or manifest.get("tensor_sha256") != sha256_file(tensor_path)
+            or (manifest.get("tensor_sha256") != sha256_file(tensor_path) if manifest.get("schema_version") == 1
+                else manifest.get("tensor_hash_algorithm") != "xxh3-128" or manifest.get("tensor_xxh3_128") != hash_file(tensor_path))
         ):
             raise ValueError("EXL3 projection checkpoint failed content validation")
-        payload = tensor_path.read_bytes()
         try:
-            tensors = load_safetensors(payload)
+            tensors = read_safetensors(tensor_path)
         except Exception as error:
             raise ValueError(
                 "cannot decode EXL3 projection checkpoint tensors"
@@ -530,7 +543,7 @@ class EXL3ProjectionCheckpointStore:
         if not isinstance(tensor_specs, dict) or set(tensor_specs) != set(tensors):
             raise ValueError("EXL3 projection checkpoint tensor set is inconsistent")
         for name, tensor in tensors.items():
-            if tensor_specs[name] != tensor_identity(tensor):
+            if tensor_specs[name] != tensor_identity(tensor, hash_algorithm="sha256" if manifest.get("schema_version") == 1 else "xxh3-128"):
                 raise ValueError(
                     f"EXL3 projection checkpoint tensor `{name}` is inconsistent"
                 )
@@ -580,7 +593,7 @@ class EXL3ProjectionCheckpointStore:
         }
         if not host_tensors:
             raise ValueError("EXL3 projection checkpoint cannot commit no tensors")
-        tensor_payload = save_safetensors(host_tensors)
+        receipt = write_safetensors(tensor_path, host_tensors)
         clean_result = _finite_json_value(result, "result")
         manifest = {
             "schema": CHECKPOINT_SCHEMA,
@@ -588,19 +601,14 @@ class EXL3ProjectionCheckpointStore:
             "request": deepcopy(request),
             "request_sha256": request_sha256,
             "tensor_file": tensor_path.name,
-            "tensor_sha256": sha256_bytes(tensor_payload),
-            "tensors": {
-                name: tensor_identity(tensor) for name, tensor in host_tensors.items()
-            },
+            "tensor_hash_algorithm": "xxh3-128",
+            "tensor_xxh3_128": receipt["xxh3_128"],
+            "tensors": receipt["tensors"],
             "result": clean_result,
         }
         manifest["manifest_sha256"] = sha256_bytes(canonical_json_bytes(manifest))
-        _atomic_write(tensor_path, tensor_payload)
         _atomic_write(manifest_path, canonical_json_bytes(manifest) + b"\n")
         _fsync_directory(manifest_path.parent)
-        loaded = self.load(request)
-        if loaded is None or loaded[1] != clean_result:
-            raise RuntimeError("EXL3 projection checkpoint did not commit durably")
         return clean_result
 
     def prune(
@@ -666,6 +674,11 @@ class EXL3ProjectionCheckpointStore:
                 for path in second.iterdir():
                     if not path.is_file() or path.is_symlink():
                         raise ValueError("EXL3 checkpoint contains a non-regular file")
+                    if _PAYLOAD_TEMP.fullmatch(path.name):
+                        # A killed writer did not publish this payload. Do not
+                        # mistake it for a committed checkpoint or delete an
+                        # active concurrent writer's temporary.
+                        continue
                     if path.suffix not in {".json", ".safetensors"}:
                         raise ValueError("EXL3 checkpoint contains an unexpected file")
                     request_sha256 = path.name.removesuffix(path.suffix)

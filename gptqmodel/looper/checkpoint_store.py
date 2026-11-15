@@ -16,6 +16,7 @@ from threading import get_ident
 from uuid import uuid4
 
 from filelock import FileLock, Timeout
+import xxhash
 
 
 class CheckpointError(RuntimeError):
@@ -90,7 +91,7 @@ def _sync_directory(path):
 
 
 class CheckpointStore:
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self, config: CheckpointConfig, *, identity_projection=None):
         self.config = config
@@ -100,6 +101,7 @@ class CheckpointStore:
         self._owner = None
         self._identity = None
         self._cursor = -1
+        self._written = {}
 
     def __enter__(self):
         if self._lease is not None:
@@ -157,7 +159,7 @@ class CheckpointStore:
     def put(self, data: bytes) -> str:
         """Persist an immutable object; publishing its reference is separate."""
         self._check_owner()
-        digest = hashlib.sha256(data).hexdigest()
+        digest = "xxh3-128-" + xxhash.xxh3_128_hexdigest(data)
         path = self.root / "objects" / digest
         if path.exists():
             try:
@@ -168,32 +170,56 @@ class CheckpointStore:
                 self._atomic_write(path, data)
         else:
             self._atomic_write(path, data)
+        self._written[digest] = self._signature(path)
         return digest
+
+    @staticmethod
+    def _signature(path):
+        stat = path.stat()
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    @staticmethod
+    def _valid_ref(digest):
+        return isinstance(digest, str) and re.fullmatch(r"(?:[0-9a-f]{64}|xxh3-128-[0-9a-f]{32})", digest) is not None
+
+    @staticmethod
+    def _hasher(digest):
+        return xxhash.xxh3_128() if digest.startswith("xxh3-128-") else hashlib.sha256()
+
+    @staticmethod
+    def _checksum(digest):
+        return digest.removeprefix("xxh3-128-")
 
     def get(self, digest: str) -> bytes:
         self._check_owner()
-        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        if not self._valid_ref(digest):
             raise CheckpointCorrupt("invalid object reference")
         try:
             data = (self.root / "objects" / digest).read_bytes()
         except FileNotFoundError as exc:
             raise CheckpointCorrupt(f"missing checkpoint object {digest}") from exc
-        if hashlib.sha256(data).hexdigest() != digest:
+        actual = self._hasher(digest)
+        actual.update(data)
+        if actual.hexdigest() != self._checksum(digest):
             raise CheckpointCorrupt(f"checksum mismatch for checkpoint object {digest}")
         return data
 
     def object_path(self, digest: str) -> Path:
         """Verify an object without allocating its tensor payload in memory."""
         self._check_owner()
-        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        if not self._valid_ref(digest):
             raise CheckpointCorrupt("invalid object reference")
         path = self.root / "objects" / digest
         try:
+            if self._written.get(digest) == self._signature(path):
+                return path
+            actual = self._hasher(digest)
             with path.open("rb") as stream:
-                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+                while chunk := stream.read(8 * 1024 * 1024):
+                    actual.update(chunk)
         except FileNotFoundError as exc:
             raise CheckpointCorrupt(f"missing checkpoint object {digest}") from exc
-        if actual != digest:
+        if actual.hexdigest() != self._checksum(digest):
             raise CheckpointCorrupt(f"checksum mismatch for checkpoint object {digest}")
         return path
 
@@ -205,7 +231,7 @@ class CheckpointStore:
             self.object_path(source.name)
             return source.name
         temporary = self.root / "objects" / f".{uuid4().hex}.tmp"
-        digest = hashlib.sha256()
+        digest = xxhash.xxh3_128()
         try:
             with source.open("rb") as reader, temporary.open("xb") as writer:
                 while chunk := reader.read(8 * 1024 * 1024):
@@ -213,7 +239,7 @@ class CheckpointStore:
                     writer.write(chunk)
                 writer.flush()
                 os.fsync(writer.fileno())
-            ref = digest.hexdigest()
+            ref = "xxh3-128-" + digest.hexdigest()
             destination = self.root / "objects" / ref
             if destination.exists():
                 try:
@@ -224,6 +250,7 @@ class CheckpointStore:
             else:
                 os.replace(temporary, destination)
                 _sync_directory(destination.parent)
+            self._written[ref] = self._signature(destination)
             return ref
         finally:
             temporary.unlink(missing_ok=True)
@@ -236,13 +263,12 @@ class CheckpointStore:
             current = json.loads(path.read_bytes())
             refs = current["generations"]
             if (
-                current["version"] != self.VERSION
+                current["version"] not in {1, self.VERSION}
                 or not isinstance(refs, list)
                 or not refs
                 or len(refs) != len(set(refs))
                 or any(
-                    not isinstance(ref, str)
-                    or re.fullmatch(r"[0-9a-f]{64}", ref) is None
+                    not self._valid_ref(ref)
                     for ref in refs
                 )
             ):
@@ -257,7 +283,7 @@ class CheckpointStore:
         try:
             manifest = json.loads(self.get(ref))
             if (
-                manifest["version"] != self.VERSION
+                manifest["version"] not in {1, self.VERSION}
                 or type(manifest["cursor"]) is not int
                 or manifest["cursor"] < 0
                 or not isinstance(manifest["artifacts"], dict)
@@ -332,6 +358,7 @@ class CheckpointStore:
             raise CheckpointError("checkpoint cursor must advance")
         manifest = {
             "version": self.VERSION,
+            "object_hash_algorithm": "xxh3-128",
             "identity": identity,
             "cursor": cursor,
             "continuation": continuation,
@@ -377,8 +404,8 @@ class CheckpointStore:
             reachable.add(manifest["continuation"])
             reachable.update(manifest["artifacts"].values())
         for path in (self.root / "objects").iterdir():
-            if re.fullmatch(r"\.(?:[0-9a-f]{64}\.)?[0-9a-f]{32}\.tmp", path.name) or (
-                re.fullmatch(r"[0-9a-f]{64}", path.name) and path.name not in reachable
+            if re.fullmatch(r"\.(?:(?:[0-9a-f]{64}|xxh3-128-[0-9a-f]{32})\.)?[0-9a-f]{32}\.tmp", path.name) or (
+                self._valid_ref(path.name) and path.name not in reachable
             ):
                 path.unlink()
         _sync_directory(self.root / "objects")

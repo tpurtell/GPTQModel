@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file as save_safetensors_file
+from ..utils.checkpoint_io import durable_makedirs, write_safetensors
 
 
 @dataclass
@@ -360,7 +360,7 @@ class DiskBackedLayerOutputWriter:
         if on_finalize is not None and not callable(on_finalize):
             raise TypeError("disk-backed output finalizer must be callable")
         self.parent = Path(root).expanduser().resolve()
-        self.parent.mkdir(parents=True, exist_ok=True)
+        durable_makedirs(self.parent)
         self.destination = self.parent / f"layer-{layer_index:06d}"
         self.temporary = self.parent / f".layer-{layer_index:06d}.partial"
         self.layer_index = int(layer_index)
@@ -392,7 +392,7 @@ class DiskBackedLayerOutputWriter:
             self._committed_indices.update(range(self.expected_batches))
             return
 
-        self.temporary.mkdir(exist_ok=True)
+        durable_makedirs(self.temporary)
         progress_path = self.temporary / "progress.json"
         if progress_path.exists():
             self._restore_progress(progress_path)
@@ -496,29 +496,12 @@ class DiskBackedLayerOutputWriter:
             return
         filename = f"outputs-{shard_index:06d}.safetensors"
         final_path = self.temporary / filename
-        with tempfile.NamedTemporaryFile(
-            dir=self.temporary,
-            prefix=f".{filename}.",
-            suffix=".tmp",
-            delete=False,
-        ) as output:
-            temporary = Path(output.name)
-        try:
-            ordered = (
-                {"hidden": pending[start]}
-                if self.shard_batches == 1
-                else {
-                    f"batch_{index:09d}": pending[index]
-                    for index in range(start, start + count)
-                }
-            )
-            save_safetensors_file(ordered, temporary)
-            with temporary.open("rb") as source:
-                os.fsync(source.fileno())
-            os.replace(temporary, final_path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+        ordered = (
+            {"hidden": pending[start]}
+            if self.shard_batches == 1
+            else {f"batch_{index:09d}": pending[index] for index in range(start, start + count)}
+        )
+        receipt = write_safetensors(final_path, ordered)
         record = {
             "path": filename,
             "start": start,
@@ -528,7 +511,7 @@ class DiskBackedLayerOutputWriter:
             ],
             "dtype": str(pending[start].dtype),
             "bytes": final_path.stat().st_size,
-            "xxh3_128": _xxh3_128_file(final_path),
+            "xxh3_128": receipt["xxh3_128"],
         }
         self._shards[shard_index] = record
         self._committed_indices.update(expected_indices)

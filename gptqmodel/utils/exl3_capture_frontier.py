@@ -20,7 +20,7 @@ from typing import Any, Callable, Iterable
 import torch
 import xxhash
 from safetensors.torch import load_file as load_safetensors_file
-from safetensors.torch import save_file as save_safetensors_file
+from .checkpoint_io import durable_makedirs, write_safetensors
 
 from .exl3_error_ledger import routed_expert_identity, routed_expert_processor_layer
 
@@ -499,7 +499,7 @@ class EXL3CaptureFrontierStore:
             subset_total=subset_total,
             module_names=module_names,
         )
-        self.root.mkdir(parents=True, exist_ok=True)
+        durable_makedirs(self.root)
         if self.root.is_symlink():
             raise EXL3CaptureFrontierError("capture-frontier root cannot be a symlink")
         self._prune_incomplete()
@@ -575,17 +575,11 @@ class EXL3CaptureFrontierStore:
                         )
                 relative = Path("hessians") / f"hessian-{payload_index:06d}.safetensors"
                 path = temporary / relative
-                save_safetensors_file({"H": reference_hessian.contiguous()}, path)
-                os.chmod(path, 0o644)
-                descriptor = os.open(path, os.O_RDONLY)
-                try:
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
+                receipt = write_safetensors(path, {"H": reference_hessian.contiguous()})
                 payload = {
                     "file": relative.as_posix(),
                     "bytes": path.stat().st_size,
-                    "xxh3_128": _xxh3_128_file(path),
+                    "xxh3_128": receipt["xxh3_128"],
                     "tensor": _tensor_spec(reference_hessian),
                 }
                 for state in group_states:

@@ -185,6 +185,48 @@ def test_path_traversal_rejected(tmp_path):
         store.get("../../secret")
 
 
+def test_legacy_sha256_generations_remain_readable(tmp_path):
+    import hashlib
+
+    root = tmp_path / "objects"
+    root.mkdir()
+
+    def legacy_put(value):
+        ref = hashlib.sha256(value).hexdigest()
+        (root / ref).write_bytes(value)
+        return ref
+
+    manifest = {"version": 1, "identity": IDENTITY, "cursor": 1,
+                "continuation": legacy_put(b"old-state"),
+                "artifacts": {"weights": legacy_put(b"old-packed")}}
+    ref = legacy_put(json.dumps(manifest).encode())
+    (tmp_path / "CURRENT").write_text(json.dumps({"version": 1, "generations": [ref]}))
+    with CheckpointStore(CheckpointConfig(tmp_path)) as store:
+        assert store.load(IDENTITY) == manifest
+        assert store.get(manifest["continuation"]) == b"old-state"
+        new = commit(store, 2)
+        assert new["object_hash_algorithm"] == "xxh3-128"
+        assert new["continuation"].startswith("xxh3-128-")
+        store.collect()
+        assert store.get(manifest["continuation"]) == b"old-state"
+
+
+def test_new_artifact_is_not_reread_to_publish_manifest(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.write_bytes(b"packed")
+    with CheckpointStore(CheckpointConfig(tmp_path / "checkpoint")) as store:
+        ref = store.put_file(source)
+        original = Path.open
+
+        def deny_object_read(path, mode="r", *args, **kwargs):
+            if path.name == ref and "r" in mode:
+                pytest.fail("new payload was reread at commit")
+            return original(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", deny_object_read)
+        store.commit(identity=IDENTITY, cursor=1, continuation=store.put(b"state"), artifacts={"weights": ref})
+
+
 # Import the storage module directly: subprocess fault injection should not
 # initialize CUDA, transformers, or the quantization worker pool.
 DRIVER = r"""

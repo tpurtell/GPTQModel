@@ -18,7 +18,9 @@ from typing import Any
 import torch
 import xxhash
 from safetensors import safe_open
-from safetensors.torch import save as serialize_safetensors
+from uuid import uuid4
+
+from .checkpoint_io import append_safetensors, durable_makedirs, hash_file, read_safetensors
 
 
 CAPTURE_BATCH_SPOOL_ENV = "GPTQMODEL_EXL3_CAPTURE_BATCH_SPOOL"
@@ -26,7 +28,7 @@ CAPTURE_BATCH_CHECKPOINT_INTERVAL_ENV = (
     "GPTQMODEL_EXL3_CAPTURE_BATCH_CHECKPOINT_INTERVAL"
 )
 CAPTURE_BATCH_SPOOL_SCHEMA = "ds4rt.exl3-capture-batch-spool"
-CAPTURE_BATCH_SPOOL_SCHEMA_VERSION = 1
+CAPTURE_BATCH_SPOOL_SCHEMA_VERSION = 2
 CAPTURE_BATCH_SPOOL_CONTRACT = (
     f"{CAPTURE_BATCH_SPOOL_SCHEMA}-v{CAPTURE_BATCH_SPOOL_SCHEMA_VERSION}"
 )
@@ -34,6 +36,8 @@ _DIRECTORY = re.compile(
     r"layer-(?P<layer>[0-9]{6})-subset-(?P<subset>[0-9]{4})-"
     r"of-(?P<total>[0-9]{4})-(?P<digest>[0-9a-f]{16})\Z"
 )
+_SEGMENT_FILE = re.compile(r"segment-[0-9a-f]{32}\.bin\Z")
+SEGMENT_BYTES = 256 * 1024 * 1024
 _BATCH_FILE = re.compile(r"batch-(?P<batch>[0-9]{9})\.safetensors\Z")
 
 
@@ -114,7 +118,7 @@ class EXL3CaptureBatchSpool:
         module_names: list[str],
         provenance: dict[str, Any],
         ownership: dict[str, str],
-        checkpoint_interval: int = 1,
+        checkpoint_interval: int = 32,
     ) -> None:
         if (
             layer_index < 0
@@ -150,6 +154,7 @@ class EXL3CaptureBatchSpool:
         # identity. A different cadence may safely resume the same committed
         # batch set without changing any Hessian or route evidence.
         self.checkpoint_interval = int(checkpoint_interval)
+        self._segment = None
         self.directory = self.root / (
             f"layer-{layer_index:06d}-subset-{subset_index:04d}-"
             f"of-{subset_total:04d}-{self.key_sha256[:16]}"
@@ -157,10 +162,10 @@ class EXL3CaptureBatchSpool:
         self._records: dict[int, dict[str, Any]] = {}
         self._pending_records: dict[int, dict[str, Any]] = {}
         self._lock = threading.RLock()
-        self.root.mkdir(parents=True, exist_ok=True)
+        durable_makedirs(self.root)
         if self.root.is_symlink():
             raise EXL3CaptureBatchSpoolError("capture spool root is a symlink")
-        self.directory.mkdir(exist_ok=True)
+        durable_makedirs(self.directory)
         if self.directory.is_symlink():
             raise EXL3CaptureBatchSpoolError("capture spool entry is a symlink")
         self._restore()
@@ -217,7 +222,6 @@ class EXL3CaptureBatchSpool:
         expected = self._progress_body()
         for key in (
             "schema",
-            "schema_version",
             "status",
             "payload_hash_algorithm",
             "capture_key",
@@ -225,10 +229,13 @@ class EXL3CaptureBatchSpool:
         ):
             if progress.get(key) != expected[key]:
                 raise EXL3CaptureBatchSpoolError("capture progress identity differs")
+        if progress.get("schema_version") not in {1, 2}:
+            raise EXL3CaptureBatchSpoolError("capture progress version differs")
         records = progress.get("records")
         if not isinstance(records, list):
             raise EXL3CaptureBatchSpoolError("capture progress lacks records")
         expected_files = {"progress.json"}
+        extents = {}
         for record in records:
             index = record.get("batch_index") if isinstance(record, dict) else None
             relative = record.get("file") if isinstance(record, dict) else None
@@ -237,7 +244,13 @@ class EXL3CaptureBatchSpool:
                 or not isinstance(index, int)
                 or not 0 <= index < self.key["expected_batches"]
                 or index in self._records
-                or relative != f"batch-{index:09d}.safetensors"
+                or not isinstance(relative, str)
+                or (relative != f"batch-{index:09d}.safetensors" and not _SEGMENT_FILE.fullmatch(relative))
+                or (progress["schema_version"] == 1 and relative != f"batch-{index:09d}.safetensors")
+                or type(record.get("offset", 0)) is not int
+                or record.get("offset", 0) < 0
+                or type(record.get("bytes")) is not int
+                or record["bytes"] <= 0
                 or not isinstance(record.get("tensors"), dict)
                 or not isinstance(record.get("metadata"), dict)
             ):
@@ -246,12 +259,21 @@ class EXL3CaptureBatchSpool:
             if (
                 not path.is_file()
                 or path.is_symlink()
-                or path.stat().st_size != record.get("bytes")
-                or _xxh3_128_file(path) != record.get("xxh3_128")
+                or path.stat().st_size < record.get("offset", 0) + record["bytes"]
+                or hash_file(path, offset=record.get("offset", 0), length=record["bytes"]) != record.get("xxh3_128")
             ):
                 raise EXL3CaptureBatchSpoolError("capture batch payload differs")
             self._records[index] = record
+            extents.setdefault(relative, []).append((record.get("offset", 0), record["bytes"]))
             expected_files.add(relative)
+        for filename, ranges in extents.items():
+            cursor = 0
+            for offset, length in sorted(ranges):
+                if offset != cursor:
+                    raise EXL3CaptureBatchSpoolError("capture segment extents overlap or have gaps")
+                cursor += length
+            if cursor != (self.directory / filename).stat().st_size:
+                raise EXL3CaptureBatchSpoolError("capture batch payload differs")
         actual_files = {
             path.name
             for path in self.directory.iterdir()
@@ -262,7 +284,7 @@ class EXL3CaptureBatchSpool:
             raise EXL3CaptureBatchSpoolError("capture spool file set differs")
         for filename in sorted(actual_files - expected_files):
             match = _BATCH_FILE.fullmatch(filename)
-            if (
+            if not _SEGMENT_FILE.fullmatch(filename) and (
                 match is None
                 or int(match.group("batch")) >= self.key["expected_batches"]
             ):
@@ -325,52 +347,53 @@ class EXL3CaptureBatchSpool:
                 name: tensor.detach().to(device="cpu").contiguous()
                 for name, tensor in tensors.items()
             }
-            payload = serialize_safetensors(host)
-            filename = f"batch-{batch_index:09d}.safetensors"
-            destination = self.directory / filename
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{filename}.", suffix=".tmp", dir=self.directory
-            )
-            os.close(descriptor)
-            temporary = Path(temporary_name)
+            # A group is one append-only segment, so durability needs one
+            # payload barrier, independent of calibration batch count.
+            if self._segment is None:
+                self._segment = self.directory / f"segment-{uuid4().hex}.bin"
+            destination = self._segment
             try:
-                with temporary.open("wb") as target:
-                    target.write(payload)
+                with destination.open("ab") as target:
+                    receipt = append_safetensors(target, host)
                     target.flush()
-                os.replace(temporary, destination)
                 record = {
                     "batch_index": batch_index,
-                    "file": filename,
-                    "bytes": len(payload),
-                    "xxh3_128": xxhash.xxh3_128_hexdigest(payload),
-                    "tensors": {
-                        name: _tensor_spec(tensor)
-                        for name, tensor in sorted(host.items())
-                    },
+                    "file": destination.name,
+                    "offset": receipt["offset"],
+                    "bytes": receipt["bytes"],
+                    "xxh3_128": receipt["xxh3_128"],
+                    "tensors": {name: _tensor_spec(tensor) for name, tensor in sorted(host.items())},
                     "metadata": json.loads(json.dumps(metadata, sort_keys=True)),
                 }
                 self._pending_records[batch_index] = record
-                if (
-                    len(self._pending_records) >= self.checkpoint_interval
-                    or len(self._records) + len(self._pending_records)
-                    == self.key["expected_batches"]
-                ):
+                if (len(self._pending_records) >= self.checkpoint_interval
+                    or destination.stat().st_size >= SEGMENT_BYTES
+                    or len(self._records) + len(self._pending_records) == self.key["expected_batches"]):
                     self.checkpoint()
                 return record
             except BaseException:
-                if temporary.exists():
-                    temporary.unlink()
-                if batch_index not in self._records:
-                    # A failed checkpoint leaves the batch uncommitted. Drop
-                    # the pending entry too, so a retry rewrites the payload
-                    # instead of returning a record whose file was removed.
-                    self._pending_records.pop(batch_index, None)
-                    if destination.exists():
-                        destination.unlink()
+                # Reload the publication marker: rename may have succeeded
+                # before a directory-sync error. Never remove a referenced
+                # segment; unreferenced segments are safe to replay.
+                self._records.clear()
+                self._pending_records.clear()
+                self._segment = None
+                self._restore()
                 raise
 
     def checkpoint(self) -> None:
-        """Durably publish the bounded group of newly written batch files."""
+        """Seal one bounded segment, then atomically publish the group."""
+        with self._lock:
+            try:
+                self._checkpoint_locked()
+            except BaseException:
+                self._records.clear()
+                self._pending_records.clear()
+                self._segment = None
+                self._restore()
+                raise
+
+    def _checkpoint_locked(self) -> None:
 
         with self._lock:
             if not self._pending_records:
@@ -379,13 +402,13 @@ class EXL3CaptureBatchSpool:
                 self._pending_records[index]
                 for index in sorted(self._pending_records)
             ]
-            # The payloads were written and renamed before this point. Flush
-            # the bounded group before publishing any of it in progress.json;
+            # The unmanifested segment was appended before this point. Flush
+            # it once before publishing any of it in progress.json;
             # an interruption before the manifest commit simply causes the
             # unmanifested files to be discarded and those batches replayed.
-            for record in pending:
+            for filename in sorted({record["file"] for record in pending}):
                 descriptor = os.open(
-                    self.directory / record["file"],
+                    self.directory / filename,
                     os.O_RDONLY | os.O_NOFOLLOW,
                 )
                 try:
@@ -404,6 +427,7 @@ class EXL3CaptureBatchSpool:
                 self._records = previous
                 raise
             self._pending_records.clear()
+            self._segment = None
 
     def load(self, batch_index: int) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         with self._lock:
@@ -413,17 +437,12 @@ class EXL3CaptureBatchSpool:
             if record is None:
                 raise KeyError(batch_index)
             path = self.directory / record["file"]
-            tensors: dict[str, torch.Tensor] = {}
-            with safe_open(path, framework="pt", device="cpu") as source:
-                if set(source.keys()) != set(record["tensors"]):
-                    raise EXL3CaptureBatchSpoolError("capture tensor set differs")
-                for name in source.keys():
-                    tensor = source.get_tensor(name)
-                    if _tensor_spec(tensor) != record["tensors"][name]:
-                        raise EXL3CaptureBatchSpoolError(
-                            "capture tensor geometry differs"
-                        )
-                    tensors[name] = tensor
+            tensors = read_safetensors(path, offset=record.get("offset", 0), length=record["bytes"])
+            if set(tensors) != set(record["tensors"]):
+                raise EXL3CaptureBatchSpoolError("capture tensor set differs")
+            for name, tensor in tensors.items():
+                if _tensor_spec(tensor) != record["tensors"][name]:
+                    raise EXL3CaptureBatchSpoolError("capture tensor geometry differs")
             return tensors, json.loads(json.dumps(record["metadata"]))
 
     def discard(self) -> None:

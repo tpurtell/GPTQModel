@@ -257,7 +257,7 @@ def encode_tensor_envelope(
         "manifest": manifest,
         "tensor_bytes": len(tensor_payload),
         "tensor_sha256": _sha256(tensor_payload),
-        "tensors": {name: tensor_identity(tensor) for name, tensor in host_tensors.items()},
+        "tensors": {name: tensor_identity(tensor, hash_algorithm="sha256") for name, tensor in host_tensors.items()},
     }
     header_payload = canonical_json_bytes(header)
     if len(header_payload) > MAX_HEADER_BYTES:
@@ -301,7 +301,7 @@ def decode_tensor_envelope(
     if not isinstance(specs, dict) or set(specs) != set(tensors):
         raise ValueError("EXL3 remote tensor envelope has an inconsistent tensor set")
     for name, tensor in tensors.items():
-        if specs[name] != tensor_identity(tensor):
+        if specs[name] != tensor_identity(tensor, hash_algorithm="sha256"):
             raise ValueError(f"EXL3 remote tensor `{name}` failed identity validation")
     return header["manifest"], tensors
 
@@ -310,7 +310,7 @@ def validate_projection_request(request: dict[str, Any]) -> None:
     if (
         not isinstance(request, dict)
         or request.get("schema") != CHECKPOINT_SCHEMA
-        or request.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
+        or request.get("schema_version") not in {1, CHECKPOINT_SCHEMA_VERSION}
         or not isinstance(request.get("request_sha256"), str)
     ):
         raise ValueError("EXL3 remote projection request is malformed")
@@ -331,8 +331,8 @@ def validate_remote_inputs(
     hessian = tensors["hessian"]
     contract = request.get("quantizer_contract")
     if (
-        tensor_identity(weight) != request.get("input_weight")
-        or tensor_identity(hessian) != request.get("hessian")
+        tensor_identity(weight, hash_algorithm="sha256" if request.get("schema_version") == 1 else "xxh3-128") != request.get("input_weight")
+        or tensor_identity(hessian, hash_algorithm="sha256" if request.get("schema_version") == 1 else "xxh3-128") != request.get("hessian")
         or weight.dtype != torch.float32
         or hessian.dtype != torch.float32
         or weight.ndim != 2
