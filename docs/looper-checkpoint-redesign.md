@@ -98,7 +98,10 @@ and directory fsync; it is not an object-store/NFS durability guarantee.
 Unsupported flushing fails rather than silently weakening durability.
 
 Recovery considers only generations referenced by CURRENT, never arbitrary
-files discovered by scanning. All referenced objects are SHA-256 verified.
+files discovered by scanning. Referenced objects are verified with their
+declared checksum algorithm: new internal objects use XXH3-128, while legacy
+SHA-256 references remain readable. See [streamed checkpoint
+payloads](checkpoint-payload-io.md) for the storage and durability contract.
 A corrupt newest generation falls back to the preceding complete published
 generation; malformed CURRENT or no complete generation fails closed.
 

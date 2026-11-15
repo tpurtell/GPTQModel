@@ -2,6 +2,13 @@
 
 Carry the existing batch spool with provenance and tensor-geometry validation, atomic batch commits, and exact committed-batch recovery. Looper callbacks follow in the replay layer.
 
+New captures use bounded sequential segments, with one payload synchronization
+per checkpoint group and streamed XXH3-128 checksums. The default group is 32
+batches, subject to the segment byte bound. Legacy individual-batch manifests
+remain readable. See [streamed checkpoint payloads](checkpoint-payload-io.md)
+for the commit order and interruption contract; pending batches can be replayed
+until their group manifest commits.
+
 This page describes the shipped API and conditional calls carried from the working fork. It is a structural call map, with no invented execution ordering between public entry points. Solid edges name calls present in the source; dashed edges expose class entry points. Rejected states and propagated failures are marked separately.
 
 ```mermaid
