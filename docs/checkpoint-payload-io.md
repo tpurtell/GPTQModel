@@ -72,6 +72,12 @@ generic immutable objects still synchronize their standalone payloads before
 their commit metadata becomes durable. Removing all synchronization would
 invalidate those recovery guarantees.
 
+Directory synchronization is a POSIX contract. On other platforms the shared
+writer preserves the activation cache's previous file-sync and atomic-replace
+behavior without opening unsupported directory handles or requiring `fchmod`.
+POSIX directory synchronization failures still propagate; they are never
+silently ignored.
+
 These changes affect storage and checkpoint cadence. They do not change
 quantization arithmetic, tensor values or an already running process. Tests
 use small CPU fixtures and injected failures; they do not establish a
