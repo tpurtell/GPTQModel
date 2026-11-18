@@ -46,13 +46,16 @@ class BoundedHessianAccumulator:
                 or os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") == "1"):
             raise ValueError("Hessian products require IEEE FP32 matmul with TF32 disabled")
         try:
+            products_finite = torch.ones((), dtype=torch.bool, device=self.device)
             for start in range(0, len(rows), self.max_rows):
                 value = rows[start:start+self.max_rows].to(device=self.device, dtype=torch.float32)
                 product = torch.mm(value.T, value)
-                if not bool(torch.isfinite(product).all()):
-                    raise ValueError("nonfinite FP32 covariance product")
+                products_finite.logical_and_(torch.isfinite(product).all())
                 self._sum.add_(product)
-            if not bool(torch.isfinite(self._sum).all()):
+            product_ok, sum_ok = torch.stack((products_finite, torch.isfinite(self._sum).all())).tolist()
+            if not product_ok:
+                raise ValueError("nonfinite FP32 covariance product")
+            if not sum_ok:
                 raise ValueError("nonfinite FP64 covariance sum")
         except BaseException:
             self._failed = True
