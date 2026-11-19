@@ -7,8 +7,6 @@
 # Credits: TurboDerp / ExLlamaV3 contributors.
 
 import math
-import os
-import time
 import threading
 from functools import lru_cache
 
@@ -90,6 +88,8 @@ def _tile_batch_size() -> int:
     the slot count for memory-constrained hosts; tiles are quantized
     independently, so a smaller batch only means more launches.
     """
+
+    import os
 
     try:
         batch = int(os.environ.get("GPTQMODEL_EXL3_TILE_BATCH", _DEFAULT_TILE_BATCH))
@@ -500,14 +500,6 @@ def ldlq(
         weight_q = torch.empty((size_k, size_n), dtype = torch.float, device = buffer_device)
         encoded = torch.empty((tiles_k, tiles_n, 256), dtype = torch.short, device = buffer_device)
 
-        # On a display GPU, bound outstanding LDLQ work to one span and
-        # leave a configurable submission gap. Waiting on our own stream
-        # preserves other workers' independence and keeps tensors on device.
-        pause_ms = float(os.environ.get("GPTQMODEL_EXL3_SPAN_PAUSE_MS", "0"))
-        if not math.isfinite(pause_ms) or pause_ms < 0:
-            raise ValueError("GPTQMODEL_EXL3_SPAN_PAUSE_MS must be finite and nonnegative")
-        span_done = torch.cuda.Event(blocking=True) if pause_ms else None
-
         for j in range(size_k, 0, -buf_size_k):
             i = j - buf_size_k
 
@@ -561,11 +553,6 @@ def ldlq(
             # Cache error term for the rest of the matrix
             b_err = b_weight - b_weight_q
             prod_cache.addmm_(b_L.T, b_err, alpha = 1.0, beta = 1.0)
-            if span_done is not None:
-                span_done.record(main_stream)
-                span_done.synchronize()
-                time.sleep(pause_ms / 1000)
-
 
     outer_stream.wait_stream(main_stream)
     return weight_q, encoded
