@@ -29,13 +29,15 @@ def _quantizer():
 
 
 @torch.no_grad()
-def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, device="cuda:0"):
+def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, device="cuda:0", codebook="mcg"):
     """Quantize native [output,input] storage with an owned raw FP32 XTX copy.
 
     No identity rows are invented here. If routed recovery supplied such rows,
     its declared ``identity_rows`` count is retained in the returned evidence.
     Dense callers omit that key and therefore declare zero synthetic rows.
     """
+    if codebook not in ("mcg", "mul1"):
+        raise ValueError("unsupported EXL3 codebook")
     if (isinstance(bits, bool) or not isinstance(bits, int) or not 1 <= bits <= 8
             or isinstance(seed, bool) or not isinstance(seed, int)
             or isinstance(sigma, bool) or not isinstance(sigma, (int, float))
@@ -68,7 +70,7 @@ def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, de
     working[:, :outputs].copy_(weight.T)
     target = torch.device(device)
     raw = {"H": H.to(device=target, copy=True), "count": raw_hessian["count"], "finalized": False}
-    args = {"K": bits, "seed": seed, "sigma_reg": float(sigma), "devices": [target], "mcg": True, "apply_out_scales": None}
+    args = {"K": bits, "seed": seed, "sigma_reg": float(sigma), "devices": [target], codebook: True, "apply_out_scales": None}
     _, _, packed = _quantizer().quantize_exl3(working, raw, args, return_weight_q=False)
     metrics = args.get("error_metrics", {})
     required = {"quantizer_path": "hessian_ldlq", "hessian_metric_status": "ok",
@@ -84,7 +86,7 @@ def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, de
     if metrics["hessian_weighted_reference_denominator"] <= 0:
         raise ValueError("calibrated reference energy must be positive")
     packed = {key: value.detach().cpu() for key, value in packed.items()}
-    evidence = validate_core_tensors(packed, shape)
+    evidence = validate_core_tensors(packed, shape, codebook=codebook)
     if evidence["bits"] != bits:
         raise ValueError("quantizer returned a different bitrate")
     evidence.update(hessian_rows=raw_hessian["count"], identity_rows=identity_rows,

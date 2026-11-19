@@ -55,6 +55,25 @@ def test_quantizer_owns_raw_inputs_and_preserves_standard_padded_storage(monkeyp
     assert raw["finalized"] is False
 
 
+def test_mul1_encode_checks_the_requested_marker(monkeypatch):
+    data = packed(bits=4)
+    del data["mcg"]
+    data["mul1"] = torch.tensor(0x83DCD12D, dtype=torch.uint32).view(torch.int32)
+
+    def quantize(weight, h, args, **kwargs):
+        assert args["mul1"] and "mcg" not in args
+        args["error_metrics"] = metrics(h["count"])
+        return None, 0., data
+
+    monkeypatch.setattr(core, "_quantizer", lambda: SimpleNamespace(quantize_exl3=quantize))
+    raw = {"H": torch.eye(128), "count": 4, "finalized": False}
+    weight = torch.ones(576, 128)
+    core.quantize_projection(weight, raw, bits=4, device="cpu", codebook="mul1")
+    data["mul1"].zero_()
+    with pytest.raises(ValueError, match="MUL1 multiplier"):
+        core.quantize_projection(weight, raw, bits=4, device="cpu", codebook="mul1")
+
+
 @pytest.mark.parametrize("key,value",[("quantizer_path","fallback"),("hessian_metric_status","oom"),
     ("hessian_numerical_contract","old"),("hessian_transform_compute_dtype","torch.float32"),
     ("hessian_storage_dtype","torch.float64"),("hessian_sample_count",1),

@@ -26,25 +26,28 @@ def _quantizer():
     return quantize
 
 
-def validate_core_tensors(packed, logical_shape):
-    """Validate ordinary MCG storage against native [output, input] geometry."""
+_MULTIPLIERS = {"mcg": 0xCBAC1FED, "mul1": 0x83DCD12D}
+
+
+def validate_core_tensors(packed, logical_shape, *, codebook="mcg"):
+    """Validate ordinary EXL3 storage against native [output, input] geometry."""
     if (not isinstance(logical_shape, (tuple, list)) or len(logical_shape) != 2
             or any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in logical_shape)):
         raise ValueError("invalid native EXL3 weight shape")
     outputs, inputs = logical_shape
     stored_outputs = math.ceil(outputs / 128) * 128
-    if inputs % 128 or set(packed) != {"trellis", "suh", "svh", "mcg"}:
-        raise ValueError("expected 128-aligned input and standard EXL3 MCG tensors")
-    trellis, suh, svh, mcg = (packed[k] for k in ("trellis", "suh", "svh", "mcg"))
+    if codebook not in _MULTIPLIERS or inputs % 128 or set(packed) != {"trellis", "suh", "svh", codebook}:
+        raise ValueError(f"expected 128-aligned input and standard EXL3 {codebook.upper()} tensors")
+    trellis, suh, svh, marker = (packed[k] for k in ("trellis", "suh", "svh", codebook))
     if (trellis.dtype != torch.int16 or trellis.ndim != 3
             or tuple(trellis.shape[:2]) != (inputs // 16, stored_outputs // 16)
             or trellis.shape[2] not in range(16, 129, 16)
             or suh.dtype != torch.float16 or tuple(suh.shape) != (inputs,)
             or svh.dtype != torch.float16 or tuple(svh.shape) != (stored_outputs,)
-            or mcg.dtype != torch.int32 or tuple(mcg.shape) not in ((), (1,))):
+            or marker.dtype != torch.int32 or tuple(marker.shape) not in ((), (1,))):
         raise ValueError("EXL3 stored geometry/dtypes differ from the native projection")
-    if int(mcg.reshape(()).view(torch.uint32).item()) != 0xCBAC1FED:
-        raise ValueError("unsupported EXL3 MCG multiplier")
+    if int(marker.reshape(()).view(torch.uint32).item()) != _MULTIPLIERS[codebook]:
+        raise ValueError(f"unsupported EXL3 {codebook.upper()} multiplier")
     if not bool(torch.isfinite(suh).all()) or not bool(torch.isfinite(svh).all()):
         raise ValueError("nonfinite EXL3 scales")
     if outputs != stored_outputs and bool(torch.count_nonzero(svh[outputs:])):
@@ -54,9 +57,9 @@ def validate_core_tensors(packed, logical_shape):
 
 
 @torch.no_grad()
-def reconstruct_core_projection(packed, logical_shape, *, device="cuda:0", dtype=torch.bfloat16):
+def reconstruct_core_projection(packed, logical_shape, *, device="cuda:0", dtype=torch.bfloat16, codebook="mcg"):
     """Reconstruct serialized FP16 scales/trellis, then crop native output rows."""
-    validate_core_tensors(packed, logical_shape)
+    validate_core_tensors(packed, logical_shape, codebook=codebook)
     weight = _quantizer().reconstruct_exl3_tensors(packed, device=device, dtype=dtype)
     return weight.T[:logical_shape[0], :logical_shape[1]].contiguous()
 
